@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from mrm_trace.engines.base import (
     BaseEngine,

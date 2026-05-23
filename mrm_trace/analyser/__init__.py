@@ -31,8 +31,6 @@ def compute_all(trace) -> dict:
       locality_per_region, locality_summary,
       iai, suitability
     """
-    import pandas as pd
-
     ret_per_region, ret_summary = compute_retention(trace)
     wo = compute_write_once(trace)
     rf = compute_read_freq(trace)

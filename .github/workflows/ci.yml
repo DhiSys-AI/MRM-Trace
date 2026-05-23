@@ -28,13 +28,13 @@ jobs:
         run: pip install -e ".[test]"
 
       - name: Run unit tests
-        run: pytest -m unit -q --tb=short
+        run: pytest tests/unit/ -q --tb=short
 
       - name: Run integration tests
-        run: pytest -m integration -q --tb=short
+        run: pytest tests/integration/ -q --tb=short
 
       - name: Run validity tests
-        run: pytest -m validity -q --tb=short
+        run: pytest tests/validity/ -q --tb=short
 
       - name: Run property-based tests
         run: pytest tests/property/ -q --tb=short

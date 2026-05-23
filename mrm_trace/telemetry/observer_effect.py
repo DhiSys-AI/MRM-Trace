@@ -5,7 +5,7 @@ Aggregates ProcessMonitor samples from the observer (tracer) and target (model)
 processes into the observer_effect_summary dict that gets written to metadata.json.
 """
 
-from typing import List, Optional
+from typing import List
 
 from mrm_trace.collector.process_monitor import ProcessSample
 
@@ -38,7 +38,6 @@ def compute_observer_effect(
     obs_cpu = [s.cpu_pct for s in observer_samples] or [0.0]
     obs_rss = [s.rss_mb for s in observer_samples] or [0.0]
     tgt_rss = [s.rss_mb for s in target_samples] or [0.0]
-    tgt_cpu = [s.cpu_pct for s in target_samples] or [0.0]
 
     target_rss_peak = max(tgt_rss)
     observer_mem_peak = max(obs_rss)

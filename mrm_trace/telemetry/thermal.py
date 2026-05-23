@@ -14,7 +14,7 @@ from __future__ import annotations
 import glob as _glob
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 _SYSFS_PATTERN = (
     "/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count"

@@ -14,8 +14,8 @@ Region ID assignment:
   - activation/runtime : each distinct address_page gets a unique region_id
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, Generator, Iterable, List, Optional, Set
+from dataclasses import dataclass
+from typing import Dict, Generator, Iterable, List, Optional
 
 from mrm_trace.labeller.kv_lifecycle import KVBlockTracker
 from mrm_trace.labeller.symbol_rules import DEFAULT_RULES, SymbolRule, classify_symbol
