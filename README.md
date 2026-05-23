@@ -66,9 +66,11 @@ mrm-trace run --config config/default_experiment.yaml
 
 | Notebook | Description | Run on Colab |
 |---|---|---|
-| [001 - Getting Started](notebooks/001%20-%20Getting%20Started.ipynb) | Install, build a synthetic trace, label, analyse, export | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhiSys-AI/MRM-Trace/blob/main/notebooks/001%20-%20Getting%20Started.ipynb) |
+| [001 - Getting Started](notebooks/001%20-%20Getting%20Started.ipynb) | Install, synthetic trace, label, analyse, export, schema versioning, validity | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhiSys-AI/MRM-Trace/blob/main/notebooks/001%20-%20Getting%20Started.ipynb) |
+| [002 - YAML Config & Experiment Planning](notebooks/002%20-%20YAML%20Config%20%26%20Experiment%20Planning.ipynb) | Write & validate configs, sweep expansion, multi-model runs, collector tuning | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhiSys-AI/MRM-Trace/blob/main/notebooks/002%20-%20YAML%20Config%20%26%20Experiment%20Planning.ipynb) |
+| [003 - Real Collection Walkthrough](notebooks/003%20-%20Real%20Collection%20Walkthrough.ipynb) | Real memray capture, parse raw trace, understand symbols, real-model guide | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhiSys-AI/MRM-Trace/blob/main/notebooks/003%20-%20Real%20Collection%20Walkthrough.ipynb) |
 
-The Getting Started notebook runs entirely without root or model files — it uses the Python API with synthetic data and is a good first stop for new contributors and researchers.
+All three notebooks run without root or model files (001 and 002 use synthetic data; 003 uses memray on a simulated workload). They are a good first stop for new contributors and researchers.
 
 ---
 
