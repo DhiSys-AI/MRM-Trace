@@ -61,7 +61,10 @@ def parse_memray(
             else OpType.STORE.value
         )
 
-        frames = record.stack_trace()
+        try:
+            frames = record.stack_trace()
+        except NotImplementedError:
+            frames = []
         if frames:
             top = frames[0]
             symbol = getattr(top, "function_name", "") or ""
