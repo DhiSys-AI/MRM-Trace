@@ -77,9 +77,9 @@ mrm_trace/
 
 | Phase | Deliverables | Acceptance Criteria |
 |-------|-------------|---------------------|
-| **1 — Foundations** (current) | Scaffolding, schemas, YAML loader, logging, CLI skeleton, manifest | `validate` + `plan` commands work |
-| **2 — Engine adapters** | llama.cpp + vLLM wrappers, phase events, PID discovery | Both engines run a prompt |
-| **3 — Collectors** | perf mem runner, memray runner, process monitor | Raw artifacts + telemetry snapshots produced |
+| **1 — Foundations** (done) | Scaffolding, schemas, YAML loader, logging, CLI skeleton, manifest | `validate` + `plan` commands work |
+| **2 — Engine adapters** (done) | llama.cpp + vLLM wrappers, phase events, PID discovery | Both engines run a prompt |
+| **3 — Collectors** (current) | perf mem runner, memray runner, process monitor | Raw artifacts + telemetry snapshots produced |
 | **4 — Parsing** | perf script parser, memray parser, canonical schema output | Synthetic raw data → trace.parquet |
 | **5 — Labelling** | Symbol labeller, address tracker, region map, KV lifecycle | Test fixtures classify weight + KV regions |
 | **6 — Analysis** | Retention, write-once, read-freq, working-set, locality, IAI, suitability | Synthetic traces yield expected metrics |
