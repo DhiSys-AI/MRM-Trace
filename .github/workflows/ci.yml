@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: "Test (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: pip install -e ".[test]"
+
+      - name: Run unit tests
+        run: pytest -m unit -q --tb=short
+
+      - name: Run integration tests
+        run: pytest -m integration -q --tb=short
+
+      - name: Run validity tests
+        run: pytest -m validity -q --tb=short
+
+      - name: Run property-based tests
+        run: pytest tests/property/ -q --tb=short
+
+  coverage:
+    name: "Coverage"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install with test extras
+        run: pip install -e ".[test]"
+
+      - name: Run full suite with coverage
+        run: |
+          pytest -m "not slow and not performance" \
+            --cov=mrm_trace \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            -q --tb=short
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  lint:
+    name: "Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install linters
+        run: pip install ruff
+
+      - name: Run ruff check
+        run: ruff check mrm_trace/ --select E,F,W --ignore E501

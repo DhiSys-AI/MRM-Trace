@@ -90,7 +90,7 @@ mrm_trace/
 | **6 — Analysis** (done) | Retention, write-once, read-freq, working-set, locality, IAI, suitability | Synthetic traces yield expected metrics |
 | **7 — Telemetry + validity** (done) | Baseline capture, thermal, observer effect sampling, validity classifier | Contaminated/clean fixture runs classify correctly |
 | **8 — Reporting + export** (done) | CSV/Parquet exports, figures, dataset manifest, export helpers | Run dirs are publication-ready |
-| **9 — Hardening** (current) | Full tests, perf tuning, schema versioning, docs | CI passes, ready for internal pilot |
+| **9 — Hardening** (done) | Full tests, perf tuning, schema versioning, docs | CI passes, ready for internal pilot |
 
 ## Testing Philosophy
 

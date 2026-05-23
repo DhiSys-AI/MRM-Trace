@@ -51,8 +51,18 @@ markers = [
     "performance: throughput and memory benchmarks",
     "slow: requires model files on disk",
 ]
-addopts = "-v --tb=short -m 'not slow'"
+addopts = "-v --tb=short -m 'not slow and not performance'"
 
 [tool.coverage.run]
 source = ["mrm_trace"]
 omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 75
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
