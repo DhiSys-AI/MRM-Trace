@@ -2,7 +2,7 @@
 
 A Python research package for collecting, parsing, labelling, and analysing LLM inference
 memory access traces. Designed as scientific instrumentation for
-**Managed-Retention Memory (MRM)** research — it characterises how model weights, KV cache,
+**Managed-Retention Memory (MRM)** research - it characterises how model weights, KV cache,
 activations, and runtime allocations are actually accessed during inference.
 
 **Primary metrics:** retention duration · write-once ratio · read frequency · working set size
@@ -55,13 +55,13 @@ mrm-trace run --config config/default_experiment.yaml
 ## Running tests
 
 ```bash
-# Every commit — fast, no I/O
+# Every commit - fast, no I/O
 pytest -m unit
 
-# Pre-merge — includes integration tests
+# Pre-merge - includes integration tests
 pytest -m "unit or integration"
 
-# Before dataset release — scientific correctness checks
+# Before dataset release - scientific correctness checks
 pytest -m validity
 
 # Property-based invariant tests (Hypothesis)
@@ -139,10 +139,10 @@ mrm_trace/
 ```
 
 Key design decisions:
-- **Streaming parser** — generators throughout; never loads full trace into RAM (ADR-2)
-- **Phase-aware tracing** — `weight_load` / `generation` / `teardown` phases distinguish weight from KV (ADR-3)
-- **Observer effect as mandatory output** — every run records overhead and validity class (ADR-4)
-- **Parquet + zstd** — column-oriented, ~3× better compression than gzip (ADR-8)
+- **Streaming parser** - generators throughout; never loads full trace into RAM (ADR-2)
+- **Phase-aware tracing** - `weight_load` / `generation` / `teardown` phases distinguish weight from KV (ADR-3)
+- **Observer effect as mandatory output** - every run records overhead and validity class (ADR-4)
+- **Parquet + zstd** - column-oriented, ~3× better compression than gzip (ADR-8)
 
 ---
 
@@ -202,13 +202,6 @@ exporter.export(trace, region_map, kv_lifecycle, results,
 
 ## Collector hierarchy
 
-1. `perf mem` — primary; requires Linux PMU + root/sudo; WSL2 supported
-2. `memray` — fallback; Python-level allocations; no root needed
-3. `process_monitor` — always runs in parallel as coarse baseline (psutil)
-
----
-
-## Development
-
-See [CLAUDE.md](CLAUDE.md) for the full developer guide: phase plan, ADRs, test philosophy,
-environment setup, and run validity thresholds.
+1. `perf mem` - primary; requires Linux PMU + root/sudo; WSL2 supported
+2. `memray` - fallback; Python-level allocations; no root needed
+3. `process_monitor` - always runs in parallel as coarse baseline (psutil)
