@@ -1,0 +1,13 @@
+{
+  "run_id": "llama3-8b-q4_ctx2048_batch1_out128_rep0_20260523T000000Z",
+  "observer_effect": {
+    "observer_effect_summary": {
+      "run_validity": "clean",
+      "observer_cpu_overhead_pct_max": 4.2,
+      "observer_memory_overhead_mb_peak": 312.0,
+      "thermal_throttle_events": 0,
+      "io_contention_detected": false,
+      "cache_pollution_estimate": "low"
+    }
+  }
+}

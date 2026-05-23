@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: mrm-trace
+Version: 0.1.0
+Summary: LLM inference memory trace platform for MRM research
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: typer>=0.12
+Requires-Dist: rich>=13.0
+Requires-Dist: pandas>=2.0
+Requires-Dist: pyarrow>=15.0
+Requires-Dist: psutil>=5.9
+Requires-Dist: numpy>=1.26
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"
+Requires-Dist: pytest-cov; extra == "test"
+Requires-Dist: pytest-xdist; extra == "test"
+Requires-Dist: pytest-benchmark; extra == "test"
+Requires-Dist: pytest-mock; extra == "test"
+Requires-Dist: hypothesis>=6.0; extra == "test"
+Requires-Dist: freezegun; extra == "test"
+Provides-Extra: plots
+Requires-Dist: matplotlib>=3.8; extra == "plots"
+Requires-Dist: seaborn>=0.13; extra == "plots"

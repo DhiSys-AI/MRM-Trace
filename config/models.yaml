@@ -1,0 +1,94 @@
+# Symbol-to-region-type labelling rules per model family.
+# Used by mrm_trace/labeller/symbol_labeller.py (Phase 5).
+#
+# Each entry defines regex patterns that map function symbols or DSO names
+# to a region_type: weight | kv_cache | activation | runtime | unknown
+
+families:
+  llama3:
+    weight:
+      symbols:
+        - "^ggml_"
+        - "^ggml_vec_dot"
+        - "^ggml_mul_mat"
+        - "^llama_model_load"
+        - "^llama_load_model_from_file"
+      dsos:
+        - "libggml.so"
+        - "libllama.so"
+
+    kv_cache:
+      symbols:
+        - "^llama_kv_cache"
+        - "llama_kv_cache_update"
+        - "llama_kv_cache_seq_cp"
+        - "llama_kv_cache_seq_rm"
+
+    activation:
+      symbols:
+        - "^ggml_compute_forward"
+        - "^llama_decode"
+
+    runtime:
+      symbols:
+        - "^llama_context"
+        - "^llama_batch"
+        - "^ggml_allocr"
+        - "^ggml_tallocr"
+      dsos:
+        - "libc.so"
+        - "libpthread.so"
+        - "libgomp.so"
+
+  mistral:
+    weight:
+      symbols:
+        - "^ggml_"
+        - "^ggml_vec_dot"
+        - "^ggml_mul_mat"
+      dsos:
+        - "libggml.so"
+        - "libllama.so"
+
+    kv_cache:
+      symbols:
+        - "^llama_kv_cache"
+
+    activation:
+      symbols:
+        - "^ggml_compute_forward"
+
+    runtime:
+      dsos:
+        - "libc.so"
+        - "libpthread.so"
+
+  vllm:
+    weight:
+      symbols:
+        - "^torch"
+        - "^aten::"
+        - "weight"
+        - "_weight_"
+      dsos:
+        - "libtorch_cpu.so"
+        - "libopenblas.so"
+        - "libmkl"
+
+    kv_cache:
+      symbols:
+        - "paged_attention"
+        - "kv_cache"
+        - "key_value"
+        - "^PagedAttention"
+
+    activation:
+      symbols:
+        - "forward"
+        - "attention_forward"
+
+    runtime:
+      dsos:
+        - "libc.so"
+        - "libpython"
+        - "libgomp.so"

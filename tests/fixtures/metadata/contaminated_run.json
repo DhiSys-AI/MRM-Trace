@@ -1,0 +1,17 @@
+{
+  "run_id": "llama3-8b-q4_ctx2048_batch1_out128_rep0_20260523T010000Z",
+  "observer_effect": {
+    "observer_effect_summary": {
+      "run_validity": "contaminated",
+      "observer_cpu_overhead_pct_max": 28.5,
+      "observer_memory_overhead_mb_peak": 4800.0,
+      "thermal_throttle_events": 5,
+      "io_contention_detected": true,
+      "cache_pollution_estimate": "high",
+      "validity_notes": [
+        "observer CPU overhead 28.5% exceeds marginal threshold of 20%",
+        "thermal throttling detected: 5 events"
+      ]
+    }
+  }
+}

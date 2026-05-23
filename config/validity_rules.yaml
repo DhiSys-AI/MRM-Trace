@@ -1,0 +1,37 @@
+# Run validity classification thresholds.
+# Used by mrm_trace/orchestration/validity.py (Phase 7).
+#
+# Runs are classified as: clean | marginal | contaminated
+# A run is contaminated if it exceeds marginal thresholds.
+
+validity_rules:
+  clean:
+    # Observer process (mrm-trace itself) CPU overhead
+    observer_cpu_overhead_pct_max: 10.0
+
+    # Observer memory as fraction of target (inference engine) RSS
+    observer_memory_overhead_pct_of_target_rss_max: 5.0
+
+    # Number of CPU thermal throttling events during run
+    thermal_throttle_events: 0
+
+    # Whether disk I/O contention was detected (observer write > 10% disk BW)
+    io_contention_detected: false
+
+    # Machine must be near-idle at baseline capture
+    baseline_cpu_utilisation_max: 15.0
+
+    # Fraction of trace samples retained (vs dropped by perf buffer overflow)
+    min_parse_completeness_pct: 90.0
+
+  marginal:
+    # Included in dataset but flagged — use with caution for analysis
+    observer_cpu_overhead_pct_max: 20.0
+    observer_memory_overhead_pct_of_target_rss_max: 15.0
+    thermal_throttle_events: 2
+    io_contention_detected: true
+    baseline_cpu_utilisation_max: 30.0
+    min_parse_completeness_pct: 75.0
+
+  # contaminated: anything exceeding marginal thresholds
+  # Contaminated runs are archived but excluded from aggregated metrics and figures.

@@ -1,0 +1,86 @@
+# Default experiment template — edit and copy for your own experiments.
+# Run: mrm-trace validate --config config/default_experiment.yaml
+
+experiment:
+  name: "mrm_baseline_v1"
+  description: "MRM retention characterisation baseline experiment"
+  version: "1.0.0"
+  date_created: "2026-05-23"
+  authors: []
+  institution: ""
+  paper_ref: ""
+
+# Update path to point to a real model file on your system
+models:
+  - id: "llama3-8b-q4"
+    engine: "llamacpp"
+    path: "models/llama-3-8b.Q4_K_M.gguf"
+    family: "llama3"
+    params_billions: 8
+    quantisation: "Q4_K_M"
+    dtype: "float16"
+
+sweep:
+  context_lengths: [512, 2048]
+  batch_sizes: [1]
+  output_tokens: [128]
+  repetitions: 2
+  warmup_runs: 1
+
+prompts:
+  source: "prompts/standard_suite.jsonl"
+
+collector:
+  primary: "perf_mem"
+  fallback: "memray"
+  fallback_2: "process_monitor"
+  perf_mem:
+    sample_period: 4000
+    ldlat_threshold: 20
+    events:
+      - "cpu/mem-loads,ldlat=20/P"
+      - "cpu/mem-stores/P"
+    extra_flags: ["--call-graph", "dwarf"]
+    require_root: true
+  memray:
+    native_traces: true
+    follow_fork: true
+    file_size_limit_gb: 20
+  process_monitor:
+    poll_interval_ms: 100
+    metrics: ["rss", "vms", "shared", "text", "data"]
+
+telemetry:
+  capture: true
+  thermal_sampling_interval_s: 5
+  thermal_source: "auto"
+  invalidate_on_throttle: true
+  software_versions: true
+  hardware_topology: true
+  run_fio_benchmark: false
+
+labeller:
+  rules_file: "config/models.yaml"
+  unknown_policy: "log_and_skip"
+  min_sample_count: 10
+
+analyser:
+  metrics:
+    - retention_duration
+    - write_once_ratio
+    - read_frequency
+    - working_set_size
+    - access_locality
+    - inter_access_interval
+  histogram_bins: 100
+  cdf_resolution: 1000
+  group_by: ["region_type", "context_length", "model_family", "batch_size"]
+
+output:
+  base_dir: "results/"
+  formats:
+    raw_traces: "parquet"
+    metrics: "csv"
+    figures: "pdf"
+    metadata: "json"
+  compression: "zstd"
