@@ -65,13 +65,19 @@ def parse_memray(
             frames = record.stack_trace()
         except NotImplementedError:
             frames = []
-        if frames:
-            top = frames[0]
-            symbol = getattr(top, "function_name", "") or ""
-            dso = getattr(top, "filename", "") or ""
-        else:
-            symbol = ""
-            dso = ""
+
+        # Scan from innermost outward for the first frame with a non-empty
+        # function name. frames[0] is the C allocator itself and is often
+        # unnamed in stripped native builds; the meaningful symbol is a few
+        # frames up.
+        symbol = ""
+        dso = ""
+        for frame in (frames or []):
+            fn = getattr(frame, "function_name", "") or ""
+            if fn:
+                symbol = fn
+                dso = getattr(frame, "filename", "") or ""
+                break
 
         yield {
             "run_id": run_id,
