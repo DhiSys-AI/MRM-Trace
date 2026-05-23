@@ -21,6 +21,6 @@ pytest tests/integration/ -q --tb=short
 pytest tests/validity/ -q --tb=short
 pytest tests/property/ -q --tb=short
 
-# Tag the version (must match pyproject.toml version = "0.1.0")
-git tag v0.1.0
-git push origin v0.1.0
+# Tag the version (must match pyproject.toml version field)
+git tag v0.1.2
+git push origin v0.1.2

@@ -9,6 +9,16 @@ activations, and runtime allocations are actually accessed during inference.
 
 ---
 
+## Install from PyPI
+
+```bash
+pip install mrm-trace
+```
+
+> Linux (or WSL2) is required for `perf mem` collection. See [Requirements](#requirements) below.
+
+---
+
 ## Requirements
 
 | Requirement | Notes |
@@ -23,8 +33,8 @@ activations, and runtime allocations are actually accessed during inference.
 
 ```bash
 # Clone and set up a virtual environment
-git clone <repo-url>
-cd mrm-trace
+git clone https://github.com/DhiSys-AI/MRM-Trace
+cd MRM-Trace
 python -m venv venv
 source venv/bin/activate      # Windows WSL: same command
 

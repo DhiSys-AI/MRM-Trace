@@ -4,11 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mrm-trace"
-version = "0.1.0"
-description = "LLM inference memory trace platform for MRM research"
+version = "0.1.2"
+description = "Scientific instrumentation for LLM inference memory trace collection and MRM research"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
+authors = [
+    {name = "DhiSys AI", email = "pat2echo@gmail.com"},
+]
+keywords = [
+    "llm", "memory", "tracing", "inference", "perf", "kv-cache",
+    "managed-retention-memory", "mrm", "machine-learning", "research",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Monitoring",
+]
 dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
@@ -34,6 +52,11 @@ plots = [
     "matplotlib>=3.8",
     "seaborn>=0.13",
 ]
+
+[project.urls]
+Homepage = "https://github.com/DhiSys-AI/MRM-Trace"
+Repository = "https://github.com/DhiSys-AI/MRM-Trace"
+Issues = "https://github.com/DhiSys-AI/MRM-Trace/issues"
 
 [project.scripts]
 mrm-trace = "mrm_trace.cli:main"
