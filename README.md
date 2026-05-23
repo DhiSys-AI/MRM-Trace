@@ -62,6 +62,16 @@ mrm-trace run --config config/default_experiment.yaml
 
 ---
 
+## Notebooks
+
+| Notebook | Description | Run on Colab |
+|---|---|---|
+| [001 - Getting Started](notebooks/001%20-%20Getting%20Started.ipynb) | Install, build a synthetic trace, label, analyse, export | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhiSys-AI/MRM-Trace/blob/main/notebooks/001%20-%20Getting%20Started.ipynb) |
+
+The Getting Started notebook runs entirely without root or model files — it uses the Python API with synthetic data and is a good first stop for new contributors and researchers.
+
+---
+
 ## Running tests
 
 ```bash
@@ -215,3 +225,10 @@ exporter.export(trace, region_map, kv_lifecycle, results,
 1. `perf mem` - primary; requires Linux PMU + root/sudo; WSL2 supported
 2. `memray` - fallback; Python-level allocations; no root needed
 3. `process_monitor` - always runs in parallel as coarse baseline (psutil)
+
+---
+
+## Reporting issues and contact
+
+- **Bug reports / feature requests:** [GitHub Issues](https://github.com/DhiSys-AI/MRM-Trace/issues)
+- **Email:** [info@dhisys.co.uk](mailto:info@dhisys.co.uk)
