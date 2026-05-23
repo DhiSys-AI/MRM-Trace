@@ -1,0 +1,87 @@
+"""
+metrics.csv export — one-row-per-region_type summary of all analysis results.
+
+Columns: region_type, n_regions, retention_p50_s, retention_p90_s, retention_p99_s,
+         retention_mean_s, write_once_ratio_mean, reads_per_write_mean,
+         working_set_mb_total, unique_pages_total, suitability
+"""
+
+from pathlib import Path
+from typing import Union
+
+import pandas as pd
+
+
+def build_metrics_table(analysis: dict) -> pd.DataFrame:
+    """
+    Merge analysis results into a single per-region_type summary DataFrame.
+
+    Parameters
+    ----------
+    analysis : dict returned by compute_all()
+
+    Returns
+    -------
+    DataFrame with one row per region_type.
+    """
+    ret = analysis["retention_summary"].copy()
+
+    # write-once mean per type
+    wo = (
+        analysis["write_once"]
+        .groupby("region_type")["write_once_ratio"]
+        .mean()
+        .rename("write_once_ratio_mean")
+        .reset_index()
+    )
+
+    # reads-per-write mean per type
+    rf = (
+        analysis["read_freq"]
+        .groupby("region_type")["reads_per_write"]
+        .mean()
+        .rename("reads_per_write_mean")
+        .reset_index()
+    )
+
+    # working set totals
+    ws = analysis["working_set_summary"][
+        ["region_type", "total_pages", "total_bytes"]
+    ].rename(columns={
+        "total_pages": "unique_pages_total",
+        "total_bytes": "working_set_bytes_total",
+    }).copy()
+    ws["working_set_mb_total"] = ws["working_set_bytes_total"] / 1_048_576
+
+    # suitability
+    suit = analysis["suitability"][["region_type", "suitability"]]
+
+    merged = (
+        ret
+        .merge(wo,   on="region_type", how="left")
+        .merge(rf,   on="region_type", how="left")
+        .merge(ws[["region_type", "unique_pages_total", "working_set_mb_total"]],
+               on="region_type", how="left")
+        .merge(suit, on="region_type", how="left")
+    )
+
+    col_order = [
+        "region_type", "n_regions",
+        "retention_p50_s", "retention_p90_s", "retention_p99_s", "retention_mean_s",
+        "write_once_ratio_mean", "reads_per_write_mean",
+        "working_set_mb_total", "unique_pages_total",
+        "suitability",
+    ]
+    present = [c for c in col_order if c in merged.columns]
+    return merged[present].sort_values("region_type").reset_index(drop=True)
+
+
+def write_metrics_csv(
+    analysis: dict,
+    path: Union[str, Path],
+) -> Path:
+    """Write metrics.csv and return the path."""
+    path = Path(path)
+    df = build_metrics_table(analysis)
+    df.to_csv(path, index=False)
+    return path
