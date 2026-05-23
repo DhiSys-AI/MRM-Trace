@@ -141,3 +141,36 @@ def test_run_id_in_every_row(tmp_path):
     with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
         rows = list(parse_memray(f, run_id="myrun"))
     assert all(r["run_id"] == "myrun" for r in rows)
+
+
+# ── deallocation records ──────────────────────────────────────────────────────
+
+def test_deallocation_without_stack_trace_does_not_raise(tmp_path):
+    """memray raises NotImplementedError for stack_trace() on FREE records."""
+    rec = _make_record(allocator="FREE")
+    rec.stack_trace.side_effect = NotImplementedError
+    f = tmp_path / "trace.bin"
+    f.write_bytes(b"fake")
+    mock = _mock_memray_with([rec])
+    with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
+        rows = list(parse_memray(f, run_id="r1"))
+    assert len(rows) == 1
+    assert rows[0]["op_type"] == "load"
+    assert rows[0]["symbol"] == ""
+    assert rows[0]["dso"] == ""
+
+
+def test_mixed_alloc_and_free_records(tmp_path):
+    """Allocation records get symbol; deallocation records get empty symbol."""
+    alloc = _make_record(allocator="MALLOC")
+    free_rec = _make_record(allocator="FREE")
+    free_rec.stack_trace.side_effect = NotImplementedError
+    f = tmp_path / "trace.bin"
+    f.write_bytes(b"fake")
+    mock = _mock_memray_with([alloc, free_rec])
+    with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
+        rows = list(parse_memray(f, run_id="r1"))
+    assert rows[0]["symbol"] == "test_func"
+    assert rows[1]["symbol"] == ""
+    assert rows[0]["op_type"] == "store"
+    assert rows[1]["op_type"] == "load"

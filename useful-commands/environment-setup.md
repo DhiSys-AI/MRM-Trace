@@ -24,3 +24,21 @@ pytest tests/property/ -q --tb=short
 # Tag the version (must match pyproject.toml version field)
 git tag v0.1.2
 git push origin v0.1.2
+
+
+# build options:
+Goal	Command
+Dev testing (editable, changes instant)	already done: 
+`pip install -e ".[test]"`
+
+## Run specific tests	
+pytest tests/unit/parser/test_memray_parser.py -v
+
+## Run full unit suite	
+pytest -m unit -q
+
+## Build wheel	
+pip install build && python -m build
+
+## Install wheel locally	
+pip install dist/mrm_trace-0.1.2-py3-none-any.whl --force-reinstall
