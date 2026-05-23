@@ -88,8 +88,8 @@ mrm_trace/
 | **4 — Parsing** (done) | perf script parser, memray parser, canonical schema output | Synthetic raw data → trace.parquet |
 | **5 — Labelling** (done) | Symbol labeller, address tracker, region map, KV lifecycle | Test fixtures classify weight + KV regions |
 | **6 — Analysis** (done) | Retention, write-once, read-freq, working-set, locality, IAI, suitability | Synthetic traces yield expected metrics |
-| **7 — Telemetry + validity** (current) | Baseline capture, thermal, observer effect sampling, validity classifier | Contaminated/clean fixture runs classify correctly |
-| **8 — Reporting + export** | CSV/Parquet exports, figures, dataset manifest, export helpers | Run dirs are publication-ready |
+| **7 — Telemetry + validity** (done) | Baseline capture, thermal, observer effect sampling, validity classifier | Contaminated/clean fixture runs classify correctly |
+| **8 — Reporting + export** (current) | CSV/Parquet exports, figures, dataset manifest, export helpers | Run dirs are publication-ready |
 | **9 — Hardening** | Full tests, perf tuning, schema versioning, docs | CI passes, ready for internal pilot |
 
 ## Testing Philosophy
