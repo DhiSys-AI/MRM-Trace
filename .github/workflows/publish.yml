@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read    # required for checkout on private repos
       id-token: write   # required for trusted publishing (no token needed)
 
     steps:
