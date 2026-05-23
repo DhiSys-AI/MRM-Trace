@@ -1,5 +1,10 @@
 # CLAUDE.md — mrm-trace Developer Guide
 
+## Dev Environment
+WSL  
+Run full test suite via WSL  
+`wsl -e bash -c "cd /mnt/c/proj/mrm-trace && source venv/bin/activate && python -m pytest --tb=short -q 2>&1"`  
+
 ## Project Summary
 
 `mrm-trace` is a Python research package for collecting, parsing, labelling, and analysing
@@ -80,8 +85,8 @@ mrm_trace/
 | **1 — Foundations** (done) | Scaffolding, schemas, YAML loader, logging, CLI skeleton, manifest | `validate` + `plan` commands work |
 | **2 — Engine adapters** (done) | llama.cpp + vLLM wrappers, phase events, PID discovery | Both engines run a prompt |
 | **3 — Collectors** (done) | perf mem runner, memray runner, process monitor | Raw artifacts + telemetry snapshots produced |
-| **4 — Parsing** (current) | perf script parser, memray parser, canonical schema output | Synthetic raw data → trace.parquet |
-| **5 — Labelling** | Symbol labeller, address tracker, region map, KV lifecycle | Test fixtures classify weight + KV regions |
+| **4 — Parsing** (done) | perf script parser, memray parser, canonical schema output | Synthetic raw data → trace.parquet |
+| **5 — Labelling** (current) | Symbol labeller, address tracker, region map, KV lifecycle | Test fixtures classify weight + KV regions |
 | **6 — Analysis** | Retention, write-once, read-freq, working-set, locality, IAI, suitability | Synthetic traces yield expected metrics |
 | **7 — Telemetry + validity** | Baseline capture, thermal, observer effect sampling, validity classifier | Contaminated/clean fixture runs classify correctly |
 | **8 — Reporting + export** | CSV/Parquet exports, figures, dataset manifest, export helpers | Run dirs are publication-ready |
