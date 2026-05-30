@@ -22,8 +22,8 @@ pytest tests/validity/ -q --tb=short
 pytest tests/property/ -q --tb=short
 
 # Tag the version (must match pyproject.toml version field)
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.6
+git push origin v0.1.6
 
 
 # build options:

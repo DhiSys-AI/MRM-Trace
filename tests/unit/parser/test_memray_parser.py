@@ -74,7 +74,7 @@ def test_free_maps_to_load(tmp_path):
     f.write_bytes(b"fake")
     mock = _mock_memray_with([_make_record(allocator="FREE")])
     with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
-        rows = list(parse_memray(f, run_id="r1"))
+        rows = list(parse_memray(f, run_id="r1", skip_frees=False))
     assert rows[0]["op_type"] == "load"
 
 
@@ -83,7 +83,7 @@ def test_delete_maps_to_load(tmp_path):
     f.write_bytes(b"fake")
     mock = _mock_memray_with([_make_record(allocator="DELETE")])
     with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
-        rows = list(parse_memray(f, run_id="r1"))
+        rows = list(parse_memray(f, run_id="r1", skip_frees=False))
     assert rows[0]["op_type"] == "load"
 
 
@@ -153,7 +153,7 @@ def test_deallocation_without_stack_trace_does_not_raise(tmp_path):
     f.write_bytes(b"fake")
     mock = _mock_memray_with([rec])
     with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
-        rows = list(parse_memray(f, run_id="r1"))
+        rows = list(parse_memray(f, run_id="r1", skip_frees=False, native_traces=True))
     assert len(rows) == 1
     assert rows[0]["op_type"] == "load"
     assert rows[0]["symbol"] == ""
@@ -169,7 +169,7 @@ def test_mixed_alloc_and_free_records(tmp_path):
     f.write_bytes(b"fake")
     mock = _mock_memray_with([alloc, free_rec])
     with patch("mrm_trace.parser.memray_parser._try_import_memray", return_value=mock):
-        rows = list(parse_memray(f, run_id="r1"))
+        rows = list(parse_memray(f, run_id="r1", skip_frees=False, native_traces=True))
     assert rows[0]["symbol"] == "test_func"
     assert rows[1]["symbol"] == ""
     assert rows[0]["op_type"] == "store"
