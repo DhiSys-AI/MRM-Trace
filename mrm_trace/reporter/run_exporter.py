@@ -62,25 +62,34 @@ class RunExporter:
         metadata: Optional[Dict[str, Any]] = None,
         run_id: str = "unknown",
         figures: bool = True,
+        trace_already_written: bool = False,
     ) -> "ExportResult":
         """
         Write all artifacts and return an ExportResult.
 
         Parameters
         ----------
-        trace        : labelled trace DataFrame
-        region_map   : region_map rows (DataFrame or list of dicts)
-        kv_lifecycle : kv_block_lifecycle rows (DataFrame or list of dicts)
-        analysis     : dict from compute_all(trace)
-        metadata     : dict to write as metadata.json (optional)
-        run_id       : run identifier for the manifest
-        figures      : whether to generate figures (skipped if matplotlib absent)
+        trace                 : labelled trace DataFrame (used for analysis; skipped if
+                                trace_already_written=True)
+        region_map            : region_map rows (DataFrame or list of dicts)
+        kv_lifecycle          : kv_block_lifecycle rows (DataFrame or list of dicts)
+        analysis              : dict from compute_all(trace)
+        metadata              : dict to write as metadata.json (optional)
+        run_id                : run identifier for the manifest
+        figures               : whether to generate figures (skipped if matplotlib absent)
+        trace_already_written : set True when trace.parquet was written by the caller
+                                (e.g. via streaming write_parquet). Avoids a second write.
         """
         ensure_dir(self.run_dir)
 
         written: List[Path] = []
 
-        written.append(export_trace(trace, self.run_dir))
+        if trace_already_written:
+            trace_path = self.run_dir / "trace.parquet"
+            if trace_path.exists():
+                written.append(trace_path)
+        else:
+            written.append(export_trace(trace, self.run_dir))
         written.append(export_region_map(region_map, self.run_dir))
         written.append(export_kv_lifecycle(kv_lifecycle, self.run_dir))
         written.append(write_metrics_csv(analysis, self.run_dir / "metrics.csv"))

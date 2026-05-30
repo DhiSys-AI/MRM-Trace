@@ -214,16 +214,17 @@ def main():
 
     print()
     print("mrm-trace live demo — TinyLlama 1.1B Q4_K_M (perf mem)")
+    print(f"  Collector     : perf mem (hardware PMU)  ← real timestamps, real region map")
     print(f"  Model         : {model_path}")
     print(f"  Context       : {args.ctx} tokens")
     print(f"  Output tokens : {args.tokens} per prompt")
     print(f"  Sample period : {args.sample_period}")
     print(f"  Output dir    : {out_dir}")
     print()
-    print("  Unlike memray, perf mem provides:")
-    print("    ✓ Hardware timestamps (nanoseconds) → real retention durations")
-    print("    ✓ Actual symbol names from libllama.so → region classification")
-    print("    ✓ Cache level (L1/L2/L3/DRAM) per access")
+    print("  perf mem provides:")
+    print("    + Hardware timestamps (nanoseconds) → real retention durations")
+    print("    + Symbol names from libllama.so     → weight / kv_cache / activation regions")
+    print("    + Cache level (L1/L2/L3/DRAM)       → memory hierarchy analysis")
     print()
 
     # ── Setup engine ──────────────────────────────────────────────────────────

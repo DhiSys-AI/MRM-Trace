@@ -45,6 +45,7 @@ from mrm_trace.engines.base import PhaseEvent
 from mrm_trace.engines.llamacpp import LlamaCppEngine
 from mrm_trace.labeller import TraceLabeller
 from mrm_trace.parser.memray_parser import parse_memray
+from mrm_trace.parser.writer import write_parquet
 from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.utils.ids import generate_run_id
 
@@ -84,8 +85,8 @@ def parse_args():
         help="Force native_traces=False (Python-level only, always works)",
     )
     p.add_argument(
-        "--sample-every-n", dest="sample_every_n", type=int, default=1,
-        help="Parse every Nth allocation record (default 1 = all). Use 5-10 for large traces.",
+        "--sample-every-n", dest="sample_every_n", type=int, default=25,
+        help="Parse every Nth allocation record (default 25). Lower = denser but slower; 1 = all (may OOM).",
     )
     return p.parse_args()
 
@@ -205,6 +206,7 @@ def main():
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"mrm-trace live demo — TinyLlama 1.1B Q4_K_M")
+    print(f"  Collector     : memray (Python-level allocations)  ← NO hw timestamps, NO region map")
     print(f"  Model         : {model_path}")
     print(f"  Context       : {args.ctx} tokens")
     print(f"  Output tokens : {args.tokens} per prompt")
@@ -215,18 +217,22 @@ def main():
     engine = LlamaCppEngine(model_cfg, run_cfg)
     engine.prepare()
 
+    # ── Load model BEFORE starting collector ──────────────────────────────────
+    # Model loading creates tens of millions of Python-level allocation events.
+    # Capturing that phase makes the memray file 10-20x larger and causes
+    # parsing to hang for 30+ minutes. Only the generation phase is captured.
+    engine.load_model()
+    print(f"Model loaded.")
+    print()
+
     runner = MemrayRunner(native_traces=use_native)
     if not runner.is_available():
         print("ERROR: memray is not installed. Run: pip install memray", file=sys.stderr)
         sys.exit(1)
 
-    # ── Phase 1: collection ───────────────────────────────────────────────────
-    print("Starting memray collector ...")
+    # ── Phase 1: collection (generation phase only) ───────────────────────────
+    print("Starting memray collector (generation phase only) ...")
     runner.start(target_pids=[], output_dir=raw_dir)
-
-    engine.load_model()
-    print(f"Model loaded.")
-    print()
 
     gen_results = []
     for i, (prompt, raw_prompt) in enumerate(zip(PROMPTS, _RAW_PROMPTS), 1):
@@ -243,37 +249,40 @@ def main():
     print(f"Capture complete — {collector_meta.output_file_size_bytes:,} bytes")
     print()
 
-    # ── Phase 2: parse ────────────────────────────────────────────────────────
+    # ── Phase 2+3: parse → label → Parquet (streaming, one chunk at a time) ───
+    # Records flow: parse_memray() → labeller.label() → write_parquet() → disk
+    # Peak RAM = one 100k-row batch (~130 MB) not the full trace.
     phase_boundaries = build_phase_boundaries(engine.get_phase_records())
     memray_bin = raw_dir / "memray.bin"
+    trace_path = out_dir / "trace.parquet"
 
-    print(f"Parsing trace ({collector_meta.output_file_size_bytes / 1e6:.1f} MB) ...")
-    rows = list(parse_memray(memray_bin, run_id=run_id, phase_boundaries=phase_boundaries, native_traces=use_native, sample_every_n=args.sample_every_n))
-    print(f"  {len(rows):,} allocation records")
-    if rows:
-        op_counts: dict = {}
-        phase_counts: dict = {}
-        for r in rows:
-            op_counts[r["op_type"]] = op_counts.get(r["op_type"], 0) + 1
-            phase_counts[r["phase"]] = phase_counts.get(r["phase"], 0) + 1
-        print(f"  op_type  : {op_counts}")
-        print(f"  phases   : {phase_counts}")
-    print()
-
-    # ── Phase 3: label ────────────────────────────────────────────────────────
-    # Pass rows directly — avoids a costly DataFrame → dict round-trip.
-    print("Labelling ...")
+    mb = collector_meta.output_file_size_bytes / 1e6
+    print(f"Parsing + labelling ({mb:.1f} MB, 1-in-{args.sample_every_n} sample) ...")
     labeller = TraceLabeller()
-    labelled = pd.DataFrame(list(labeller.label(rows)))
+    n_rows = write_parquet(
+        labeller.label(
+            parse_memray(
+                memray_bin,
+                run_id=run_id,
+                phase_boundaries=phase_boundaries,
+                native_traces=use_native,
+                sample_every_n=args.sample_every_n,
+            )
+        ),
+        trace_path,
+    )
     region_map = pd.DataFrame(labeller.region_map())
     kv_lifecycle = pd.DataFrame(labeller.kv_lifecycle())
-    print(f"  Labelled trace : {labelled.shape}")
+    print(f"  {n_rows:,} labelled records → trace.parquet")
     print(f"  Region map     : {region_map.shape}")
     print(f"  KV lifecycle   : {kv_lifecycle.shape}")
     if region_map.empty:
         print("  (Region map is empty — expected without native_traces=True + root;")
         print("   real ggml_init / llama_kv_cache_update symbols populate it.)")
     print()
+
+    # Read back from Parquet for analysis — sampled trace fits in RAM comfortably.
+    labelled = pd.read_parquet(trace_path)
 
     # ── Phase 4: analyse ──────────────────────────────────────────────────────
     print("Analysing ...")
@@ -311,6 +320,7 @@ def main():
         analysis=analysis,
         metadata=metadata,
         run_id=run_id,
+        trace_already_written=True,
     )
 
     print(f"  Output: {out_dir}/")
