@@ -5,3 +5,5 @@ __pycache__/
 *.pyd
 .Python
 dist/*
+models/*
+results/*

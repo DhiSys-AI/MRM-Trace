@@ -23,9 +23,35 @@ pip install mrm-trace
 
 | Requirement | Notes |
 |---|---|
-| Linux (WSL2 supported) | `perf mem` requires Linux PMU; WSL2 works |
+| Linux (WSL2 supported) | memray works everywhere; `perf mem` requires bare-metal or PMU-capable VM |
 | Python ≥ 3.11 | Tested on 3.11 and 3.12 |
-| sudo / CAP_PERFMON | Required for `perf mem` collection |
+| sudo / root | Required for `native_traces=True` (memray) and `perf mem` |
+
+### Collector capability by environment
+
+| Environment | Best collector | `region_map` | Timestamps | Cache level |
+|---|---|---|---|---|
+| WSL2 (non-root) | `memray` | empty | 0 (no HW timestamps) | n/a |
+| WSL2 as root / sudo | `memray --native-traces` | empty † | 0 (memray limitation) | n/a |
+| Bare-metal Linux (root) | `perf mem` | populated | nanoseconds | L1/L2/L3/DRAM |
+| Cloud VM with PMU passthrough | `perf mem` | populated | nanoseconds | L1/L2/L3/DRAM |
+
+**WSL2 note:** The Microsoft WSL2 kernel (`*-microsoft-standard-WSL2`) does not expose hardware
+PMU counters to the guest. `perf mem` requires hardware PMU — it will not produce data on WSL2.
+Use `memray` with `native_traces=True` (sudo) for WSL2 development. For publication-quality
+retention and cache-level data, run on bare-metal Linux.
+
+**`native_traces` note:** memray's `native_traces=True` captures C-level allocations from
+llama.cpp/llama-cpp-python. In theory this makes `ggml_init` and `llama_kv_cache_update`
+symbols visible to the labeller, but **pip-installed `llama-cpp-python` strips C symbols** —
+so `region_map` will still be empty (`†`). Populating `region_map` via memray requires a
+debug-symbol build of llama-cpp-python (`CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python`).
+The reliable path is `perf mem` on bare-metal Linux.
+`native_traces=True` requires root or `CAP_SYS_PTRACE`.
+
+**Timestamps note:** memray does not record per-allocation timestamps — `timestamp_ns` is
+always 0. Retention duration (`retention_p99_s`) will be 0 in all memray runs. Only `perf mem`
+provides real nanosecond timestamps.
 
 ---
 
@@ -59,6 +85,78 @@ mrm-trace plan --config config/default_experiment.yaml
 # Run a full experiment (requires model files + sudo for perf)
 mrm-trace run --config config/default_experiment.yaml
 ```
+
+---
+
+## Live demo scripts
+
+End-to-end scripts that run real inference against small models and write all mrm-trace
+artifacts to a timestamped results directory. Located in [`notebooks/scripts/`](notebooks/scripts/).
+
+### Setup
+
+```bash
+# From the repo root (WSL2 or Linux)
+source venv/bin/activate
+pip install -e ".[test]"
+pip install memray
+```
+
+### TinyLlama 1.1B (llama-cpp-python + GGUF)
+
+```bash
+# Install backend
+pip install llama-cpp-python \
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
+# Download model (~670 MB, one-time)
+mkdir -p models
+wget -P models/ https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# Run (non-root — Python-level trace only)
+python notebooks/scripts/demo_tinyllama.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# Run as root — enables native_traces=True (C-level symbols, populated region_map)
+sudo -E python notebooks/scripts/demo_tinyllama.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --native-traces
+```
+
+### Qwen2.5-0.5B-Instruct (transformers, no GGUF needed)
+
+```bash
+# Install backend (model auto-downloads from HuggingFace, ~1 GB)
+pip install transformers torch accelerate
+
+python notebooks/scripts/demo_qwen_hf.py
+
+# Larger variant
+python notebooks/scripts/demo_qwen_hf.py --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+### perf mem (bare-metal Linux only)
+
+```bash
+# Requires root and hardware PMU — does NOT work on WSL2
+sudo -E python notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+```
+
+### Script options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model PATH` | `models/tinyllama-*.gguf` | Path to GGUF file |
+| `--ctx N` | 2048 | Context length |
+| `--tokens N` | 128 | Max output tokens per prompt |
+| `--out DIR` | `results/` | Output base directory |
+| `--native-traces` | auto (root check) | Force `native_traces=True` for memray |
+| `--no-native-traces` | — | Force `native_traces=False` |
+
+All scripts run 5 real prompts and write `trace.parquet`, `region_map.parquet`,
+`kv_block_lifecycle.parquet`, `metrics.csv`, `metadata.json`, and `manifest.json` to
+`results/<model_id>/<run_id>/`.
 
 ---
 
@@ -224,9 +322,11 @@ exporter.export(trace, region_map, kv_lifecycle, results,
 
 ## Collector hierarchy
 
-1. `perf mem` - primary; requires Linux PMU + root/sudo; WSL2 supported
-2. `memray` - fallback; Python-level allocations; no root needed
-3. `process_monitor` - always runs in parallel as coarse baseline (psutil)
+1. `perf mem` — primary; requires Linux PMU + root; bare-metal or PMU-capable VM only; **does not work on WSL2**
+2. `memray` — fallback; Python-level allocations (no root) or C-level (root + `native_traces=True`); works everywhere
+3. `process_monitor` — always runs in parallel as coarse RSS/CPU baseline (psutil)
+
+See [Collector capability by environment](#collector-capability-by-environment) for a full comparison.
 
 ---
 

@@ -25,9 +25,25 @@ def parse_memray(
     path: Union[str, Path],
     run_id: str,
     phase_boundaries: Optional[List[dict]] = None,
+    native_traces: bool = False,
+    skip_frees: bool = True,
+    sample_every_n: int = 1,
 ) -> Generator[dict, None, None]:
     """
     Stream-parse a memray binary trace file, yielding one canonical row dict per record.
+
+    Args:
+        native_traces: Set True when the trace was captured with native_traces=True and
+            a debug-symbol build of the backend. Enables stack_trace() per record to
+            extract ggml_* symbol names. Leave False (default) for pip-installed backends
+            or Python-level traces — calling stack_trace() on every record is very slow
+            and the symbols will be Python internals, not useful for region classification.
+        skip_frees: Skip FREE/DELETE deallocation records (default True). These typically
+            account for ~50% of records and are not needed for MRM retention/write-once
+            analysis. Set False to include them.
+        sample_every_n: Keep only every Nth allocation record (default 1 = keep all).
+            Use 2–10 to reduce record count for very large traces; the address distribution
+            and region classification are preserved at low sample rates.
 
     Raises:
         ImportError: if memray is not installed
@@ -41,6 +57,7 @@ def parse_memray(
 
     path = Path(path)
     sample_id = 0
+    raw_index = 0
 
     def _annotate_phase(ts_ns: int) -> Optional[str]:
         if not phase_boundaries:
@@ -52,32 +69,39 @@ def parse_memray(
 
     reader = memray.FileReader(str(path))
     for record in reader.get_allocation_records():
+        allocator = str(getattr(record, "allocator", "")).lower()
+        is_free = any(tok in allocator for tok in _FREE_ALLOCATORS)
+
+        if skip_frees and is_free:
+            continue
+
+        raw_index += 1
+        if sample_every_n > 1 and (raw_index % sample_every_n) != 0:
+            continue
+
         addr = record.address
         ts_ns = int(getattr(record, "timestamp", 0))
-        allocator = str(getattr(record, "allocator", "")).lower()
-        op_type = (
-            OpType.LOAD.value
-            if any(tok in allocator for tok in _FREE_ALLOCATORS)
-            else OpType.STORE.value
-        )
+        op_type = OpType.LOAD.value if is_free else OpType.STORE.value
 
-        try:
-            frames = record.stack_trace()
-        except NotImplementedError:
-            frames = []
-
-        # Scan from innermost outward for the first frame with a non-empty
-        # function name. frames[0] is the C allocator itself and is often
-        # unnamed in stripped native builds; the meaningful symbol is a few
-        # frames up.
         symbol = ""
         dso = ""
-        for frame in (frames or []):
-            fn = getattr(frame, "function_name", "") or ""
-            if fn:
-                symbol = fn
-                dso = getattr(frame, "filename", "") or ""
-                break
+        if native_traces:
+            # stack_trace() is expensive — only call it when symbols are expected.
+            # With pip-installed backends (stripped C symbols) this is always empty.
+            try:
+                frames = record.stack_trace()
+            except NotImplementedError:
+                frames = []
+            # Scan from innermost outward for the first frame with a non-empty
+            # function name. frames[0] is the C allocator itself and is often
+            # unnamed in stripped native builds; the meaningful symbol is a few
+            # frames up.
+            for frame in (frames or []):
+                fn = getattr(frame, "function_name", "") or ""
+                if fn:
+                    symbol = fn
+                    dso = getattr(frame, "filename", "") or ""
+                    break
 
         yield {
             "run_id": run_id,

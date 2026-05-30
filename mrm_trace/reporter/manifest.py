@@ -30,6 +30,8 @@ def build_manifest(
 
     file_entries: List[Dict[str, Any]] = []
     for f in sorted(files):
+        if not f.exists():
+            continue
         entry: Dict[str, Any] = {
             "path": f.name,
             "size_bytes": f.stat().st_size,

@@ -122,3 +122,14 @@ def test_manifest_files_sorted_by_name(tmp_path):
     manifest = build_manifest(tmp_path, "run")
     names = [e["path"] for e in manifest["files"]]
     assert names == sorted(names)
+
+
+def test_manifest_skips_nonexistent_paths(tmp_path):
+    """write_parquet skips empty tables; build_manifest must not crash on the returned path."""
+    existing = tmp_path / "trace.parquet"
+    existing.write_bytes(b"data")
+    missing = tmp_path / "kv_block_lifecycle.parquet"  # never written
+    manifest = build_manifest(tmp_path, "run_001", files=[existing, missing])
+    names = {e["path"] for e in manifest["files"]}
+    assert "trace.parquet" in names
+    assert "kv_block_lifecycle.parquet" not in names

@@ -16,7 +16,7 @@ Primary metrics: retention duration, write-once ratio, read frequency, working s
 
 ## Environment
 
-- **Runtime**: WSL2 (Linux kernel) — required for `perf mem` (PMU-based collection)
+- **Runtime**: WSL2 Ubuntu 24.04 (kernel `5.15.167.4-microsoft-standard-WSL2`)
 - **Python**: Python venv at `venv/` — activate with `source venv/bin/activate`
 - **Install (dev)**: `pip install -e ".[test]"`
 - **Run tests**: `pytest` (excludes `slow` tests by default)
@@ -29,6 +29,26 @@ pip install -e ".[test]"
 pytest -m "unit or integration"
 mrm-trace validate --config config/default_experiment.yaml
 mrm-trace plan --config config/default_experiment.yaml
+```
+
+### Verify installed version and fixes
+
+```bash
+python -c "import mrm_trace; print(mrm_trace.__version__)"
+python -c "import mrm_trace; print(mrm_trace.__file__)"
+# should print the source tree path, not site-packages
+```
+
+If either fix below says STALE, run `pip install -e ".[test]"`:
+
+```bash
+python -c "
+from mrm_trace.reporter.manifest import build_manifest
+from mrm_trace.engines.llamacpp import LlamaCppEngine
+import inspect
+print('manifest fix:', 'OK' if \"not f.exists()\" in inspect.getsource(build_manifest) else 'STALE')
+print('engine reset:', 'OK' if 'reset' in inspect.getsource(LlamaCppEngine._generate_via_bindings) else 'STALE')
+"
 ```
 
 ## Three-Layer Data Model
@@ -161,9 +181,74 @@ Contaminated runs are archived but excluded from aggregated metrics and paper fi
 ## Collector Hierarchy
 
 ```
-1. perf mem   — primary, requires Linux PMU + root/sudo, WSL2 supported
-2. memray     — fallback, Python-level allocations, no root needed
-3. process_monitor — always runs in parallel as coarse baseline (psutil)
+1. perf mem   — primary, requires Linux PMU + root; DOES NOT WORK on WSL2
+               (Microsoft WSL2 kernel does not expose hardware PMU counters)
+2. memray     — correct collector for WSL2
+               non-root: Python-level only, region_map empty, timestamps = 0
+               root + native_traces=True: C-level alloc events, timestamps still 0
+               region_map STILL EMPTY with pip-installed llama-cpp-python (C symbols stripped)
+               region_map populated only with debug-symbol build of llama-cpp-python
+3. process_monitor — always runs in parallel as coarse RSS/CPU baseline (psutil)
+```
+
+### What each collector gives you
+
+| Capability | memray (non-root) | memray (root, native) | perf mem |
+|---|---|---|---|
+| Allocation events | Python-level only | Python + C-level | load/store events |
+| `region_map` populated | No (all unknown) | No† (pip strips symbols) | Yes |
+| `timestamp_ns` | Always 0 | Always 0 | Nanosecond HW timestamps |
+| Retention duration | Always 0 | Always 0 | Real values |
+| Cache level (L1/L2/L3) | No | No | Yes |
+| Works on WSL2 | Yes | Yes (sudo) | No |
+| Works on bare-metal | Yes | Yes | Yes |
+
+† pip-installed `llama-cpp-python` strips C debug symbols. `ggml_*` names won't appear even with `native_traces=True`. Use `CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python` for a debug build, or use `perf mem` on bare-metal.
+
+### WSL2 limitation — perf mem does not work
+
+The development machine runs `5.15.167.4-microsoft-standard-WSL2`. This kernel does not
+forward hardware PMU counters to the guest. `perf mem` will not produce data. Even after
+installing `linux-tools-common linux-tools-virtual`, the PMU events
+(`cpu/mem-loads,ldlat=20/P`) are unsupported.
+
+**For WSL2 development:** use `demo_tinyllama.py --native-traces` (with sudo).
+**For publication data:** run on bare-metal Linux with `demo_perf_mem.py`.
+
+### Live demo scripts (`notebooks/scripts/`)
+
+| Script | Collector | Root needed | Region map | Timestamps |
+|---|---|---|---|---|
+| `demo_tinyllama.py` | memray | No (or --native-traces) | Empty (pip strips C symbols) | Always 0 |
+| `demo_qwen_hf.py` | memray | No (or --native-traces) | Empty (PyTorch internals, no ggml_ names) | Always 0 |
+| `demo_perf_mem.py` | perf mem | Yes | Populated | Nanoseconds |
+
+```bash
+# WSL2 — best available (C-level symbols, populated region_map)
+sudo -E python notebooks/scripts/demo_tinyllama.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --native-traces
+
+# WSL2 — no root (Python-level only, region_map empty)
+python notebooks/scripts/demo_tinyllama.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# WSL2 — Qwen (no GGUF needed, auto-downloads ~1 GB)
+pip install transformers torch accelerate
+python notebooks/scripts/demo_qwen_hf.py
+
+# Bare-metal Linux only
+sudo -E python notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+```
+
+Model download (one-time):
+
+```bash
+pip install llama-cpp-python \
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+mkdir -p models
+wget -P models/ https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
 ## Important Constraints

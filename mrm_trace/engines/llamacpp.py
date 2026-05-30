@@ -138,6 +138,12 @@ class LlamaCppEngine(BaseEngine):
         return result
 
     def _generate_via_bindings(self, prompt: str) -> Tuple[str, int, int]:
+        # Reset KV cache so each generate() call uses a fresh context.
+        # Without this, prompt tokens accumulate across calls and the context
+        # window fills up, causing later prompts to produce 0 output tokens.
+        if hasattr(self._llm, "reset"):
+            self._llm.reset()
+
         output = self._llm(
             prompt,
             max_tokens=self._run_config.output_tokens,
@@ -146,10 +152,19 @@ class LlamaCppEngine(BaseEngine):
         )
         choice = output["choices"][0]
         usage = output.get("usage", {})
+        # completion_tokens can be 0 when llama-cpp-python omits usage; fall back
+        # to counting the generated text's tokens via the tokeniser.
+        text = choice["text"]
+        completion_tokens = usage.get("completion_tokens") or 0
+        if completion_tokens == 0 and text:
+            try:
+                completion_tokens = len(self._llm.tokenize(text.encode()))
+            except Exception:
+                completion_tokens = max(1, len(text.split()))
         return (
-            choice["text"],
+            text,
             usage.get("prompt_tokens", 0),
-            usage.get("completion_tokens", 0),
+            completion_tokens,
         )
 
     def _generate_via_cli(self, prompt: str) -> Tuple[str, int, int]:
