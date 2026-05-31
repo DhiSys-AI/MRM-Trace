@@ -4,6 +4,7 @@ from typing import Optional
 
 import typer
 
+import mrm_trace
 from mrm_trace.config.loader import load_experiment
 from mrm_trace.config.validators import (
     expand_sweep,
@@ -130,6 +131,12 @@ def export(
     """Package outputs for dataset release. (Phase 8)"""
     typer.echo("[NOT IMPLEMENTED] 'export' requires Phase 8. Coming soon.", err=True)
     raise typer.Exit(1)
+
+
+@app.command()
+def version() -> None:
+    """Print the mrm-trace version."""
+    typer.echo(mrm_trace.__version__)
 
 
 def main() -> None:
