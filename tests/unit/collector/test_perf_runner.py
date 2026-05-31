@@ -79,12 +79,14 @@ def test_start_includes_output_flag_with_perf_data(tmp_path):
     assert "perf.data" in cmd[cmd.index("-o") + 1]
 
 
-def test_start_includes_event_flags(tmp_path):
+def test_start_no_event_flags_by_default(tmp_path):
+    # Default events list is empty — let perf auto-select CPU-appropriate events.
+    # Explicit -e flags are omitted; perf mem record picks the right events itself.
     with patch("mrm_trace.collector.perf_runner.shutil.which", return_value="/usr/bin/perf"):
         with patch("subprocess.Popen", return_value=_mock_proc()) as mock_popen:
             PerfMemRunner().start([1], tmp_path)
     cmd = mock_popen.call_args[0][0]
-    assert "-e" in cmd
+    assert "-e" not in cmd
 
 
 def test_start_uses_custom_events(tmp_path):

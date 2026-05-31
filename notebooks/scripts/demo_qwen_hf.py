@@ -172,9 +172,9 @@ def run_generation(model, tokenizer, max_new_tokens: int) -> "tuple[list, int, i
 
 def run_headless(args) -> None:
     """
-    Load model and generate all prompts, then write timing results to --results-file.
-    This function runs inside the process that perf mem record spawns, so every
-    memory access from model load onwards is captured by the hardware PMU.
+    Load model and generate all prompts, then write timing + weight-address results.
+    Runs inside the process that perf mem record spawns — every memory access from
+    model load onwards is captured by the hardware PMU.
     """
     if not args.results_file:
         print("ERROR: --results-file required in --headless mode", file=sys.stderr)
@@ -182,14 +182,37 @@ def run_headless(args) -> None:
 
     check_transformers()
 
+    from mrm_trace.labeller.pytorch_regions import extract_pytorch_regions
+    from mrm_trace.labeller.kv_address_monitor import (
+        install_transformers_kv_monitor,
+        uninstall_transformers_kv_monitor,
+        collect_kv_ranges,
+    )
+
     load_start_ns = time.time_ns()
     model, tokenizer = load_model_and_tokenizer(args.model, args.device)
     load_end_ns = time.time_ns()
     print(f"Model loaded in {(load_end_ns - load_start_ns) / 1e9:.1f}s")
-    print()
 
+    # Extract weight tensor address ranges while the model is in memory.
+    regions = extract_pytorch_regions(model)
+    regions_file = pathlib.Path(args.results_file).with_name("pytorch_regions.json")
+    regions_file.write_text(json.dumps([r.to_dict() for r in regions]))
+    print(f"  Weight regions recorded: {len(regions)} tensors across "
+          f"{sum(r.size_bytes for r in regions) / 1e6:.0f} MB")
+
+    # Install KV cache monitor BEFORE generation so every K/V tensor address
+    # created by DynamicCache.update (including intermediate torch.cat results)
+    # is captured with a timestamp.
+    install_transformers_kv_monitor()
     gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens)
+    kv_ranges = collect_kv_ranges()
+    uninstall_transformers_kv_monitor()
     del model, tokenizer
+
+    kv_file = pathlib.Path(args.results_file).with_name("kv_ranges.json")
+    kv_file.write_text(json.dumps(kv_ranges))
+    print(f"  KV cache ranges recorded: {len(kv_ranges)} tensors")
 
     results = {
         "load_start_ns": load_start_ns,
@@ -274,11 +297,10 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     perf_script_txt = raw_dir / "perf_script.txt"
     print("Parsing + labelling perf script output ...")
 
-    # Diagnostic: show first 3 lines so format issues are immediately visible
+    # Diagnostic: show first line so format issues are immediately visible
     try:
         with open(perf_script_txt) as _fh:
-            _sample = [next(_fh).rstrip() for _ in range(3)]
-        print(f"  perf_script.txt format sample: {_sample[0]}")
+            print(f"  perf_script.txt format sample: {next(_fh).rstrip()}")
     except (StopIteration, OSError):
         pass
 
@@ -287,9 +309,26 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         print("WARNING: no samples parsed from perf script output.", file=sys.stderr)
         print(f"  Check format: head -5 {perf_script_txt}", file=sys.stderr)
         print("  Continuing with empty trace — analysis metrics will be zero.", file=sys.stderr)
-        rows = []
 
+    # Pre-register weight and KV cache address ranges with the labeller.
+    # Perf samples hitting those pages are classified before symbol rules run.
     labeller = TraceLabeller()
+    regions_file = raw_dir.parent / "pytorch_regions.json"
+    if regions_file.exists():
+        regions_data = json.loads(regions_file.read_text())
+        n_pages = labeller.register_address_ranges(regions_data)
+        print(f"  Pre-registered {len(regions_data)} weight tensors → {n_pages:,} pages")
+    else:
+        print("  pytorch_regions.json not found — weight regions will be unknown")
+
+    kv_file = raw_dir.parent / "kv_ranges.json"
+    if kv_file.exists():
+        kv_data = json.loads(kv_file.read_text())
+        n_kv_pages = labeller.register_address_ranges(kv_data)
+        print(f"  Pre-registered {len(kv_data)} KV tensors → {n_kv_pages:,} pages")
+    else:
+        print("  kv_ranges.json not found — KV lifecycle will be empty")
+
     labelled = pd.DataFrame(list(labeller.label(iter(rows)))) if rows else pd.DataFrame()
     region_map = pd.DataFrame(labeller.region_map())
     kv_lifecycle = pd.DataFrame(labeller.kv_lifecycle())

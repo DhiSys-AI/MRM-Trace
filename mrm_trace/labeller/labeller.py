@@ -91,6 +91,33 @@ class TraceLabeller:
 
     # ── public API ───────────────────────────────────────────────────────────
 
+    def register_address_ranges(self, regions) -> int:
+        """
+        Pre-seed the page-type map with known address ranges before labelling.
+
+        Call this before label() with the output of
+        ``extract_pytorch_regions(model)`` (or any iterable of objects with
+        ``addr_start``, ``addr_end``, and ``region_type`` attributes / keys).
+
+        Each 4 KB page that falls within a registered range will be classified
+        immediately by the page-propagation rule (step 2 in _label_row), so
+        perf samples on those pages never reach the symbol-matching step.
+
+        Returns the number of pages registered.
+        """
+        page_count = 0
+        for r in regions:
+            addr_start = r["addr_start"] if isinstance(r, dict) else r.addr_start
+            addr_end   = r["addr_end"]   if isinstance(r, dict) else r.addr_end
+            rtype      = r["region_type"] if isinstance(r, dict) else r.region_type
+            page_start = addr_start >> 12
+            page_end   = (max(addr_end, addr_start + 1) - 1) >> 12
+            for page in range(page_start, page_end + 1):
+                if page not in self._page_types:
+                    self._page_types[page] = rtype
+                    page_count += 1
+        return page_count
+
     def label(self, rows: Iterable[dict]) -> Generator[dict, None, None]:
         """
         Stream trace rows, yielding each row with region_type and region_id set.

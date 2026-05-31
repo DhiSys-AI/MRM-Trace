@@ -71,27 +71,36 @@ pip install mrm-trace
 
 | Environment | Best collector | `region_map` | Timestamps | Cache level |
 |---|---|---|---|---|
-| WSL2 (non-root) | `memray` | empty | 0 (no HW timestamps) | n/a |
-| WSL2 as root / sudo | `memray --native-traces` | empty † | 0 (memray limitation) | n/a |
-| Bare-metal Linux (root) | `perf mem` | populated | nanoseconds | L1/L2/L3/DRAM |
-| Cloud VM with PMU passthrough | `perf mem` | populated | nanoseconds | L1/L2/L3/DRAM |
+| WSL2 (non-root) | `memray` | empty | 0 | n/a |
+| WSL2 (root) | `memray --native-traces` | empty † | 0 | n/a |
+| Bare-metal Linux (root) | `perf mem` (spawn mode) | populated ‡ | nanoseconds | L1/L2/L3/DRAM |
+| Cloud VM / Colab | `memray` | empty | 0 | n/a |
+| Debian bare-metal (root) | `perf mem` (spawn mode) | populated ‡ | nanoseconds | L1/L2/L3/DRAM |
 
-**WSL2 note:** The Microsoft WSL2 kernel (`*-microsoft-standard-WSL2`) does not expose hardware
-PMU counters to the guest. `perf mem` requires hardware PMU — it will not produce data on WSL2.
-Use `memray` with `native_traces=True` (sudo) for WSL2 development. For publication-quality
-retention and cache-level data, run on bare-metal Linux.
+**WSL2:** The Microsoft WSL2 kernel does not expose hardware PMU counters.
+`perf mem` will not produce data. Use `memray` for development; run on bare-metal for publication data.
 
-**`native_traces` note:** memray's `native_traces=True` captures C-level allocations from
-llama.cpp/llama-cpp-python. In theory this makes `ggml_init` and `llama_kv_cache_update`
-symbols visible to the labeller, but **pip-installed `llama-cpp-python` strips C symbols** —
-so `region_map` will still be empty (`†`). Populating `region_map` via memray requires a
-debug-symbol build of llama-cpp-python (`CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python`).
-The reliable path is `perf mem` on bare-metal Linux.
-`native_traces=True` requires root or `CAP_SYS_PTRACE`.
+**perf mem — spawn mode:** `perf mem record -p PID` (attach to running process) fails on
+Ubuntu 24.04 / kernel 6.8 for Intel PEBS load-latency events even as root. Use spawn mode:
+`perf mem record -- python script.py`. `demo_qwen_hf.py` does this automatically when root is
+detected on bare-metal Linux.
 
-**Timestamps note:** memray does not record per-allocation timestamps — `timestamp_ns` is
-always 0. Retention duration (`retention_p99_s`) will be 0 in all memray runs. Only `perf mem`
-provides real nanosecond timestamps.
+**`native_traces`:** memray `native_traces=True` requires root. pip-installed `llama-cpp-python`
+strips C symbols, so `region_map` remains empty (`†`). For a populated region map via memray,
+build llama-cpp-python from source: `CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python`.
+
+**region_map with PyTorch (‡):** `perf mem` populates `region_map` only with llama.cpp (GGUF)
+models. PyTorch/transformers symbols (`at::native::*`) do not match the `ggml_*` labeller rules.
+For PyTorch runs, `region_type = unknown` for all records — retention and write-once metrics
+are still valid but undifferentiated by region type.
+
+**Timestamps:** memray does not record per-allocation timestamps. `timestamp_ns = 0` and
+`retention_p99_s = 0` in all memray runs. Only `perf mem` provides real nanosecond hardware timestamps.
+
+**sudo:** `sudo -E python` resolves to the **system Python**. Always use:
+```bash
+sudo -E venv/bin/python notebooks/scripts/demo_qwen_hf.py
+```
 
 ---
 
@@ -169,17 +178,30 @@ sudo -E python notebooks/scripts/demo_tinyllama.py \
 # Install backend (model auto-downloads from HuggingFace, ~1 GB)
 pip install transformers torch accelerate
 
+# Auto-detects collector: memray on WSL2/non-root, perf mem on bare-metal Linux as root
 python notebooks/scripts/demo_qwen_hf.py
+
+# Force memray (any environment):
+python notebooks/scripts/demo_qwen_hf.py --collector memray
+
+# Force perf mem (bare-metal Linux, run as root with full venv path):
+sudo -E venv/bin/python notebooks/scripts/demo_qwen_hf.py --collector perf-mem
 
 # Larger variant
 python notebooks/scripts/demo_qwen_hf.py --model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
-### perf mem (bare-metal Linux only)
+> **Note on region_map:** The Qwen demo uses PyTorch/transformers. `region_map` will be empty
+> and all records will have `region_type = unknown` regardless of collector. Retention and
+> write-once metrics are still measured correctly but cannot be separated by region type.
+> For classified regions, use `demo_perf_mem.py` with a GGUF model.
+
+### perf mem + TinyLlama GGUF (bare-metal Linux, classified regions)
 
 ```bash
 # Requires root and hardware PMU — does NOT work on WSL2
-sudo -E python notebooks/scripts/demo_perf_mem.py \
+# Use full venv path: sudo -E python resolves to system Python, not venv
+sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
@@ -187,10 +209,11 @@ sudo -E python notebooks/scripts/demo_perf_mem.py \
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model PATH` | `models/tinyllama-*.gguf` | Path to GGUF file |
+| `--model PATH` | varies | GGUF path or HuggingFace model ID |
 | `--ctx N` | 2048 | Context length |
 | `--tokens N` | 128 | Max output tokens per prompt |
 | `--out DIR` | `results/` | Output base directory |
+| `--collector auto\|memray\|perf-mem` | `auto` | Override collector selection (Qwen demo only) |
 | `--native-traces` | auto (root check) | Force `native_traces=True` for memray |
 | `--no-native-traces` | — | Force `native_traces=False` |
 
