@@ -10,7 +10,7 @@ from typing import List, Union
 
 import pandas as pd
 
-from mrm_trace.parser.writer import write_parquet
+from mrm_trace.parser.writer import TRACE_SCHEMA, write_parquet
 
 _TRACE_FILE = "trace.parquet"
 _REGION_MAP_FILE = "region_map.parquet"
@@ -24,7 +24,7 @@ def export_trace(
     """Write trace.parquet into run_dir.  Returns the file path."""
     run_dir = Path(run_dir)
     out = run_dir / _TRACE_FILE
-    write_parquet(trace.to_dict("records"), out)
+    write_parquet(trace.to_dict("records"), out, schema=TRACE_SCHEMA)
     return out
 
 

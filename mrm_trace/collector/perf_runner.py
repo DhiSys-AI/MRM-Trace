@@ -15,10 +15,12 @@ from typing import List, Optional
 
 from .base import BaseCollector, CollectorMeta
 
-_DEFAULT_EVENTS = [
-    "cpu/mem-loads,ldlat=20/P",
-    "cpu/mem-stores/P",
-]
+# Pass no default events so perf mem auto-selects the right PMU events for the CPU.
+# Explicit events like "cpu/mem-loads,ldlat=20/P" are Intel-specific and require ldlat
+# support in the running kernel — not universally available even on Intel hardware.
+# Leaving events empty lets perf mem pick cpu/mem-loads/ and cpu/mem-stores/ (or
+# their architecture equivalents) automatically.
+_DEFAULT_EVENTS: List[str] = []
 _DEFAULT_SAMPLE_PERIOD = 4000
 _PERF_SCRIPT_TIMEOUT_S = 120
 
@@ -146,7 +148,13 @@ class PerfMemRunner(BaseCollector):
                     [
                         perf_bin, "script",
                         "-i", str(perf_data),
-                        "-F", "time,pid,addr,sym,dso",
+                        # Explicit field list keeps output single-line-per-sample.
+                        # Default output includes multi-line callchains which the
+                        # parser cannot handle, and some perf versions emit nothing
+                        # without this flag for mem events.
+                        # cpu attribute is not set for all perf mem event types;
+                        # omitting it avoids "Cannot print 'cpu' field" exit 255.
+                        "-F", "comm,pid,time,event,addr,sym,dso",
                     ],
                     stdout=fh,
                     stderr=subprocess.PIPE,
