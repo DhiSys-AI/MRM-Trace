@@ -371,7 +371,7 @@ def check_perf_mem_smoke() -> Check:
             # Fallback: any non-comment output from perf script at all.
             rc3, sout3, _ = _run(["perf", "script", "-i", str(data)])
             addr_ok = rc3 == 0 and any(
-                l.strip() and not l.startswith("#") for l in sout3.splitlines()
+                line.strip() and not line.startswith("#") for line in sout3.splitlines()
             )
 
         if addr_ok:
