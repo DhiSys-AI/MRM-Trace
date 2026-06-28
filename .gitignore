@@ -9,3 +9,4 @@ models/*
 results/*
 venv/*
 perf.data
+.old
