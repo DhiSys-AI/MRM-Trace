@@ -93,7 +93,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Qwen2.5 mrm-trace demo (transformers)")
     p.add_argument("--model", default=DEFAULT_MODEL_HF)
     p.add_argument("--ctx", type=int, default=2048)
-    p.add_argument("--tokens", type=int, default=128)
+    p.add_argument("--tokens", type=int, default=256)
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
+    p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
     p.add_argument("--out", default="results")
     p.add_argument("--device", default="auto")
     p.add_argument("--collector", choices=["auto", "memray", "perf-mem"], default="auto")
@@ -504,7 +506,7 @@ def main():
     model_slug = args.model.split("/")[-1].lower()
     run_id = generate_run_id(
         model_id=model_slug, context_length=args.ctx,
-        batch_size=1, output_tokens=args.tokens, rep_index=0,
+        batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
     )
     out_dir = pathlib.Path(args.out) / model_slug / run_id
     raw_dir = out_dir / "raw"

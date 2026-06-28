@@ -167,3 +167,11 @@ pip install build && python -m build
 git tag v0.1.7
 git push origin v0.1.7
 ```
+
+
+### Verify PMU produces real samples (15 min, do first)
+
+```bash
+sudo perf mem record -- sleep 2
+sudo perf mem report --stdio | head -20
+```

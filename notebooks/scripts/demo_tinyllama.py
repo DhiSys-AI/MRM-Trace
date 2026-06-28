@@ -110,6 +110,8 @@ def parse_args():
     p.add_argument("--model", default=DEFAULT_MODEL, help="Path to GGUF model file")
     p.add_argument("--ctx", type=int, default=2048)
     p.add_argument("--tokens", type=int, default=128)
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
+    p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
     p.add_argument("--out", default="results")
     p.add_argument("--collector", choices=["auto", "memray", "perf-mem"], default="auto")
     p.add_argument(
@@ -150,9 +152,9 @@ def _make_run_cfg(model_cfg: ModelConfig, run_id: str, args) -> RunConfig:
         run_id=run_id,
         model=model_cfg,
         context_length=args.ctx,
-        batch_size=1,
+        batch_size=args.batch_size,
         output_tokens=args.tokens,
-        rep_index=0,
+        rep_index=args.rep,
     )
 
 
@@ -541,7 +543,7 @@ def main():
     model_cfg = _make_model_cfg(model_path)
     run_id = generate_run_id(
         model_id=model_cfg.id, context_length=args.ctx,
-        batch_size=1, output_tokens=args.tokens, rep_index=0,
+        batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
     )
     run_cfg = _make_run_cfg(model_cfg, run_id, args)
 
