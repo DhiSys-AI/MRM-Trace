@@ -4,6 +4,7 @@ mrm_trace/__init__.py
 mrm_trace/api.py
 mrm_trace/cli.py
 mrm_trace/schema_version.py
+mrm_trace/validate_machine.py
 mrm_trace.egg-info/PKG-INFO
 mrm_trace.egg-info/SOURCES.txt
 mrm_trace.egg-info/dependency_links.txt

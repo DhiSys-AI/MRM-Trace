@@ -23,10 +23,27 @@ app = typer.Typer(
 
 @app.command()
 def validate(
-    config: Path = typer.Option(..., "--config", "-c", help="Path to experiment YAML"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to experiment YAML"),
+    machine: bool = typer.Option(False, "--machine", help="Validate the host can collect (PMU/perf-mem), not a config file."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON output (with --machine)."),
+    out_dir: str = typer.Option(".", "--out", "-o", help="Directory to check for free disk space (with --machine)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ) -> None:
-    """Validate experiment YAML config and check the environment."""
+    """Validate an experiment config, or (with --machine) check this host can collect.
+
+    \b
+    mrm-trace validate --config config/default_experiment.yaml   # config mode (default)
+    mrm-trace validate --machine                                  # day-one PMU/perf-mem check
+    mrm-trace validate --machine --json                           # machine-readable, for CI
+    """
+    if machine:
+        from mrm_trace.validate_machine import validate_machine as _vm
+        raise typer.Exit(_vm(out_dir=out_dir, json_output=json_output))
+
+    if config is None:
+        typer.echo("Provide --config <file> or --machine.", err=True)
+        raise typer.Exit(2)
+
     configure_root(level=logging.DEBUG if verbose else logging.INFO)
     typer.echo(f"Validating: {config}")
 

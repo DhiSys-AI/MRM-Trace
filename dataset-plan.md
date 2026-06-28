@@ -37,7 +37,7 @@ Two separate papers from this codebase:
 | Track | Title | Status |
 |---|---|---|
 | **A** (original) | LLM inference memory characterisation → MRM silicon contribution + Kaggle dataset | Code complete (Phase 9). Needs measurement sweep. |
-| **B** (new) | Retention-Aware Memory Placement for Batch LLM Inference on Reused Hardware | See `review-discuss.md`. Needs energy measurement + crossover model. |
+| **B** (new) | Retention-Aware Memory Placement for Batch LLM Inference on Reused Hardware | See `review-discuss.md`. Crossover model built (`crossover_model.xlsx`). Needs energy measurement (RAPL) + real metrics.csv inputs. |
 
 Track B layers on top of Track A - it does not break or replace it.
 
@@ -65,7 +65,7 @@ These are *logical* properties of the inference algorithm, not the memory substr
 
 ---
 
-## Hardware Assessment (this machine)
+## Hardware Assessment (dev machine)
 
 | Requirement | Status |
 |---|---|
@@ -193,7 +193,12 @@ Engine: `llama.cpp` (CPU path, reliable on this hardware). `vLLM` as secondary i
 
 ## Pending Code Work (small, before sweep)
 
-1. **Extend `mrm-trace validate` with PMU checks** - detect `perf_event_paranoid`, CPU PMU type (Intel PEBS/AMD IBS/ARM SPE), run a live `perf mem record` probe and report go/no-go. Researchers using the tool need this on day one.
+1. ~~**Extend `mrm-trace validate` with PMU checks**~~ — **DONE (2026-06-28)**
+   `mrm-trace validate --machine` runs a full 16-check hardware validation covering OS, WSL2,
+   kernel, perf binary/version, root, `perf_event_paranoid`, CPU vendor + PEBS sysfs markers,
+   dmesg PMU driver, live 32 MiB smoke test, AC power, governor/turbo, thermal sensors, memray,
+   nvidia-smi, and disk space. Exits 0/1/2 for classified/degraded/cannot-collect.
+   Standalone: `python validate_machine.py --json` (stdlib only, works before venv is set up).
 
 2. **Config templates for model matrix** - YAML experiment configs for each model in the sweep, with the 2K/8K/32K × 1/4/8 sweep pre-configured.
 

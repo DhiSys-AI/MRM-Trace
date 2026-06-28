@@ -85,6 +85,9 @@ pip install -e ".[test,plots]"
 ## Quick start
 
 ```bash
+# Day-one machine check: can this box collect? (exit 0 = publication-grade perf mem)
+sudo mrm-trace validate --machine
+
 # Validate a config file
 mrm-trace validate --config config/default_experiment.yaml
 
@@ -171,7 +174,9 @@ sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
 |---|---|---|
 | `--model PATH` | varies | GGUF path or HuggingFace model ID |
 | `--ctx N` | 2048 | Context length |
-| `--tokens N` | 128 | Max output tokens per prompt |
+| `--tokens N` | 128/256 | Max output tokens per prompt |
+| `--batch-size N` | 1 | Number of prompts in the batch |
+| `--rep N` | 0 | Repetition index (0 = warmup; 1+ = data runs) |
 | `--out DIR` | `results/` | Output base directory |
 | `--collector auto\|memray\|perf-mem` | `auto` | Override collector selection (Qwen demo only) |
 | `--native-traces` | auto (root check) | Force `native_traces=True` for memray |
