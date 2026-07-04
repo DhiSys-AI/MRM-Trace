@@ -12,9 +12,9 @@ experiment:
 
 # Update path to point to a real model file on your system
 models:
-  - id: "llama3-8b-q4"
+  - id: "Meta-Llama-3.1-8B-Instruct-Q4_K_M"
     engine: "llamacpp"
-    path: "models/llama-3-8b.Q4_K_M.gguf"
+    path: "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
     family: "llama3"
     params_billions: 8
     quantisation: "Q4_K_M"

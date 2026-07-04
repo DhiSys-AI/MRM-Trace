@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: mrm-trace
-Version: 0.1.9
+Version: 0.1.10
 Summary: Scientific instrumentation for LLM inference memory trace collection and MRM research
 Author-email: DhiSys AI <pat2echo@gmail.com>
 License-Expression: MIT

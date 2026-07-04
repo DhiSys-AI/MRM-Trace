@@ -211,8 +211,13 @@ def check_cpu_vendor() -> Check:
     }.get(vendor)
     if facility is None and ("aarch64" in platform.machine() or "arm" in platform.machine().lower()):
         facility = "SPE (Statistical Profiling Extension)"
-    facility = facility or "unknown"
-    return Check("cpu", Status.INFO, f"{model or vendor}  ->  {facility}",
+    detail = f"{model or vendor}  ->  {facility or 'unknown'}"
+    if facility is None:
+        return Check("cpu", Status.WARN, detail,
+                     "Unrecognised CPU vendor for memory sampling — check_sampling_facility "
+                     "below will likely FAIL; perf mem needs Intel PEBS, AMD IBS, or ARM SPE.",
+                     data={"vendor": vendor, "model": model, "facility": "unknown"})
+    return Check("cpu", Status.PASS, detail,
                  data={"vendor": vendor, "model": model, "facility": facility})
 
 
@@ -417,10 +422,26 @@ def check_governor_turbo() -> Check:
     if no_turbo != "":
         bits.append("turbo=" + ("off" if no_turbo == "1" else "on"))
     detail = ", ".join(bits) or "cpufreq info unavailable"
+
+    if not gov and no_turbo == "":
+        return Check("governor", Status.WARN, detail,
+                     "cpufreq/intel_pstate sysfs not readable — cannot verify frequency is "
+                     "pinned for reproducibility.")
+
+    turbo_on = no_turbo == "0"
+    governor_ok = gov in ("", "performance")
+    if governor_ok and not turbo_on:
+        return Check("governor", Status.PASS, detail)
+
+    remediation_bits = []
+    if not governor_ok:
+        remediation_bits.append("sudo cpupower frequency-set -g performance")
+    if turbo_on:
+        remediation_bits.append("echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo")
     return Check(
-        "governor", Status.INFO, detail,
-        "For reproducibility pin the governor (performance) and consider disabling turbo "
-        "(echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo) so frequency is fixed.",
+        "governor", Status.WARN, detail,
+        "Frequency is not pinned — reproducibility risk under sustained perf mem collection. "
+        + " && ".join(remediation_bits),
     )
 
 

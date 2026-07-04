@@ -42,8 +42,9 @@ pip install mrm-trace
 
 **perf mem — spawn mode:** `perf mem record -p PID` (attach to running process) fails on
 Ubuntu 24.04 / kernel 6.8 for Intel PEBS load-latency events even as root. Use spawn mode:
-`perf mem record -- python script.py`. `demo_qwen_hf.py` does this automatically when root is
-detected on bare-metal Linux.
+`perf mem record -- python script.py`. Both `demo_qwen_hf.py` and `demo_perf_mem.py` use spawn
+mode — perf launches the script itself (via `--headless`) so the traced process starts under
+perf from the first instruction.
 
 **`native_traces`:** memray `native_traces=True` requires root. pip-installed `llama-cpp-python`
 strips C symbols, so `region_map` remains empty (`†`). For a populated region map via memray,

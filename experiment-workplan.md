@@ -159,35 +159,40 @@ sensors               # should show CPU core temps
 
 ## 5. Python Environment Setup
 
+Every command in this guide, on either machine, resolves paths through a single
+`MRM_ROOT` variable set once per machine. Nothing below is hardcoded to a
+particular username or clone location — set `MRM_ROOT` correctly for the box
+you're on and every subsequent command (including Sections 7, 10, and 13) just works.
+
 ```bash
-# 1. Install the mrm-trace package from PyPI
-python3 -m venv ~/mrm-env
-source ~/mrm-env/bin/activate
-pip install --upgrade pip
-pip install mrm-trace
-
-# Verify the published package
-python -c "import mrm_trace; print(mrm_trace.__version__)"
-mrm-trace --help
-
-# 2. Clone the repo — needed for the experiment scripts (not part of the installed package)
-cd ~
+# 1. Clone the repo (anywhere you like)
 git clone <mrm-trace-repo-url> mrm-trace
+cd mrm-trace
+
+# 2. Set MRM_ROOT once for this machine/shell — $(pwd) is always absolute.
+#    Add this export to ~/.bashrc (or re-run it each new shell) so it persists.
+export MRM_ROOT="$(pwd)"
+
+# 3. Create the venv INSIDE the repo and install mrm-trace in editable/dev mode.
+#    This is a local, easy-to-test install: source edits under mrm_trace/ take
+#    effect immediately, no reinstall or separate package venv needed.
+python3 -m venv "$MRM_ROOT/venv"
+source "$MRM_ROOT/venv/bin/activate"
+pip install --upgrade pip
+pip install -e "$MRM_ROOT[test]"
+
+# Verify — should print the source tree path, not site-packages
+python -c "import mrm_trace; print(mrm_trace.__version__); print(mrm_trace.__file__)"
+mrm-trace --help
 ```
 
-The venv (`~/mrm-env`) provides the mrm-trace package and CLI. The cloned repo
-(`~/mrm-trace`) provides the scripts in `notebooks/scripts/`. They are kept separate
-deliberately so the PyPI package is what's validated during the sweep.
-
-> **Contributing / modifying the source**: replace `pip install mrm-trace` with
-> `pip install -e ".[test]"` run from inside the cloned repo, and use the repo's own
-> `venv/` instead of `~/mrm-env`. The instructions below remain the same — just swap the
-> venv path.
+`$MRM_ROOT/venv` provides both the mrm-trace package/CLI and the scripts in
+`notebooks/scripts/` from the same clone — one venv, one repo, per machine.
 
 ### 5.1 llama-cpp-python (CPU path)
 
 ```bash
-source ~/mrm-env/bin/activate
+
 pip install llama-cpp-python \
   --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
@@ -200,7 +205,6 @@ python -c "from llama_cpp import Llama; print('llama-cpp-python OK')"
 ### 5.2 PyTorch + transformers (GPU path)
 
 ```bash
-source ~/mrm-env/bin/activate
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install transformers accelerate
 
@@ -233,7 +237,7 @@ All models for the full experiment matrix. Download before starting the runner.
 ### 6.1 CPU path - GGUF models (perf mem primary collector)
 
 ```bash
-cd ~/mrm-trace
+cd "$MRM_ROOT"
 mkdir -p models
 ```
 
@@ -297,7 +301,7 @@ These are downloaded automatically on first use by `transformers`. They are cach
 
 Pre-download:
 ```bash
-source ~/mrm-env/bin/activate
+
 python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
   AutoTokenizer.from_pretrained('meta-llama/Llama-3.2-3B-Instruct'); \
   print('tokenizer OK')"
@@ -322,30 +326,35 @@ python notebooks/scripts/demo_qwen_hf.py --model Qwen/Qwen2.5-0.5B-Instruct
 Run every check below on the **partner machine** before starting the sweep. The first check is a hard gate — do not proceed if it exits non-zero.
 
 ```bash
-cd ~/mrm-trace
-source ~/mrm-env/bin/activate
+cd "$MRM_ROOT"
+
 
 # 1. HARD GATE — full automated machine validation
 #    Checks: OS, WSL2, kernel, perf binary, perf version, root, paranoid,
 #    CPU vendor + PEBS sysfs, dmesg PMU, live smoke test, thermal, memray, disk.
 #    Exit 0 = publication-grade perf mem. Exit 1 = degraded. Exit 2 = stop.
-sudo mrm-trace validate --machine
+sudo "$MRM_ROOT/venv/bin/mrm-trace" validate --machine
 # Tiger Lake PMU v5 should exit 0 with no action required.
+#
+# WARN governor: means frequency is not pinned (governor != performance, or
+# turbo on) — a reproducibility risk, not a blocker. Apply the Section 9.1
+# thermal protocol commands (cpupower + no_turbo) before starting the sweep,
+# then this check should read PASS.
 
 # Save the validation report to the results directory (for paper provenance)
 mkdir -p results
-sudo mrm-trace validate --machine --json > results/machine_validation.json
+sudo "$MRM_ROOT/venv/bin/mrm-trace" validate --machine --json > results/machine_validation.json
 cat results/machine_validation.json | python -m json.tool | grep verdict
 
 # 2. Python and mrm-trace
-python -c "import mrm_trace; print(mrm_trace.__version__)"
-mrm-trace validate --config config/default_experiment.yaml
+"$MRM_ROOT/venv/bin/python" -c "import mrm_trace; print(mrm_trace.__version__)"
+"$MRM_ROOT/venv/bin/mrm-trace" validate --config config/default_experiment.yaml
 
 # 3. llama-cpp-python
-python -c "from llama_cpp import Llama; print('llama-cpp OK')"
+"$MRM_ROOT/venv/bin/python" -c "from llama_cpp import Llama; print('llama-cpp OK')"
 
 # 4. PyTorch GPU
-python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+"$MRM_ROOT/venv/bin/python" -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
 
 # 5. Model files
 ls -lh models/*.gguf | awk '{print $5, $9}'
@@ -358,12 +367,12 @@ sensors | grep -E "Core|Package|temp"
 df -h ~   # must have > 200 GB free for safe operation
 
 # 8. Quick end-to-end test (TinyLlama, 1 prompt, fast)
-sudo -E ~/mrm-env/bin/python notebooks/scripts/demo_perf_mem.py \
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --ctx 512 --tokens 32 --batch-size 1 --rep 0
 # Expected: completes without error, prints non-zero Region map and KV lifecycle rows,
-# writes results to results/tinyllama-1.1b/<run_id>/
-RUN_DIR=$(ls -td results/tinyllama-1.1b/*/ 2>/dev/null | head -1)
+# writes results to results/tinyllama-1.1b-q4km-perf/<run_id>/
+RUN_DIR=$(ls -td results/tinyllama-1.1b-q4km-perf/*/ 2>/dev/null | head -1)
 cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq columns
 ```
 
@@ -497,28 +506,28 @@ notebooks/scripts/experiment_runner.py
 
 ```bash
 # Run or resume the sweep (standard usage)
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py
 
 # Show current status without running
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --status
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --status
 
 # Retry only runs that previously failed
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --retry-failed
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --retry-failed
 
 # Restart from scratch (WARNING: discards all state, does NOT delete results)
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --restart
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --restart
 
 # Dry run: print what would be run without executing
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --dry-run
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --dry-run
 
 # Fast validation mode: 1 model, 1 context, 1 batch, 1 rep
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --fast
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --fast
 
 # CPU path only (skip GPU runs)
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --cpu-only
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --cpu-only
 
 # GPU path only
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --gpu-only
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --gpu-only
 ```
 
 ### 10.3 Stopping and resuming
@@ -636,21 +645,21 @@ Do not wait for the full 186-run sweep. After nights 1–2 (TinyLlama + Llama-3.
 
 ```bash
 # Dev machine - test run (tinyllama, fast)
-sudo -E ~/mrm-env/bin/python notebooks/scripts/demo_perf_mem.py \
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --ctx 2048 --tokens 128 --batch-size 1 --rep 1
 
 # Partner machine - start the full sweep
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py
 
 # Check progress
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --status
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --status
 
 # Resume after interruption
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py
 
 # Retry failed runs
-sudo -E ~/mrm-env/bin/python notebooks/scripts/experiment_runner.py --retry-failed
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --retry-failed
 
 # Check temperature
 sensors | grep -E "Package|Core 0"
