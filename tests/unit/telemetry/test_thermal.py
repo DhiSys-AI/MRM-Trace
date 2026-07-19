@@ -2,7 +2,7 @@
 
 import pytest
 
-from mrm_trace.telemetry.thermal import ThermalSnapshot, ThermalMonitor
+from mrm_trace.telemetry.thermal import ThermalSnapshot, ThermalMonitor, read_package_temp_c
 
 
 # ── ThermalSnapshot ───────────────────────────────────────────────────────────
@@ -64,3 +64,12 @@ def test_thermal_monitor_capture_returns_snapshot():
     snap = ThermalSnapshot.capture()
     assert isinstance(snap, ThermalSnapshot)
     assert isinstance(snap.counts, dict)
+
+
+# ── read_package_temp_c ────────────────────────────────────────────────────────
+
+def test_read_package_temp_c_nonnegative():
+    """Must never crash; returns 0.0 when sysfs thermal zones are unavailable."""
+    temp = read_package_temp_c()
+    assert isinstance(temp, float)
+    assert temp >= 0.0

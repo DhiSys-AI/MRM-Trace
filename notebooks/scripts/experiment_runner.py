@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from mrm_trace.telemetry.thermal import read_package_temp_c
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 RESULTS_DIR = pathlib.Path("results")
@@ -47,16 +49,22 @@ SCRIPT_HF_GPU = pathlib.Path("notebooks/scripts/demo_qwen_hf.py")
 PYTHON = sys.executable
 
 # Thermal thresholds (°C)
-TEMP_START_MAX = 50      # do not start a run above this
-TEMP_WARN = 80           # flag run as warm
-TEMP_CONTAMINATED = 90   # flag run as contaminated
+TEMP_START_MAX = 60      # do not start a run above this
+TEMP_WARN = 90           # flag run as warm
+# Fallback-only: used when the child run's metadata.json (which now records real
+# thermal_throttle_events) can't be read — e.g. GPU path, or a run that failed
+# before writing metadata. 95°C sits just under typical consumer x86 Tjmax
+# (~100-105°C), where sustained throttling is effectively guaranteed. The
+# previous value (120°C) was above any real package temperature and never
+# fired, silently letting every throttled run through as "not contaminated".
+TEMP_CONTAMINATED_FALLBACK_C = 95
 COOL_CHECK_INTERVAL = 60 # seconds between temperature checks while waiting
 
 # Timing
-MIN_COOL_SECONDS = 300          # mandatory cooldown between runs (5 min)
-LARGE_MODEL_EXTRA_COOL = 300    # extra cooldown for 7B+ models (5 min)
+MIN_COOL_SECONDS = 60          # mandatory cooldown between runs (5 min)
+LARGE_MODEL_EXTRA_COOL = 60    # extra cooldown for 7B+ models (5 min)
 MAX_RUN_SECONDS = 7200          # 2-hour hard timeout per run
-PROGRESS_INTERVAL = 300         # re-print progress every 5 min
+PROGRESS_INTERVAL = 120         # re-print progress every 5 min
 
 # Output tokens (fixed across all runs for comparability)
 OUTPUT_TOKENS = 256
@@ -123,6 +131,7 @@ class RunResult:
     peak_temp_c: float = 0.0
     throttled: bool = False
     contaminated: bool = False
+    run_validity: str = "unknown"   # "clean" | "marginal" | "contaminated" | "unknown"
     error: Optional[str] = None
 
 
@@ -130,25 +139,7 @@ class RunResult:
 
 def _get_cpu_package_temp() -> float:
     """Read CPU package temperature in Celsius from sysfs."""
-    thermal_root = pathlib.Path("/sys/class/thermal")
-    if not thermal_root.exists():
-        return 0.0
-    # Prefer the x86 package zone
-    for zone in thermal_root.glob("thermal_zone*"):
-        try:
-            zone_type = (zone / "type").read_text().strip().lower()
-            if "pkg" in zone_type or ("x86" in zone_type and "cpu" in zone_type):
-                return int((zone / "temp").read_text()) / 1000.0
-        except OSError:
-            continue
-    # Fallback: return the highest of all zones
-    temps = []
-    for temp_file in thermal_root.glob("thermal_zone*/temp"):
-        try:
-            temps.append(int(temp_file.read_text()) / 1000.0)
-        except OSError:
-            pass
-    return max(temps) if temps else 0.0
+    return read_package_temp_c()
 
 
 def _is_throttled() -> bool:
@@ -203,6 +194,7 @@ def _mark(state: Dict, key: str, result: RunResult) -> None:
         "peak_temp_c": result.peak_temp_c,
         "throttled": result.throttled,
         "contaminated": result.contaminated,
+        "run_validity": result.run_validity,
         "error": result.error,
     }
 
@@ -220,6 +212,7 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path) -> List[str]:
             PYTHON,
             str(SCRIPT_PERF_MEM),
             "--model", str(model_path),
+            "--model-id", spec.model_id,
             "--ctx",   str(spec.ctx),
             "--tokens", str(OUTPUT_TOKENS),
             "--batch-size", str(spec.batch),
@@ -297,7 +290,6 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, log_fn) -> RunResult:
     finished_at = _now()
 
     throttled = _is_throttled()
-    contaminated = peak_temp > TEMP_CONTAMINATED
 
     if error is None and returncode != 0:
         error = f"Non-zero exit code: {returncode}"
@@ -319,6 +311,9 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, log_fn) -> RunResult:
             if len(parts) > 1:
                 run_id = parts[-1].strip()
 
+    run_validity = _resolve_run_validity(output_dir, peak_temp)
+    contaminated = run_validity == "contaminated"
+
     return RunResult(
         status=status,
         run_id=run_id,
@@ -329,8 +324,28 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, log_fn) -> RunResult:
         peak_temp_c=round(peak_temp, 1),
         throttled=throttled,
         contaminated=contaminated,
+        run_validity=run_validity,
         error=error,
     )
+
+
+def _resolve_run_validity(output_dir: Optional[str], peak_temp: float) -> str:
+    """
+    Prefer the real thermal-throttle-based classification the child run wrote
+    into its own metadata.json (see demo_perf_mem.py build_metadata()). Falls
+    back to a peak-temperature heuristic for runs that didn't write it (GPU
+    path, failed runs, older script versions).
+    """
+    if output_dir:
+        meta_path = pathlib.Path(output_dir) / "metadata.json"
+        try:
+            meta = json.loads(meta_path.read_text())
+            validity = meta.get("thermal", {}).get("run_validity")
+            if validity:
+                return validity
+        except (OSError, ValueError):
+            pass
+    return "contaminated" if peak_temp > TEMP_CONTAMINATED_FALLBACK_C else "unknown"
 
 
 # ── Matrix builder ─────────────────────────────────────────────────────────────
@@ -423,7 +438,12 @@ def print_status(state: Dict, all_specs: List[RunSpec]) -> None:
     contaminated = sum(
         1 for s in all_specs
         if runs.get(s.key, {}).get("status") == "done"
-        and runs.get(s.key, {}).get("contaminated", False)
+        and runs.get(s.key, {}).get("run_validity") == "contaminated"
+    )
+    marginal = sum(
+        1 for s in all_specs
+        if runs.get(s.key, {}).get("status") == "done"
+        and runs.get(s.key, {}).get("run_validity") == "marginal"
     )
     warmup_done = sum(
         1 for s in all_specs
@@ -440,6 +460,7 @@ def print_status(state: Dict, all_specs: List[RunSpec]) -> None:
     print(f"  Failed       : {failed}")
     print(f"  Pending      : {pending}")
     print(f"  Contaminated : {contaminated}  (done but excluded from dataset)")
+    print(f"  Marginal     : {marginal}  (done, thermal caveat)")
     print(f"  CPU temp now : {_get_cpu_package_temp():.1f}°C")
     print("=" * 60)
 

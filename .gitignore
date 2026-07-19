@@ -10,3 +10,5 @@ results/*
 venv/*
 perf.data
 *.old
+publish/
+.env

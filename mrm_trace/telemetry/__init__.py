@@ -2,7 +2,7 @@
 
 from mrm_trace.telemetry.baseline import BaselineSnapshot, capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
-from mrm_trace.telemetry.thermal import ThermalMonitor, ThermalSnapshot
+from mrm_trace.telemetry.thermal import ThermalMonitor, ThermalSnapshot, read_package_temp_c
 from mrm_trace.telemetry.validity import (
     ValidityResult,
     classify_from_summary,
@@ -14,6 +14,7 @@ __all__ = [
     "capture_baseline",
     "ThermalSnapshot",
     "ThermalMonitor",
+    "read_package_temp_c",
     "compute_observer_effect",
     "ValidityResult",
     "classify_run",

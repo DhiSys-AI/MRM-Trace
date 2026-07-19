@@ -20,6 +20,35 @@ _SYSFS_PATTERN = (
     "/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count"
 )
 
+_THERMAL_ZONE_ROOT = Path("/sys/class/thermal")
+
+
+def read_package_temp_c() -> float:
+    """
+    Read CPU package temperature in Celsius from sysfs thermal zones.
+
+    Prefers the x86 package zone (type containing "pkg", or "x86" + "cpu");
+    falls back to the highest reading across all zones. Returns 0.0 if
+    /sys/class/thermal is unavailable (e.g. non-Linux, containers without
+    the mount, WSL2 without exposed thermal zones).
+    """
+    if not _THERMAL_ZONE_ROOT.exists():
+        return 0.0
+    for zone in _THERMAL_ZONE_ROOT.glob("thermal_zone*"):
+        try:
+            zone_type = (zone / "type").read_text().strip().lower()
+            if "pkg" in zone_type or ("x86" in zone_type and "cpu" in zone_type):
+                return int((zone / "temp").read_text()) / 1000.0
+        except OSError:
+            continue
+    temps = []
+    for temp_file in _THERMAL_ZONE_ROOT.glob("thermal_zone*/temp"):
+        try:
+            temps.append(int(temp_file.read_text()) / 1000.0)
+        except OSError:
+            pass
+    return max(temps) if temps else 0.0
+
 
 @dataclass
 class ThermalSnapshot:

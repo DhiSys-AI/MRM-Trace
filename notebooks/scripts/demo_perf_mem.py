@@ -43,9 +43,11 @@ import dataclasses
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import pandas as pd
@@ -59,6 +61,8 @@ from mrm_trace.engines.llamacpp import LlamaCppEngine
 from mrm_trace.labeller import TraceLabeller
 from mrm_trace.parser.perf_script_parser import parse_perf_script
 from mrm_trace.reporter.run_exporter import RunExporter
+from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
+from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
 
 DEFAULT_MODEL = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
@@ -77,6 +81,11 @@ MODEL_ID = "tinyllama-1.1b-q4km-perf"
 def parse_args():
     p = argparse.ArgumentParser(description="TinyLlama mrm-trace demo (perf mem)")
     p.add_argument("--model", default=DEFAULT_MODEL, help="Path to GGUF model file")
+    p.add_argument(
+        "--model-id", dest="model_id", default=None,
+        help="Model identifier used for the results/<model_id>/ directory and metadata.json "
+             f"(default: derived from --model's filename; {MODEL_ID!r} for the bundled TinyLlama model)",
+    )
     p.add_argument("--ctx", type=int, default=2048, help="Context length")
     p.add_argument("--tokens", type=int, default=128, help="Max output tokens per prompt")
     p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
@@ -115,9 +124,25 @@ def check_pmu():
     return True, "ok"
 
 
-def build_model_cfg(model_path) -> ModelConfig:
+def resolve_model_id(args, model_path: pathlib.Path) -> str:
+    """
+    Resolve the model_id used for the results/<model_id>/ directory and metadata.json.
+
+    Explicit --model-id always wins. Otherwise, the bundled default TinyLlama model
+    keeps the historical `tinyllama-1.1b-q4km-perf` id; any other --model gets a slug
+    derived from its filename, so different models don't collide in the same results dir.
+    """
+    if args.model_id:
+        return args.model_id
+    if model_path.name == pathlib.Path(DEFAULT_MODEL).name:
+        return MODEL_ID
+    slug = re.sub(r"[^a-z0-9]+", "-", model_path.stem.lower()).strip("-")
+    return f"{slug}-perf"
+
+
+def build_model_cfg(model_path, model_id: str) -> ModelConfig:
     return ModelConfig(
-        id=MODEL_ID,
+        id=model_id,
         engine=EngineType.LLAMACPP,
         path=str(model_path),
         family="llama",
@@ -156,10 +181,13 @@ def build_phase_boundaries(phase_records):
     return boundaries
 
 
-def build_metadata(model_cfg, run_id, runtime_metadata, gen_results, collector_meta):
+def build_metadata(
+    model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
+    thermal_meta=None, total_wall_duration_s=None,
+):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
-    return {
+    metadata = {
         "run_id": run_id,
         "model": {
             "id": model_cfg.id,
@@ -185,6 +213,35 @@ def build_metadata(model_cfg, run_id, runtime_metadata, gen_results, collector_m
         },
     }
 
+    if total_wall_duration_s is not None:
+        metadata["timing"] = {
+            "total_wall_duration_s": round(total_wall_duration_s, 3),
+        }
+
+    if thermal_meta is not None:
+        # Only the thermal-throttle axis of CLAUDE.md's clean/marginal/contaminated
+        # rule is measured here (observer CPU/mem overhead and baseline CPU are not
+        # sampled by this script) — run_validity reflects thermal contamination only,
+        # not the full 5-axis classification.
+        validity = classify_run(
+            observer_cpu_overhead_pct_max=0.0,
+            observer_memory_frac=0.0,
+            thermal_throttle_events=thermal_meta["throttle_events"],
+            baseline_cpu_pct=0.0,
+            io_contention_detected=False,
+        )
+        metadata["thermal"] = {
+            **thermal_meta,
+            "run_validity": validity.run_validity,
+            "run_validity_note": (
+                "Thermal-only: reflects throttle events during this run. "
+                "Observer CPU/memory overhead and baseline CPU are not measured "
+                "by this script, so this is not the full CLAUDE.md validity classification."
+            ),
+        }
+
+    return metadata
+
 
 def _df_val(df, col, agg="mean"):
     if df is None or df.empty or col not in df.columns:
@@ -206,7 +263,8 @@ def run_headless(args) -> None:
         sys.exit(1)
 
     model_path = pathlib.Path(args.model)
-    model_cfg = build_model_cfg(model_path)
+    model_id = resolve_model_id(args, model_path)
+    model_cfg = build_model_cfg(model_path, model_id)
     run_id = generate_run_id(
         model_id=model_cfg.id, context_length=args.ctx,
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
@@ -282,11 +340,39 @@ def _preflight(args) -> "tuple[pathlib.Path, list | None]":
     return model_path, ["mem:0:rw:p"]
 
 
-def _collect_via_spawn(args, model_path, events, out_dir, raw_dir, run_id):
+_TEMP_POLL_INTERVAL_S = 2.0
+
+
+class _PeakTempPoller:
+    """Background thread that tracks the highest CPU package temp seen so far."""
+
+    def __init__(self, interval_s: float = _TEMP_POLL_INTERVAL_S):
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._peak_c = read_package_temp_c()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._peak_c = max(self._peak_c, read_package_temp_c())
+            self._stop.wait(self._interval_s)
+
+    def start(self) -> "_PeakTempPoller":
+        self._thread.start()
+        return self
+
+    def stop(self) -> float:
+        self._stop.set()
+        self._thread.join(timeout=self._interval_s * 2)
+        self._peak_c = max(self._peak_c, read_package_temp_c())
+        return self._peak_c
+
+
+def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run_id):
     """
     Spawn this script under perf mem record so the entire process lifetime
     (model load + generation) is instrumented from the start. Returns
-    (runtime_metadata, gen_results, phase_boundaries, collector_meta).
+    (runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta).
     """
     perf_bin = shutil.which("perf")
     if not perf_bin:
@@ -300,6 +386,7 @@ def _collect_via_spawn(args, model_path, events, out_dir, raw_dir, run_id):
         sys.executable, str(pathlib.Path(__file__).resolve()),
         "--headless",
         "--model", str(model_path),
+        "--model-id", model_id,
         "--ctx", str(args.ctx),
         "--tokens", str(args.tokens),
         "--batch-size", str(args.batch_size),
@@ -313,7 +400,28 @@ def _collect_via_spawn(args, model_path, events, out_dir, raw_dir, run_id):
 
     current_pid = os.getpid()
     print(f"Starting perf mem collector (spawn mode, launcher PID {current_pid}) ...")
-    result = subprocess.run(perf_cmd)
+
+    start_temp_c = read_package_temp_c()
+    thermal_monitor = ThermalMonitor()
+    thermal_monitor.begin()
+    poller = _PeakTempPoller().start()
+    collection_start = time.time()
+    try:
+        result = subprocess.run(perf_cmd)
+    finally:
+        peak_temp_c = poller.stop()
+        collection_duration_s = round(time.time() - collection_start, 3)
+        throttle_events = thermal_monitor.end()
+
+    end_temp_c = read_package_temp_c()
+    thermal_meta = {
+        "start_temp_c": round(start_temp_c, 1),
+        "peak_temp_c": round(peak_temp_c, 1),
+        "end_temp_c": round(end_temp_c, 1),
+        "throttle_events": throttle_events,
+        "throttled": throttle_events > 0,
+        "collection_wall_duration_s": collection_duration_s,
+    }
 
     warnings: list = []
     if result.returncode != 0:
@@ -364,7 +472,7 @@ def _collect_via_spawn(args, model_path, events, out_dir, raw_dir, run_id):
     )
     print(f"  Capture: {collector_meta.output_file_size_bytes:,} bytes (perf.data)")
     print()
-    return runtime_metadata, gen_results, phase_boundaries, collector_meta
+    return runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta
 
 
 def _parse_and_label(perf_script_txt, run_id, phase_boundaries) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
@@ -429,17 +537,18 @@ def main():
         return
 
     model_path, events = _preflight(args)
+    model_id = resolve_model_id(args, model_path)
 
     run_id = generate_run_id(
-        model_id=MODEL_ID, context_length=args.ctx,
+        model_id=model_id, context_length=args.ctx,
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
     )
-    out_dir = pathlib.Path(args.out) / MODEL_ID / run_id
+    out_dir = pathlib.Path(args.out) / model_id / run_id
     raw_dir = out_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     print()
-    print("mrm-trace live demo — TinyLlama 1.1B Q4_K_M (perf mem)")
+    print(f"mrm-trace live demo — {model_id} (perf mem)")
     print("  Collector     : perf mem (hardware PMU, spawn mode)  ← real timestamps, real region map")
     print(f"  Model         : {model_path}")
     print(f"  Context       : {args.ctx} tokens")
@@ -453,9 +562,10 @@ def main():
     print("    + Cache level (L1/L2/L3/DRAM)       → memory hierarchy analysis")
     print()
 
-    model_cfg = build_model_cfg(model_path)
-    runtime_metadata, gen_results, phase_boundaries, collector_meta = _collect_via_spawn(
-        args, model_path, events, out_dir, raw_dir, run_id
+    run_start_time = time.time()
+    model_cfg = build_model_cfg(model_path, model_id)
+    runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta = _collect_via_spawn(
+        args, model_path, model_id, events, out_dir, raw_dir, run_id
     )
 
     labelled, region_map, kv_lifecycle = _parse_and_label(
@@ -466,7 +576,11 @@ def main():
     _print_analysis_summary(analysis)
 
     print("Exporting ...")
-    metadata = build_metadata(model_cfg, run_id, runtime_metadata, gen_results, collector_meta)
+    total_wall_duration_s = time.time() - run_start_time
+    metadata = build_metadata(
+        model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
+        thermal_meta=thermal_meta, total_wall_duration_s=total_wall_duration_s,
+    )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(
         trace=labelled, region_map=region_map, kv_lifecycle=kv_lifecycle,
