@@ -239,11 +239,56 @@ sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
-For a populated region_map, you need a debug-symbol build of llama-cpp-python:
+**llama-cpp-python 0.3.34+ ships split shared libraries (libllama.so, libggml.so) with
+1,334 `ggml_*` and 281 `llama_kv_cache*` symbols exported — no debug build needed.**
+
+The standard pip install is sufficient:
 ```bash
-CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python \
+pip install llama-cpp-python \
   --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
+
+---
+
+### Verifying a run output
+
+After any `demo_perf_mem.py` run, confirm the output is valid using the **run-specific path**
+(do not use `glob('results/*/*/trace.parquet')[-1]` — it picks the wrong file when multiple
+model directories exist, since `tinyllama-1.1b-q4km/` sorts after `tinyllama-1.1b-q4km-perf/`).
+
+```bash
+# Replace the run_id with the actual timestamp from the demo output
+python -c "
+import pandas as pd
+f = 'results/tinyllama-1.1b-q4km-perf/<run_id>/trace.parquet'
+df = pd.read_parquet(f)
+print('rows:', len(df))
+print('cache_level non-null:', df['cache_level'].notna().sum())
+print('latency non-null:', df['access_latency_ns'].notna().sum())
+print(df['cache_level'].value_counts())
+print('latency mean (cycles):', round(df['access_latency_ns'].mean(), 1))
+"
+```
+
+Expected for a good perf mem run:
+- `cache_level non-null` ≈ 100% of rows
+- `latency non-null` = 100% of rows
+- `cache_level` breakdown: L1 ~57%, LFB ~36%, DRAM ~4%, L3 ~3%
+- `latency mean` ≈ 70–100 cycles
+
+The pipeline also prints an inline quality gate immediately after parsing (before labelling):
+
+```
+  Trace quality gate [perf_mem] — PASS
+    Rows parsed          : 342,162
+    access_latency_ns    : [████████████████████] 100.0%
+    cache_level          : [████████████████████] 100.0%
+    symbol (non-empty)   : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected for heap data
+    region classified    : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected without alloc events
+```
+
+If `access_latency_ns` or `cache_level` drop below threshold, the pipeline prints `FAIL`
+in red and exits immediately — the run is not exported.
 
 ---
 

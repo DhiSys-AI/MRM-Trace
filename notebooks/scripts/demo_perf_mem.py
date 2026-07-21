@@ -61,6 +61,7 @@ from mrm_trace.engines.llamacpp import LlamaCppEngine
 from mrm_trace.labeller import TraceLabeller
 from mrm_trace.parser.perf_script_parser import parse_perf_script
 from mrm_trace.reporter.run_exporter import RunExporter
+from mrm_trace.reporter.trace_qa import check_trace_quality
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
 from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
@@ -492,7 +493,8 @@ def _parse_and_label(perf_script_txt, run_id, phase_boundaries) -> "tuple[pd.Dat
     print("  Top 15 symbols (expect ggml_* and llama_* with native llama.cpp):")
     for sym, cnt in trace["symbol"].value_counts().head(15).items():
         print(f"    {sym:<50}  {cnt:>6}")
-    print()
+
+    check_trace_quality(trace, collector_type="perf_mem", fail_fast=True)
 
     print("Labelling ...")
     labeller = TraceLabeller()

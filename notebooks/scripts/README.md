@@ -7,10 +7,14 @@ These scripts run **real inference** against small models and capture full mrm-t
 
 ## Scripts
 
-| Script | Model | Backend | Notes |
-|---|---|---|---|
-| `demo_tinyllama.py` | TinyLlama-1.1B Q4_K_M | llama-cpp-python | Needs GGUF download |
-| `demo_qwen_hf.py` | Qwen2.5-0.5B-Instruct | transformers | Auto-downloads from HF |
+| Script | Collector | Root needed | Timestamps | Cache level | Region map |
+|---|---|---|---|---|---|
+| `demo_tinyllama.py` | memray | No (or `--native-traces`) | Always 0 | No | Empty |
+| `demo_qwen_hf.py` | auto-detect | No (memray) / Yes (perf mem) | 0 or ns | perf mem only | Empty (PyTorch) |
+| `demo_perf_mem.py` | perf mem | Yes | Nanoseconds | L1/L2/L3/DRAM | Populated (GGUF) |
+
+**For publication-quality data use `demo_perf_mem.py` on bare-metal Linux.** It is the only
+script that produces real hardware timestamps and a populated cache hierarchy breakdown.
 
 ---
 
@@ -46,20 +50,37 @@ pip install transformers torch accelerate
 ## Running
 
 ```bash
-cd /mnt/c/proj/mrm-trace/notebooks/scripts
+# From the repo root
+source venv/bin/activate
 
-# TinyLlama
-python demo_tinyllama.py --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+# TinyLlama — memray (Python-level only, no timestamps)
+python notebooks/scripts/demo_tinyllama.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
-# Qwen2.5-0.5B
-python demo_qwen_hf.py
+# Qwen2.5-0.5B — auto-detects collector
+python notebooks/scripts/demo_qwen_hf.py
 
-# Custom output directory
-python demo_tinyllama.py --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --out /tmp/mrm_results
+# TinyLlama — perf mem (bare-metal Linux, root, real timestamps + cache levels)
+# IMPORTANT: sudo -E python resolves to system Python — always use the full venv path
+sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
 # More output tokens (slower, richer KV trace)
-python demo_qwen_hf.py --tokens 256
+python notebooks/scripts/demo_qwen_hf.py --tokens 256
 ```
+
+Each run prints an inline quality gate immediately after parsing:
+
+```
+  Trace quality gate [perf_mem] — PASS
+    Rows parsed          : 342,162
+    access_latency_ns    : [████████████████████] 100.0%
+    cache_level          : [████████████████████] 100.0%
+    symbol (non-empty)   : [░░░░░░░░░░░░░░░░░░░░]   0.0%
+    region classified    : [░░░░░░░░░░░░░░░░░░░░]   0.0%
+```
+
+A `FAIL` status exits immediately before export so bad runs are never written to disk.
 
 ---
 

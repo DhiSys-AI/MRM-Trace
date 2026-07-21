@@ -154,7 +154,9 @@ class PerfMemRunner(BaseCollector):
                         # without this flag for mem events.
                         # cpu attribute is not set for all perf mem event types;
                         # omitting it avoids "Cannot print 'cpu' field" exit 255.
-                        "-F", "comm,pid,time,event,addr,sym,dso",
+                        # weight = PEBS load-latency cycles; data_src encodes
+                        # cache hierarchy level and NUMA node.
+                        "-F", "comm,pid,time,event,addr,sym,dso,weight,data_src",
                     ],
                     stdout=fh,
                     stderr=subprocess.PIPE,

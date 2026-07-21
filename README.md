@@ -47,8 +47,9 @@ mode — perf launches the script itself (via `--headless`) so the traced proces
 perf from the first instruction.
 
 **`native_traces`:** memray `native_traces=True` requires root. pip-installed `llama-cpp-python`
-strips C symbols, so `region_map` remains empty (`†`). For a populated region map via memray,
-build llama-cpp-python from source: `CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python`.
+strips C symbols in older versions, so `region_map` remains empty via memray (`†`). For a
+populated region map, use `demo_perf_mem.py` with `llama-cpp-python ≥ 0.3.34`, which exports
+`ggml_*` symbols from its split shared libraries without a debug build.
 
 **region_map with PyTorch (‡):** `perf mem` populates `region_map` only with llama.cpp (GGUF)
 models. PyTorch/transformers symbols (`at::native::*`) do not match the `ggml_*` labeller rules.
@@ -168,6 +169,23 @@ python notebooks/scripts/demo_qwen_hf.py --model Qwen/Qwen2.5-1.5B-Instruct
 sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
+
+`llama-cpp-python ≥ 0.3.34` ships split shared libraries (`libllama.so`, `libggml.so`) with
+1,334 `ggml_*` and 281 `llama_kv_cache*` exported symbols — no debug build required.
+The standard `pip install llama-cpp-python` is sufficient.
+
+After each run, the pipeline prints an inline quality gate before the labelling step:
+
+```
+  Trace quality gate [perf_mem] — PASS
+    Rows parsed          : 342,162
+    access_latency_ns    : [████████████████████] 100.0%
+    cache_level          : [████████████████████] 100.0%
+    symbol (non-empty)   : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected for heap allocations
+    region classified    : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected without alloc events
+```
+
+`FAIL` exits immediately — the run is never exported to disk.
 
 ### Script options
 
