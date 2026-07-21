@@ -59,6 +59,7 @@ from mrm_trace.config.schema import EngineType, ModelConfig, RunConfig
 from mrm_trace.engines.base import PhaseEvent
 from mrm_trace.engines.llamacpp import LlamaCppEngine
 from mrm_trace.labeller import TraceLabeller
+from mrm_trace.labeller.llamacpp_regions import extract_llamacpp_regions, snapshot_proc_maps
 from mrm_trace.parser.perf_script_parser import parse_perf_script
 from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import check_trace_quality
@@ -275,9 +276,11 @@ def run_headless(args) -> None:
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
     )
 
+    pre_load_maps = snapshot_proc_maps()
     engine = LlamaCppEngine(model_cfg, run_cfg)
     engine.prepare()
     engine.load_model()
+    address_regions = extract_llamacpp_regions(str(model_path), pre_load_maps)
     print("Model loaded.")
     print()
 
@@ -306,6 +309,7 @@ def run_headless(args) -> None:
         "phase_records": phase_records,
         "gen_results": gen_results,
         "runtime_metadata": runtime_metadata,
+        "address_regions": address_regions,
     }))
     print()
     print("Headless run complete — perf mem will flush on exit.")
@@ -438,6 +442,7 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     gen_results = timing["gen_results"]
     phase_boundaries = build_phase_boundaries(timing["phase_records"])
     runtime_metadata = timing["runtime_metadata"]
+    address_regions = timing.get("address_regions", [])
 
     print()
     print("Running perf script (flushing perf.data → text) ...")
@@ -473,10 +478,10 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     )
     print(f"  Capture: {collector_meta.output_file_size_bytes:,} bytes (perf.data)")
     print()
-    return runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta
+    return runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta, address_regions
 
 
-def _parse_and_label(perf_script_txt, run_id, phase_boundaries) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
+def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=None) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
     """Parse perf script, label, print symbol summary. Returns (labelled, region_map, kv_lifecycle)."""
     print("Parsing perf script output ...")
     rows = list(parse_perf_script(perf_script_txt, run_id=run_id, phase_boundaries=phase_boundaries))
@@ -498,6 +503,12 @@ def _parse_and_label(perf_script_txt, run_id, phase_boundaries) -> "tuple[pd.Dat
 
     print("Labelling ...")
     labeller = TraceLabeller()
+    if address_regions:
+        n_pages = labeller.register_address_ranges(address_regions)
+        weight_regions = sum(1 for r in address_regions if r.get("region_type") == "weight")
+        kv_regions = sum(1 for r in address_regions if r.get("region_type") == "kv_cache")
+        print(f"  Pre-registered {n_pages:,} pages from /proc/maps "
+              f"({weight_regions} weight mmap, {kv_regions} kv_cache anon)")
     labelled = pd.DataFrame(list(labeller.label(trace.to_dict(orient="records"))))
     region_map = pd.DataFrame(labeller.region_map())
     kv_lifecycle = pd.DataFrame(labeller.kv_lifecycle())
@@ -508,7 +519,9 @@ def _parse_and_label(perf_script_txt, run_id, phase_boundaries) -> "tuple[pd.Dat
         print("  Classified regions:")
         for _, row in region_map.iterrows():
             print(f"    {row.get('region_type', '?'):<15} id={row.get('region_id')}  accesses={row.get('access_count', '?')}")
-    print()
+
+    check_trace_quality(labelled, collector_type="perf_mem_labelled", fail_fast=True)
+
     return labelled, region_map, kv_lifecycle
 
 
@@ -566,12 +579,12 @@ def main():
 
     run_start_time = time.time()
     model_cfg = build_model_cfg(model_path, model_id)
-    runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta = _collect_via_spawn(
+    runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta, address_regions = _collect_via_spawn(
         args, model_path, model_id, events, out_dir, raw_dir, run_id
     )
 
     labelled, region_map, kv_lifecycle = _parse_and_label(
-        raw_dir / "perf_script.txt", run_id, phase_boundaries
+        raw_dir / "perf_script.txt", run_id, phase_boundaries, address_regions
     )
 
     analysis = compute_all(labelled)

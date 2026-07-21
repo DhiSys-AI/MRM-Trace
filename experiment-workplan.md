@@ -2,7 +2,7 @@
 
 *This document is a standalone reproduction guide. A partner with no prior context should be able to follow it start to finish and produce the complete dataset.*
 
-*Last updated: 2026-06-28*
+*Last updated: 2026-07-21*
 
 ---
 
@@ -191,15 +191,23 @@ mrm-trace --help
 
 ### 5.1 llama-cpp-python (CPU path)
 
-```bash
+**Minimum version: 0.3.34.** Versions before 0.3.34 used a monolithic shared library and stripped debug symbols, leaving `region_map` empty. Version 0.3.34+ ships split shared libraries (`libllama.so`, `libggml.so`, `libggml-cpu.so`) that export 1,334 `ggml_*` and 281 `llama_kv_cache*` symbols at link time — no debug build required.
 
-pip install llama-cpp-python \
+```bash
+pip install "llama-cpp-python>=0.3.34" \
   --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
 
 Verify:
 ```bash
-python -c "from llama_cpp import Llama; print('llama-cpp-python OK')"
+python -c "
+import llama_cpp, importlib.metadata
+ver = importlib.metadata.version('llama-cpp-python')
+print(f'llama-cpp-python {ver} OK')
+from llama_cpp import Llama
+print('import OK')
+"
+# Expected: llama-cpp-python 0.3.34 (or newer) OK
 ```
 
 ### 5.2 PyTorch + transformers (GPU path)
@@ -370,10 +378,29 @@ df -h ~   # must have > 200 GB free for safe operation
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --ctx 512 --tokens 32 --batch-size 1 --rep 0
-# Expected: completes without error, prints non-zero Region map and KV lifecycle rows,
-# writes results to results/tinyllama-1.1b-q4km-perf/<run_id>/
+# Expected console output (two inline quality gates printed by the pipeline):
+#
+#   Pre-registered N pages from /proc/maps (M weight mmap, K kv_cache anon)
+#
+#   Trace quality gate [perf_mem] — PASS        ← Gate 1: latency + cache_level
+#     Rows parsed          : 300,000+
+#     access_latency_ns    : [████████████████████] 100.0%
+#     cache_level          : [████████████████████] 100.0%
+#     symbol (non-empty)   : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected
+#     region classified    : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected pre-label
+#
+#   Trace quality gate [perf_mem_labelled] — PASS  ← Gate 2: + region classified
+#     region classified    : [████████...] > 5%   ← weight + kv_cache via /proc/maps
+#
+#   Region map     : (N, 8)   ← non-zero (weight + kv_cache regions)
+#   KV lifecycle   : (N, 8)   ← non-zero
+#
+# If either gate prints FAIL in red, the pipeline exits immediately — the run is
+# NOT exported. Fix the issue (check perf version, PMU availability, llama-cpp ≥ 0.3.34)
+# before continuing.
 RUN_DIR=$(ls -td results/tinyllama-1.1b-q4km-perf/*/ 2>/dev/null | head -1)
-cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq columns
+cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq columns,
+                              # with rows for region_type: weight, kv_cache, unknown
 ```
 
 ---
@@ -627,7 +654,9 @@ kaggle_dataset/
 
 - Hardware: CPU model, RAM, GPU, OS, kernel version
 - Collector: perf mem, perf version, ldlat threshold used
-- Proxy caveat: *"Retention durations are observed lifetimes under a batch schedule on this CPU/GPU's cache hierarchy. The logical access-pattern structure (write-once ratio, read frequency ordering by region type) transfers across substrates and constitutes first-order evidence for MRM silicon design questions. Absolute timing values are machine-specific."*
+- Region classification: weight regions are identified by diffing `/proc/self/maps` before and after `Llama()` construction — GGUF file mmap ranges → `weight`, new anonymous RW regions ≥ 2 MB → `kv_cache`. Runs where `region_classified < 5%` are rejected by the post-labelling quality gate and excluded from the dataset.
+- Quality gate: every run passed two inline gates: (1) pre-labelling — `access_latency_ns` and `cache_level` ≥ 95% populated; (2) post-labelling — `region_classified` ≥ 5%. Runs that failed either gate were discarded and not re-run until the fault was corrected.
+- Proxy caveat: *"Retention durations are observed lifetimes under a batch schedule on this CPU/GPU's cache hierarchy. The logical access-pattern structure (write-once ratio, read frequency ordering by region type) transfers across substrates and constitutes first-order evidence for MRM silicon design questions. Absolute timing values are machine-specific. Weight and KV-cache regions are classified per-run via /proc/maps address-range injection; Python runtime allocations appear as region_type=unknown and are excluded from region-level retention comparisons."*
 - Schema: column definitions for all parquet files
 - Citations: Legtchenko et al. (2025) "Managed-Retention Memory"
 

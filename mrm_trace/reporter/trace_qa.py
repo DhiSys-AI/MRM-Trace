@@ -24,6 +24,14 @@ _THRESHOLDS = {
         "access_latency_ns": (0.95, 0.50),   # (pass_min, warn_min)
         "cache_level":       (0.85, 0.50),
     },
+    # Post-labelling check: region classification must be non-trivial.
+    # weight + kv_cache rows depend on /proc/maps injection; < 5% means
+    # address_regions didn't register or the model backend isn't llama.cpp.
+    "perf_mem_labelled": {
+        "access_latency_ns": (0.95, 0.50),
+        "cache_level":       (0.85, 0.50),
+        "region_classified": (0.05, 0.001),  # FAIL if literally zero
+    },
     "memray": {
         "access_latency_ns": (0.0, 0.0),      # always 0 for memray — not a failure
         "cache_level":       (0.0, 0.0),
@@ -56,6 +64,26 @@ class TraceQA:
         return self.status != "FAIL"
 
 
+def _check_column(col: str, cov: float, thresholds: dict, issues: list) -> str:
+    """Return updated status after checking one coverage value against thresholds."""
+    limits = thresholds.get(col)
+    if limits is None:
+        return "PASS"
+    pass_min, warn_min = limits
+    if cov < warn_min:
+        issues.append(f"{col}: {cov:.0%} coverage (need ≥{warn_min:.0%})")
+        return "FAIL"
+    if cov < pass_min:
+        issues.append(f"{col}: {cov:.0%} coverage (expected ≥{pass_min:.0%})")
+        return "WARN"
+    return "PASS"
+
+
+def _merge_status(current: str, new: str) -> str:
+    order = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    return current if order[current] >= order[new] else new
+
+
 def check_trace_quality(
     trace: pd.DataFrame,
     collector_type: str = "perf_mem",
@@ -68,7 +96,7 @@ def check_trace_quality(
 
     Args:
         trace:          parsed trace DataFrame
-        collector_type: "perf_mem" | "memray" | "default"
+        collector_type: "perf_mem" | "perf_mem_labelled" | "memray" | "default"
         print_report:   print the report to stdout
         fail_fast:      call sys.exit(1) if status is FAIL
 
@@ -76,7 +104,7 @@ def check_trace_quality(
         TraceQA with status and per-column coverage fractions.
     """
     n = len(trace)
-    issues = []
+    issues: list = []
 
     if n == 0:
         qa = TraceQA("FAIL", 0, 0.0, 0.0, 0.0, 0.0, ["No rows parsed"])
@@ -97,19 +125,9 @@ def check_trace_quality(
     )
 
     status = "PASS"
-
-    for col, cov, key in [
-        ("access_latency_ns", lat_cov, "access_latency_ns"),
-        ("cache_level",       cl_cov,  "cache_level"),
-    ]:
-        pass_min, warn_min = thresholds.get(key, (0.5, 0.1))
-        if cov < warn_min:
-            issues.append(f"{col}: {cov:.0%} coverage (need ≥{warn_min:.0%})")
-            status = "FAIL"
-        elif cov < pass_min:
-            issues.append(f"{col}: {cov:.0%} coverage (expected ≥{pass_min:.0%})")
-            if status != "FAIL":
-                status = "WARN"
+    status = _merge_status(status, _check_column("access_latency_ns", lat_cov, thresholds, issues))
+    status = _merge_status(status, _check_column("cache_level",       cl_cov,  thresholds, issues))
+    status = _merge_status(status, _check_column("region_classified", reg_cov, thresholds, issues))
 
     qa = TraceQA(status, n, lat_cov, cl_cov, sym_cov, reg_cov, issues)
 
