@@ -165,18 +165,30 @@ def _get_cpu_package_temp() -> float:
     return read_package_temp_c()
 
 
-def _is_throttled() -> bool:
-    """Check whether any CPU core is running below 85% of its rated max frequency."""
-    cpu_root = pathlib.Path("/sys/devices/system/cpu")
-    for cpu_dir in sorted(cpu_root.glob("cpu[0-9]*"))[:8]:
-        max_f = cpu_dir / "cpufreq" / "cpuinfo_max_freq"
-        cur_f = cpu_dir / "cpufreq" / "scaling_cur_freq"
+def _read_throttle_counts() -> dict:
+    """
+    Read sysfs core_throttle_count for each CPU. Returns {cpu_id: count}.
+    Only increments when the CPU actually hits its thermal limit — unlike
+    frequency scaling, which drops for power-management reasons at any temp.
+    """
+    counts = {}
+    for path in pathlib.Path("/sys/devices/system/cpu").glob(
+        "cpu[0-9]*/thermal_throttle/core_throttle_count"
+    ):
+        cpu_id = path.parts[-3]
         try:
-            if int(cur_f.read_text()) < int(max_f.read_text()) * 0.85:
-                return True
+            counts[cpu_id] = int(path.read_text())
         except OSError:
-            continue
-    return False
+            pass
+    return counts
+
+
+def _new_throttle_events(before: dict, after: dict) -> int:
+    """Return total new thermal throttle events between two snapshots."""
+    return sum(
+        max(0, after.get(cpu, 0) - before.get(cpu, 0))
+        for cpu in after
+    )
 
 
 def wait_for_cool(target_temp: float, log_fn) -> None:
@@ -263,6 +275,7 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
     start_time = time.time()
     start_temp = _get_cpu_package_temp()
     peak_temp = start_temp
+    throttle_before = _read_throttle_counts()
 
     cmd = _build_command(spec, models_dir, machine)
     log_fn(f"  CMD: {' '.join(cmd)}")
@@ -314,7 +327,8 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
     elapsed = time.time() - start_time
     finished_at = _now()
 
-    throttled = _is_throttled()
+    throttle_after = _read_throttle_counts()
+    throttled = _new_throttle_events(throttle_before, throttle_after) > 0
 
     if error is None and returncode != 0:
         error = f"Non-zero exit code: {returncode}"
