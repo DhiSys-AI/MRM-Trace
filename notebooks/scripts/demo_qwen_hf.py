@@ -35,8 +35,13 @@ import time
 import pandas as pd
 
 from mrm_trace.analyser import compute_all
+from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.labeller import TraceLabeller
 from mrm_trace.reporter.run_exporter import RunExporter
+from mrm_trace.reporter.trace_qa import check_trace_quality
+from mrm_trace.telemetry.baseline import capture_baseline
+from mrm_trace.telemetry.observer_effect import compute_observer_effect
+from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, GpuMonitor
 from mrm_trace.utils.ids import generate_run_id
 
 DEFAULT_MODEL_HF = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -216,12 +221,16 @@ def run_headless(args) -> None:
     kv_file.write_text(json.dumps(kv_ranges))
     print(f"  KV cache ranges recorded: {len(kv_ranges)} tensors")
 
+    import psutil
+    target_peak_rss_mb = psutil.Process().memory_info().rss / 1_048_576
+
     results = {
         "load_start_ns": load_start_ns,
         "load_end_ns": load_end_ns,
         "gen_start_ns": gen_start_ns,
         "gen_end_ns": gen_end_ns,
         "gen_results": gen_results,
+        "target_peak_rss_mb": round(target_peak_rss_mb, 1),
     }
     pathlib.Path(args.results_file).write_text(json.dumps(results))
     print()
@@ -258,10 +267,21 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     print("  perf will instrument the full process: model load → generation")
     print()
 
-    result = subprocess.run(perf_cmd)
+    baseline = capture_baseline(duration_s=2.0)
+    cpu_freq_mon = CpuFreqMonitor()
+    gpu_mon = GpuMonitor()
+    proc = subprocess.Popen(perf_cmd)
+    observer_mon = ProcessMonitor([proc.pid], poll_interval_ms=500)
+    cpu_freq_mon.start()
+    gpu_mon.start()
+    observer_mon.start()
+    proc.wait()
+    observer_samples = observer_mon.stop()
+    cpu_freq_stats = cpu_freq_mon.stop()
+    gpu_stats = gpu_mon.stop()
 
-    if result.returncode != 0:
-        print(f"ERROR: perf mem record exited {result.returncode}", file=sys.stderr)
+    if proc.returncode != 0:
+        print(f"ERROR: perf mem record exited {proc.returncode}", file=sys.stderr)
         sys.exit(1)
 
     if not results_file.exists():
@@ -312,6 +332,10 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         print(f"  Check format: head -5 {perf_script_txt}", file=sys.stderr)
         print("  Continuing with empty trace — analysis metrics will be zero.", file=sys.stderr)
 
+    # Gate 1: latency + cache_level coverage — catches broken perf format before
+    # expensive labelling. Exits immediately on FAIL.
+    check_trace_quality(pd.DataFrame(rows), collector_type="perf_mem", fail_fast=True)
+
     # Pre-register weight and KV cache address ranges with the labeller.
     # Perf samples hitting those pages are classified before symbol rules run.
     labeller = TraceLabeller()
@@ -341,7 +365,28 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         print("  (Region map is empty — PyTorch uses internal symbols, not ggml_* names.)")
     print()
 
-    return labelled, region_map, kv_lifecycle, gen_results, phase_boundaries, collector_info
+    # Gate 2: region classification — pytorch_regions.json must have pre-registered
+    # enough pages so weight + kv_cache rows exceed 0.1 % threshold. Exits on FAIL.
+    check_trace_quality(labelled, collector_type="perf_mem_labelled", fail_fast=True)
+
+    target_peak_rss_mb = timing.get("target_peak_rss_mb", 0.0)
+    observer_effect = compute_observer_effect(
+        observer_samples=observer_samples,
+        target_samples=[],
+        thermal_throttle_events=0,
+        baseline_cpu_pct=baseline.cpu_pct,
+    )
+    if target_peak_rss_mb > 0:
+        obs_peak = observer_effect.get("observer_memory_overhead_mb_peak", 0.0)
+        observer_effect["target_rss_mb_peak"] = target_peak_rss_mb
+        observer_effect["observer_memory_overhead_frac"] = (
+            obs_peak / target_peak_rss_mb
+        )
+
+    return (
+        labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
+        collector_info, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+    )
 
 
 def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: str,
@@ -360,14 +405,25 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
         {"phase": "weight_load", "start_ns": load_start_ns, "end_ns": load_end_ns},
     ]
 
+    baseline = capture_baseline(duration_s=1.0)
+    cpu_freq_mon = CpuFreqMonitor()
+    gpu_mon = GpuMonitor()
+    self_mon = ProcessMonitor([os.getpid()], poll_interval_ms=500)
+
     print("Starting memray collector (generation phase only) ...")
     runner.start(target_pids=[], output_dir=raw_dir)
+    cpu_freq_mon.start()
+    gpu_mon.start()
+    self_mon.start()
 
     gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens)
     phase_boundaries.append({"phase": "generation", "start_ns": gen_start_ns, "end_ns": gen_end_ns})
     del model, tokenizer
 
     collector_meta = runner.stop()
+    self_samples = self_mon.stop()
+    cpu_freq_stats = cpu_freq_mon.stop()
+    gpu_stats = gpu_mon.stop()
     print()
     print(f"Capture complete — {collector_meta.output_file_size_bytes:,} bytes")
     print()
@@ -398,21 +454,42 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
         print("  (Region map is empty — transformers uses PyTorch internals, not ggml_ symbols.)")
 
     labelled = pd.read_parquet(trace_path)
+
+    # Gate 1 (memray): thresholds are 0.0 so this never exits, but prints the
+    # quality report so runs are comparable across collector types.
+    check_trace_quality(labelled, collector_type="memray", fail_fast=False)
+
     collector_info = {
         "type": "memray",
         "output_file": collector_meta.output_file,
         "output_file_size_bytes": collector_meta.output_file_size_bytes,
         "native_traces": collector_meta.extra.get("native_traces"),
     }
-    return labelled, region_map, kv_lifecycle, gen_results, phase_boundaries, collector_info, True
+
+    # For memray the model and collector share a process — self_samples covers both.
+    # observer_effect reflects the tracer's own overhead relative to total process RSS.
+    observer_effect = compute_observer_effect(
+        observer_samples=self_samples,
+        target_samples=self_samples,
+        thermal_throttle_events=0,
+        baseline_cpu_pct=baseline.cpu_pct,
+    )
+
+    return (
+        labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
+        collector_info, True, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+    )
 
 
 # ── Main helpers ──────────────────────────────────────────────────────────────
 
-def build_metadata(model_id, run_id, gen_results, collector_info, phase_boundaries, args):
+def build_metadata(
+    model_id, run_id, gen_results, collector_info, phase_boundaries, args,
+    baseline=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
+):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
-    return {
+    metadata = {
         "run_id": run_id,
         "model": {"id": model_id, "hf_repo": args.model, "backend": "transformers"},
         "generation": {
@@ -424,6 +501,31 @@ def build_metadata(model_id, run_id, gen_results, collector_info, phase_boundari
         "collector": collector_info,
         "phase_boundaries": phase_boundaries,
     }
+    if baseline is not None:
+        metadata["hardware"] = {
+            "baseline_cpu_pct": round(baseline.cpu_pct, 2),
+            "baseline_cpu_pct_max": round(baseline.cpu_pct_max, 2),
+            "mem_total_mb": round(baseline.mem_total_mb, 0),
+            "mem_available_mb": round(baseline.mem_available_mb, 0),
+            "mem_used_pct": round(baseline.mem_used_pct, 1),
+            "load_avg_1m": round(baseline.load_avg_1m, 2) if baseline.load_avg_1m is not None else None,
+            "cpu_freq_start_mhz": round(cpu_freq_stats.start_mhz, 0) if cpu_freq_stats else None,
+            "cpu_freq_min_mhz": round(cpu_freq_stats.min_mhz, 0) if cpu_freq_stats else None,
+            "cpu_freq_mean_mhz": round(cpu_freq_stats.mean_mhz, 0) if cpu_freq_stats else None,
+            "cpu_freq_end_mhz": round(cpu_freq_stats.end_mhz, 0) if cpu_freq_stats else None,
+        }
+    if gpu_stats is not None:
+        metadata["gpu"] = {
+            "name": gpu_stats.name,
+            "vram_total_mb": gpu_stats.vram_total_mb,
+            "vram_start_used_mb": gpu_stats.vram_start_used_mb,
+            "vram_peak_used_mb": gpu_stats.vram_peak_used_mb,
+            "vram_end_used_mb": gpu_stats.vram_end_used_mb,
+            "gpu_util_pct_mean": round(gpu_stats.gpu_util_pct_mean, 1),
+        }
+    if observer_effect is not None:
+        metadata["observer_effect"] = observer_effect
+    return metadata
 
 
 def _df_val(df, col, agg="mean"):
@@ -515,8 +617,10 @@ def main():
     _print_run_header(args, collector, is_root, out_dir)
 
     if collector == "perf-mem":
-        labelled, region_map, kv_lifecycle, gen_results, phase_boundaries, collector_info = \
-            collect_with_perf_mem(args, raw_dir, run_id)
+        (
+            labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
+            collector_info, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+        ) = collect_with_perf_mem(args, raw_dir, run_id)
         trace_prewritten = False
     else:
         load_start_ns = time.time_ns()
@@ -524,8 +628,10 @@ def main():
         load_end_ns = time.time_ns()
         print(f"Model loaded in {(load_end_ns - load_start_ns) / 1e9:.1f}s")
         print()
-        labelled, region_map, kv_lifecycle, gen_results, phase_boundaries, collector_info, trace_prewritten = \
-            collect_with_memray(model, tokenizer, args, raw_dir, run_id, load_start_ns, load_end_ns)
+        (
+            labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
+            collector_info, trace_prewritten, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+        ) = collect_with_memray(model, tokenizer, args, raw_dir, run_id, load_start_ns, load_end_ns)
     print()
 
     if labelled.empty:
@@ -537,7 +643,11 @@ def main():
     _print_analysis_summary(analysis)
 
     print("Exporting ...")
-    metadata = build_metadata(model_slug, run_id, gen_results, collector_info, phase_boundaries, args)
+    metadata = build_metadata(
+        model_slug, run_id, gen_results, collector_info, phase_boundaries, args,
+        baseline=baseline, cpu_freq_stats=cpu_freq_stats,
+        gpu_stats=gpu_stats, observer_effect=observer_effect,
+    )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(
         trace=labelled, region_map=region_map, kv_lifecycle=kv_lifecycle,

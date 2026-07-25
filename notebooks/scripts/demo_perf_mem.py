@@ -55,6 +55,7 @@ import pandas as pd
 from mrm_trace.analyser import compute_all
 from mrm_trace.collector.base import CollectorMeta
 from mrm_trace.collector.perf_runner import PerfMemRunner
+from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.config.schema import EngineType, ModelConfig, RunConfig
 from mrm_trace.engines.base import PhaseEvent
 from mrm_trace.engines.llamacpp import LlamaCppEngine
@@ -63,6 +64,9 @@ from mrm_trace.labeller.llamacpp_regions import extract_llamacpp_regions, snapsh
 from mrm_trace.parser.perf_script_parser import parse_perf_script
 from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import check_trace_quality
+from mrm_trace.telemetry.baseline import capture_baseline
+from mrm_trace.telemetry.observer_effect import compute_observer_effect
+from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, GpuMonitor
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
 from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
@@ -183,9 +187,37 @@ def build_phase_boundaries(phase_records):
     return boundaries
 
 
+def _hardware_section(baseline, cpu_freq_stats) -> dict:
+    return {
+        "baseline_cpu_pct": round(baseline.cpu_pct, 2),
+        "baseline_cpu_pct_max": round(baseline.cpu_pct_max, 2),
+        "mem_total_mb": round(baseline.mem_total_mb, 0),
+        "mem_available_mb": round(baseline.mem_available_mb, 0),
+        "mem_used_pct": round(baseline.mem_used_pct, 1),
+        "load_avg_1m": round(baseline.load_avg_1m, 2) if baseline.load_avg_1m is not None else None,
+        "cpu_freq_start_mhz": round(cpu_freq_stats.start_mhz, 0) if cpu_freq_stats else None,
+        "cpu_freq_min_mhz": round(cpu_freq_stats.min_mhz, 0) if cpu_freq_stats else None,
+        "cpu_freq_mean_mhz": round(cpu_freq_stats.mean_mhz, 0) if cpu_freq_stats else None,
+        "cpu_freq_end_mhz": round(cpu_freq_stats.end_mhz, 0) if cpu_freq_stats else None,
+    }
+
+
+def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
+    oe = observer_effect or {}
+    validity = classify_run(
+        observer_cpu_overhead_pct_max=oe.get("observer_cpu_overhead_pct_max", 0.0),
+        observer_memory_frac=oe.get("observer_memory_overhead_frac", 0.0),
+        thermal_throttle_events=thermal_meta["throttle_events"],
+        baseline_cpu_pct=baseline.cpu_pct if baseline else 0.0,
+        io_contention_detected=oe.get("io_contention_detected", False),
+    )
+    return {**thermal_meta, "run_validity": validity.run_validity}
+
+
 def build_metadata(
     model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
     thermal_meta=None, total_wall_duration_s=None,
+    baseline=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
@@ -220,27 +252,24 @@ def build_metadata(
             "total_wall_duration_s": round(total_wall_duration_s, 3),
         }
 
-    if thermal_meta is not None:
-        # Only the thermal-throttle axis of CLAUDE.md's clean/marginal/contaminated
-        # rule is measured here (observer CPU/mem overhead and baseline CPU are not
-        # sampled by this script) — run_validity reflects thermal contamination only,
-        # not the full 5-axis classification.
-        validity = classify_run(
-            observer_cpu_overhead_pct_max=0.0,
-            observer_memory_frac=0.0,
-            thermal_throttle_events=thermal_meta["throttle_events"],
-            baseline_cpu_pct=0.0,
-            io_contention_detected=False,
-        )
-        metadata["thermal"] = {
-            **thermal_meta,
-            "run_validity": validity.run_validity,
-            "run_validity_note": (
-                "Thermal-only: reflects throttle events during this run. "
-                "Observer CPU/memory overhead and baseline CPU are not measured "
-                "by this script, so this is not the full CLAUDE.md validity classification."
-            ),
+    if baseline is not None:
+        metadata["hardware"] = _hardware_section(baseline, cpu_freq_stats)
+
+    if gpu_stats is not None:
+        metadata["gpu"] = {
+            "name": gpu_stats.name,
+            "vram_total_mb": gpu_stats.vram_total_mb,
+            "vram_start_used_mb": gpu_stats.vram_start_used_mb,
+            "vram_peak_used_mb": gpu_stats.vram_peak_used_mb,
+            "vram_end_used_mb": gpu_stats.vram_end_used_mb,
+            "gpu_util_pct_mean": round(gpu_stats.gpu_util_pct_mean, 1),
         }
+
+    if thermal_meta is not None:
+        metadata["thermal"] = _thermal_section(thermal_meta, baseline, observer_effect)
+
+    if observer_effect is not None:
+        metadata["observer_effect"] = observer_effect
 
     return metadata
 
@@ -305,11 +334,15 @@ def run_headless(args) -> None:
     ]
     runtime_metadata = dataclasses.asdict(engine.get_runtime_metadata())
 
+    import psutil
+    peak_rss_mb = psutil.Process().memory_info().rss / 1_048_576
+
     pathlib.Path(args.results_file).write_text(json.dumps({
         "phase_records": phase_records,
         "gen_results": gen_results,
         "runtime_metadata": runtime_metadata,
         "address_regions": address_regions,
+        "target_peak_rss_mb": round(peak_rss_mb, 1),
     }))
     print()
     print("Headless run complete — perf mem will flush on exit.")
@@ -406,14 +439,25 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     current_pid = os.getpid()
     print(f"Starting perf mem collector (spawn mode, launcher PID {current_pid}) ...")
 
+    baseline = capture_baseline(duration_s=2.0)
+    cpu_freq_mon = CpuFreqMonitor()
+    gpu_mon = GpuMonitor()
     start_temp_c = read_package_temp_c()
     thermal_monitor = ThermalMonitor()
     thermal_monitor.begin()
     poller = _PeakTempPoller().start()
     collection_start = time.time()
     try:
-        result = subprocess.run(perf_cmd)
+        proc = subprocess.Popen(perf_cmd)
+        observer_mon = ProcessMonitor([proc.pid], poll_interval_ms=500)
+        cpu_freq_mon.start()
+        gpu_mon.start()
+        observer_mon.start()
+        proc.wait()
     finally:
+        observer_samples = observer_mon.stop()
+        cpu_freq_stats = cpu_freq_mon.stop()
+        gpu_stats = gpu_mon.stop()
         peak_temp_c = poller.stop()
         collection_duration_s = round(time.time() - collection_start, 3)
         throttle_events = thermal_monitor.end()
@@ -429,8 +473,8 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     }
 
     warnings: list = []
-    if result.returncode != 0:
-        warnings.append(f"perf mem record exited {result.returncode}")
+    if proc.returncode != 0:
+        warnings.append(f"perf mem record exited {proc.returncode}")
 
     if not results_file.exists():
         print("ERROR: generation_results.json not written — spawned process failed.", file=sys.stderr)
@@ -478,7 +522,27 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     )
     print(f"  Capture: {collector_meta.output_file_size_bytes:,} bytes (perf.data)")
     print()
-    return runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta, address_regions
+
+    target_peak_rss_mb = timing.get("target_peak_rss_mb", 0.0)
+    observer_effect = compute_observer_effect(
+        observer_samples=observer_samples,
+        target_samples=[],
+        thermal_throttle_events=throttle_events,
+        baseline_cpu_pct=baseline.cpu_pct,
+    )
+    # Patch in target RSS from headless results — process_monitor can't reach the
+    # child process across the perf boundary, so we read it from the results file.
+    if target_peak_rss_mb > 0:
+        obs_peak = observer_effect.get("observer_memory_overhead_mb_peak", 0.0)
+        observer_effect["target_rss_mb_peak"] = target_peak_rss_mb
+        observer_effect["observer_memory_overhead_frac"] = (
+            obs_peak / target_peak_rss_mb if target_peak_rss_mb > 0 else 0.0
+        )
+
+    return (
+        runtime_metadata, gen_results, phase_boundaries, collector_meta,
+        thermal_meta, address_regions, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+    )
 
 
 def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=None) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
@@ -579,9 +643,10 @@ def main():
 
     run_start_time = time.time()
     model_cfg = build_model_cfg(model_path, model_id)
-    runtime_metadata, gen_results, phase_boundaries, collector_meta, thermal_meta, address_regions = _collect_via_spawn(
-        args, model_path, model_id, events, out_dir, raw_dir, run_id
-    )
+    (
+        runtime_metadata, gen_results, phase_boundaries, collector_meta,
+        thermal_meta, address_regions, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+    ) = _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run_id)
 
     labelled, region_map, kv_lifecycle = _parse_and_label(
         raw_dir / "perf_script.txt", run_id, phase_boundaries, address_regions
@@ -595,6 +660,8 @@ def main():
     metadata = build_metadata(
         model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
         thermal_meta=thermal_meta, total_wall_duration_s=total_wall_duration_s,
+        baseline=baseline, cpu_freq_stats=cpu_freq_stats,
+        gpu_stats=gpu_stats, observer_effect=observer_effect,
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(

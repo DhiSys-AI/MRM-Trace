@@ -12,7 +12,6 @@ Exit codes written to the returned TraceQA namedtuple:
 
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
 
 import pandas as pd
 

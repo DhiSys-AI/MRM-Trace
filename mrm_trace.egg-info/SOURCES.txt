@@ -58,6 +58,7 @@ mrm_trace/reporter/trace_qa.py
 mrm_trace/telemetry/__init__.py
 mrm_trace/telemetry/baseline.py
 mrm_trace/telemetry/observer_effect.py
+mrm_trace/telemetry/system_monitor.py
 mrm_trace/telemetry/thermal.py
 mrm_trace/telemetry/validity.py
 mrm_trace/utils/__init__.py

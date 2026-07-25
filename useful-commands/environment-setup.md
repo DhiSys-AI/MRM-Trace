@@ -291,6 +291,37 @@ If `access_latency_ns` or `cache_level` drop below threshold, the pipeline print
 in red and exits immediately — the run is not exported.
 
 ---
+### Qwen test
+```
+sudo -E venv/bin/python notebooks/scripts/demo_qwen_hf.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --ctx 512 --tokens 32 --batch-size 1 --rep 0
+```
+
+```
+# Get the latest Qwen run dir
+RUN_DIR=$(ls -td results/qwen2.5-0.5b-instruct/*/ 2>/dev/null | head -1)
+echo "Run: $RUN_DIR"
+
+python -c "
+import pandas as pd
+
+df = pd.read_parquet('$RUN_DIR/trace.parquet')
+n = len(df)
+print(f'rows              : {n:,}')
+print(f'latency non-null  : {df[\"access_latency_ns\"].notna().sum():,} ({df[\"access_latency_ns\"].notna().mean():.1%})')
+print(f'cache_level       : {df[\"cache_level\"].notna().sum():,} ({df[\"cache_level\"].notna().mean():.1%})')
+print()
+print('cache_level breakdown:')
+print(df['cache_level'].value_counts())
+print()
+print('region_type breakdown:')
+print(df['region_type'].value_counts())
+print()
+print(f'latency mean (cycles): {df[\"access_latency_ns\"].mean():.1f}')
+"
+```
+---
 
 ## perf mem troubleshooting
 
@@ -335,6 +366,8 @@ ruff check mrm_trace/ --select E,F,W --ignore E501
 pip install build && python -m build
 
 # Tag release (version must match pyproject.toml)
-git tag v0.1.10
-git push origin v0.1.10
+git tag v0.1.13
+git push origin v0.1.13
+
+source venv/bin/activate && python -m pytest --tb=short -q 2>&1 | tail -60
 ```
