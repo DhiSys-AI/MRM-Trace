@@ -516,11 +516,13 @@ sudo nvidia-smi -pl 50   # 50 W out of 150 W max during CPU runs
 ### 9.3 Cooling between runs
 
 The experiment runner enforces:
-- **Mandatory 5-minute cooldown** after every run regardless of temperature
-- **Extended wait** until CPU package temp < 55°C before starting the next run
-- Checks temperature every 60 seconds during the wait
+- **Mandatory 60-second cooldown** after every run (sensor-settle time, not a thermal wait)
+- **Adaptive wait** until CPU package temp < 55°C before starting the next run
+- Checks temperature every 60 seconds during the adaptive wait
 
-For large model runs (7B–8B @ 32K context): allow 5 minutes between runs.
+For large model runs (7B–8B): an extra 60-second mandatory pause, then the same adaptive wait until < 55°C.
+
+The 60-second floor exists only to let the thermal sensor stabilise after the subprocess exits. The `wait_for_cool` loop is the real thermal gate — it extends the pause as long as needed regardless of model size.
 
 ### 9.4 Practical advice
 

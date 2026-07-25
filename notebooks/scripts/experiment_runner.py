@@ -61,8 +61,8 @@ TEMP_CONTAMINATED_FALLBACK_C = TEMP_CONTAMINATED_C
 COOL_CHECK_INTERVAL = 60        # seconds between temperature checks while cooling
 
 # Timing — workplan §9.3
-MIN_COOL_SECONDS = 300          # mandatory 5-minute cooldown after every run
-LARGE_MODEL_EXTRA_COOL = 300    # extra 5 minutes for 7B–8B models
+MIN_COOL_SECONDS = 60           # mandatory cooldown after every run (sensor-settle time)
+LARGE_MODEL_EXTRA_COOL = 60     # extra time for 7B–8B models; wait_for_cool() handles the rest
 MAX_RUN_SECONDS = 7200          # 2-hour hard timeout per run
 PROGRESS_INTERVAL = 120         # re-print progress every 2 min
 
