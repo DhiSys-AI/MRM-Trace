@@ -560,6 +560,15 @@ sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --cpu
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --gpu-only
 ```
 
+#### Low End Machines Only
+```bash
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --low-end
+
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --low-end --cpu-only
+
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --low-end --dry-run   # preview first
+```
+
 ### 10.3 Stopping and resuming
 
 To stop gracefully: press `Ctrl+C` once. The runner will finish the current run, save state, and exit cleanly. Press `Ctrl+C` twice to abort mid-run (that run is marked `failed` and will be retried on next resume).
