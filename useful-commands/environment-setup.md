@@ -354,6 +354,13 @@ ls /sys/bus/event_source/devices/cpu/format/ldlat 2>/dev/null && echo "ldlat OK"
 ls /sys/bus/event_source/devices/cpu/events/mem-loads 2>/dev/null && echo "mem-loads OK"
 ```
 
+## Experiment Runner
+```
+sudo -E venv/bin/python notebooks/scripts/experiment_runner.py --low-end
+sudo -E venv/bin/python notebooks/scripts/experiment_runner.py --low-end --cpu-only
+sudo -E venv/bin/python notebooks/scripts/experiment_runner.py --low-end --dry-run   # preview first
+```
+
 ---
 
 ## Build and release

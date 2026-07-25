@@ -100,6 +100,30 @@ FAST_MATRIX = [
     ("cpu", "tinyllama-1.1b", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf", 1.1, 2048, 1, 0),
 ]
 
+# ── Low-end machine limits (--low-end flag) ───────────────────────────────────
+#
+# For machines like i5-8300H (4-core, 2.3 GHz turbo-off) + GTX 1060 6 GB:
+#
+#   CPU path exclusions:
+#   - 7B+ models: ~12–18 s/tok at 2.3 GHz → 50+ min/run, sustained thermal load
+#   - 32K context: KV cache bloat + hours of inference time, throttle risk
+#
+#   GPU path exclusions:
+#   - Llama-3.2-3B (fp16 = 6 GB, exactly GPU limit → OOM from activations)
+#   - Mistral-7B (14 GB fp16, no chance)
+#   Only Qwen2.5-0.5B (~1 GB fp16) is safe on a 6 GB GPU.
+#
+# Keeps 4 CPU models × 2 contexts × 3 batches × 3 reps = 72 runs (CPU)
+# + 1 GPU model × 1 context × 2 batches × 2 reps = 4 runs (GPU)
+# = 76 runs total vs 196 full-matrix runs.
+
+LOW_END_MAX_PARAMS_B = 4.0      # exclude CPU models above this
+LOW_END_MAX_CTX = 8192          # exclude context lengths above this
+LOW_END_GPU_MODELS = [
+    ("qwen2.5-0.5b-gpu", "Qwen/Qwen2.5-0.5B-Instruct", 2048),
+]
+LOW_END_GPU_CONTEXT_LENGTHS = [2048]
+
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -347,63 +371,79 @@ def _resolve_run_validity(output_dir: Optional[str], peak_temp: float) -> str:
 
 # ── Matrix builder ─────────────────────────────────────────────────────────────
 
-def build_matrix(fast: bool = False, cpu_only: bool = False, gpu_only: bool = False) -> List[RunSpec]:
+_FAST_SPEC = RunSpec(
+    key="tinyllama-1.1b__ctx2048__b1__rep0__cpu",
+    path_type="cpu",
+    model_id="tinyllama-1.1b",
+    model_file="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+    params_b=1.1,
+    ctx=2048,
+    batch=1,
+    rep=0,
+    is_warmup=True,
+)
+
+
+def _cpu_specs(models, ctx_lengths) -> List[RunSpec]:
+    specs = []
+    for model_id, model_file, params_b in models:
+        for ctx in ctx_lengths:
+            for batch in BATCH_SIZES:
+                for rep in REPS:
+                    specs.append(RunSpec(
+                        key=f"{model_id}__ctx{ctx}__b{batch}__rep{rep}__cpu",
+                        path_type="cpu",
+                        model_id=model_id,
+                        model_file=model_file,
+                        params_b=params_b,
+                        ctx=ctx,
+                        batch=batch,
+                        rep=rep,
+                        is_warmup=(rep == 0),
+                        max_runtime=MAX_RUN_SECONDS,
+                    ))
+    return specs
+
+
+def _gpu_specs(models, ctx_lengths) -> List[RunSpec]:
+    specs = []
+    for model_id, hf_repo, max_ctx in models:
+        for ctx in ctx_lengths:
+            if ctx > max_ctx:
+                continue
+            for batch in GPU_BATCH_SIZES:
+                for rep in GPU_REPS:
+                    specs.append(RunSpec(
+                        key=f"{model_id}__ctx{ctx}__b{batch}__rep{rep}__gpu",
+                        path_type="gpu",
+                        model_id=model_id,
+                        model_file=hf_repo,
+                        params_b=0.0,
+                        ctx=ctx,
+                        batch=batch,
+                        rep=rep,
+                        is_warmup=(rep == 0),
+                    ))
+    return specs
+
+
+def build_matrix(fast: bool = False, cpu_only: bool = False, gpu_only: bool = False,
+                 low_end: bool = False) -> List[RunSpec]:
     if fast:
-        return [
-            RunSpec(
-                key="tinyllama-1.1b__ctx2048__b1__rep0__cpu",
-                path_type="cpu",
-                model_id="tinyllama-1.1b",
-                model_file="tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-                params_b=1.1,
-                ctx=2048,
-                batch=1,
-                rep=0,
-                is_warmup=True,
-            )
-        ]
+        return [_FAST_SPEC]
+
+    cpu_models = [(m, f, p) for m, f, p in CPU_MODELS
+                  if not low_end or p <= LOW_END_MAX_PARAMS_B]
+    ctx_lengths = [c for c in CONTEXT_LENGTHS
+                   if not low_end or c <= LOW_END_MAX_CTX]
+    gpu_models = LOW_END_GPU_MODELS if low_end else GPU_MODELS
+    gpu_ctx_lengths = LOW_END_GPU_CONTEXT_LENGTHS if low_end else GPU_CONTEXT_LENGTHS
 
     specs = []
-
     if not gpu_only:
-        for model_id, model_file, params_b in CPU_MODELS:
-            for ctx in CONTEXT_LENGTHS:
-                for batch in BATCH_SIZES:
-                    for rep in REPS:
-                        key = f"{model_id}__ctx{ctx}__b{batch}__rep{rep}__cpu"
-                        specs.append(RunSpec(
-                            key=key,
-                            path_type="cpu",
-                            model_id=model_id,
-                            model_file=model_file,
-                            params_b=params_b,
-                            ctx=ctx,
-                            batch=batch,
-                            rep=rep,
-                            is_warmup=(rep == 0),
-                            max_runtime=MAX_RUN_SECONDS,
-                        ))
-
+        specs += _cpu_specs(cpu_models, ctx_lengths)
     if not cpu_only:
-        for model_id, hf_repo, max_ctx in GPU_MODELS:
-            for ctx in GPU_CONTEXT_LENGTHS:
-                if ctx > max_ctx:
-                    continue
-                for batch in GPU_BATCH_SIZES:
-                    for rep in GPU_REPS:
-                        key = f"{model_id}__ctx{ctx}__b{batch}__rep{rep}__gpu"
-                        specs.append(RunSpec(
-                            key=key,
-                            path_type="gpu",
-                            model_id=model_id,
-                            model_file=hf_repo,
-                            params_b=0.0,
-                            ctx=ctx,
-                            batch=batch,
-                            rep=rep,
-                            is_warmup=(rep == 0),
-                        ))
-
+        specs += _gpu_specs(gpu_models, gpu_ctx_lengths)
     return specs
 
 
@@ -508,6 +548,8 @@ def main():
     parser.add_argument("--retry-failed", action="store_true", dest="retry_failed", help="Retry failed runs")
     parser.add_argument("--dry-run",      action="store_true", dest="dry_run", help="Print plan without running")
     parser.add_argument("--fast",         action="store_true", help="Single validation run (TinyLlama 1 prompt)")
+    parser.add_argument("--low-end",      action="store_true", dest="low_end",
+                        help="Exclude models > 4B and 32K context (safe for i5-8300H + GTX 1060 6 GB)")
     parser.add_argument("--cpu-only",     action="store_true", dest="cpu_only")
     parser.add_argument("--gpu-only",     action="store_true", dest="gpu_only")
     parser.add_argument("--models-dir",   default="models", dest="models_dir",
@@ -523,7 +565,8 @@ def main():
     log(f"experiment_runner.py started — pid {os.getpid()}")
 
     # Build the full experiment matrix
-    all_specs = build_matrix(fast=args.fast, cpu_only=args.cpu_only, gpu_only=args.gpu_only)
+    all_specs = build_matrix(fast=args.fast, cpu_only=args.cpu_only, gpu_only=args.gpu_only,
+                             low_end=args.low_end)
     log(f"Matrix: {len(all_specs)} runs planned")
 
     # Load or reset state
