@@ -373,8 +373,8 @@ ruff check mrm_trace/ --select E,F,W --ignore E501
 pip install build && python -m build
 
 # Tag release (version must match pyproject.toml)
-git tag v0.1.13
-git push origin v0.1.13
+git tag v0.1.14
+git push origin v0.1.14
 
 source venv/bin/activate && python -m pytest --tb=short -q 2>&1 | tail -60
 ```

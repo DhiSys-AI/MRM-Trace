@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mrm-trace"
-version = "0.1.13"
+version = "0.1.14"
 description = "Scientific instrumentation for LLM inference memory trace collection and MRM research"
 readme = "README.md"
 requires-python = ">=3.11"
