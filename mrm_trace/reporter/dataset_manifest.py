@@ -8,11 +8,14 @@ into individual parquet / metadata files as needed.
 
 Columns (all nullable):
   run_id, machine_id, model_id, collector,
-  context_length, batch_size, rep, run_validity,
+  context_length, batch_size, max_tokens_per_prompt, rep, run_validity,
   peak_temp_c, throttle_events, total_wall_s,
   avg_tok_per_s, total_output_tokens,
   retention_p99_s, write_once_ratio_mean, working_set_pages_total,
   cpu_model, cpu_freq_scaling_max_mhz, os, kernel, recorded_at
+
+  max_tokens_per_prompt: the --tokens ceiling passed at run time (the experimental variable).
+  total_output_tokens:   actual tokens generated across all prompts (the measurement).
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ def build_manifest_row(run_id: str, metadata: dict, analysis: dict) -> dict[str,
         "collector": collector_info.get("type"),
         "context_length": gen.get("context_length"),
         "batch_size": gen.get("batch_size"),
+        "max_tokens_per_prompt": gen.get("output_tokens"),
         "rep": gen.get("rep_index"),
         "run_validity": thermal.get("run_validity"),
         "peak_temp_c": thermal.get("peak_temp_c"),

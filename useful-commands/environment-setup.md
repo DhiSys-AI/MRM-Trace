@@ -202,6 +202,11 @@ sudo -E venv/bin/python notebooks/scripts/demo_qwen_hf.py --collector perf-mem
 
 # Larger model:
 python notebooks/scripts/demo_qwen_hf.py --model Qwen/Qwen2.5-1.5B-Instruct
+
+# Custom token limit (default 256 — lower for quick tests, higher for longer generations)
+python notebooks/scripts/demo_qwen_hf.py --tokens 512
+# The ceiling is saved in metadata.json (generation.output_tokens) and
+# manifest.csv (max_tokens_per_prompt). Actual output may be lower if EOS fires first.
 ```
 
 † region_map is empty because PyTorch symbols don't match ggml_* labeller rules.
@@ -221,6 +226,11 @@ python notebooks/scripts/demo_tinyllama.py \
 sudo -E venv/bin/python notebooks/scripts/demo_tinyllama.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --native-traces
+
+# Custom token limit (default 128)
+python notebooks/scripts/demo_tinyllama.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --tokens 256
 ```
 
 ---
@@ -237,7 +247,26 @@ sudo perf mem record -o /dev/null -- true && echo "PMU OK"
 # Run (use full venv path - sudo -E python resolves to system Python)
 sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# Custom token limit (default 128 — raise for longer KV cache retention windows)
+sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --tokens 256
 ```
+
+### Token limits — what is recorded
+
+All three demo scripts accept `--tokens N` to cap output per prompt. Two values end up in
+the dataset:
+
+| Field | Location | Meaning |
+|---|---|---|
+| `max_tokens_per_prompt` | `manifest.csv` | The `--tokens` ceiling you passed (experimental variable) |
+| `generation.output_tokens` | `metadata.json` | Same value, per-run record |
+| `total_output_tokens` | `manifest.csv` | Actual tokens generated across all prompts (measurement) |
+
+`total_output_tokens` can be lower than `max_tokens_per_prompt × num_prompts` if the model
+generates an EOS token before reaching the ceiling — normal for shorter answers.
 
 **llama-cpp-python 0.3.34+ ships split shared libraries (libllama.so, libggml.so) with
 1,334 `ggml_*` and 281 `llama_kv_cache*` symbols exported — no debug build needed.**
@@ -375,8 +404,8 @@ ruff check mrm_trace/ --select E,F,W --ignore E501
 pip install build && python -m build
 
 # Tag release (version must match pyproject.toml)
-git tag v0.1.16
-git push origin v0.1.16
+git tag v0.1.17
+git push origin v0.1.17
 
 source venv/bin/activate && python -m pytest --tb=short -q 2>&1 | tail -60
 ```

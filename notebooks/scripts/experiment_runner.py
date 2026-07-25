@@ -65,7 +65,8 @@ MAX_RUN_SECONDS = 7200          # 2-hour hard timeout per run
 PROGRESS_INTERVAL = 120         # re-print progress every 2 min
 
 # Output tokens (fixed across all runs for comparability)
-OUTPUT_TOKENS = 256
+# 512 gives a longer KV cache growth window and cleaner retention histograms vs 256.
+OUTPUT_TOKENS = 512
 
 # ── Experiment Matrix ──────────────────────────────────────────────────────────
 

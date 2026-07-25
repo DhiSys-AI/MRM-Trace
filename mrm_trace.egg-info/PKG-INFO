@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: mrm-trace
-Version: 0.1.16
+Version: 0.1.17
 Summary: Scientific instrumentation for LLM inference memory trace collection and MRM research
 Author-email: DhiSys AI <pat2echo@gmail.com>
 License-Expression: MIT
@@ -233,17 +233,33 @@ After each run, the pipeline prints an inline quality gate before the labelling 
 |---|---|---|
 | `--model PATH` | varies | GGUF path or HuggingFace model ID |
 | `--ctx N` | 2048 | Context length |
-| `--tokens N` | 128/256 | Max output tokens per prompt |
+| `--tokens N` | 128 (perf_mem/tinyllama), 256 (qwen) | **Max output tokens per prompt** — recorded in `manifest.csv` as `max_tokens_per_prompt` |
 | `--batch-size N` | 1 | Number of prompts in the batch |
 | `--rep N` | 0 | Repetition index (0 = warmup; 1+ = data runs) |
 | `--out DIR` | `results/` | Output base directory |
+| `--machine SLUG` | hostname | Machine identifier used as `results/<machine>/` subdirectory |
 | `--collector auto\|memray\|perf-mem` | `auto` | Override collector selection (Qwen demo only) |
 | `--native-traces` | auto (root check) | Force `native_traces=True` for memray |
 | `--no-native-traces` | — | Force `native_traces=False` |
 
-All scripts run 5 real prompts and write `trace.parquet`, `region_map.parquet`,
-`kv_block_lifecycle.parquet`, `metrics.csv`, `metadata.json`, and `manifest.json` to
-`results/<model_id>/<run_id>/`.
+**Setting your own token limit:**
+```bash
+# Longer generations — more KV cache growth, longer retention windows
+python notebooks/scripts/demo_qwen_hf.py --tokens 512
+
+# Short test run
+sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --tokens 32
+```
+The ceiling you pass is saved as `max_tokens_per_prompt` in `manifest.csv` and as
+`generation.output_tokens` in `metadata.json`. The actual tokens the model generated
+(may be less if EOS fires early) appear separately as `total_output_tokens` in `manifest.csv`.
+
+All scripts run **7 prompts** (P1–P7: general history topics, a long-form Africa essay for
+sustained KV growth, and a Roman Empire follow-up for KV reuse measurement) and write
+`trace.parquet`, `region_map.parquet`, `kv_block_lifecycle.parquet`, `metrics.csv`,
+`metadata.json`, and `manifest.json` to `results/<machine_id>/<model_id>/<run_id>/`.
+A dataset-level `results/manifest.csv` accumulates one summary row per run across all machines.
 
 ---
 
@@ -296,20 +312,25 @@ known metric outputs (e.g. a 30s weight retention window must yield `retention_p
 
 ## Output layout
 
-Each run writes to `results/<model_id>/<run_id>/`:
+Each run writes to `results/<machine_id>/<model_id>/<run_id>/`. A dataset-level
+`results/manifest.csv` accumulates one summary row per run (all machines, all models).
 
 ```
-results/llama-7b/run_20240101_120000/
-├── trace.parquet                  ← labelled memory access trace
-├── region_map.parquet             ← one row per region (weight, kv_cache, …)
-├── kv_block_lifecycle.parquet     ← per-block write / read / eviction timestamps
-├── metrics.csv                    ← per-region-type summary (human-readable)
-├── metadata.json                  ← hardware, software, observer effect, run validity
-├── manifest.json                  ← SHA-256 checksums for all files
-└── raw/
-    ├── perf.data
-    ├── perf_script.txt
-    └── memray.bin
+results/
+├── manifest.csv                         ← one row per run (cross-machine summary for Kaggle)
+└── dell-g5/                             ← machine slug (from hostname or --machine)
+    └── tinyllama-1.1b-q4km-perf/
+        └── run_20240101_120000/
+            ├── trace.parquet            ← labelled memory access trace
+            ├── region_map.parquet       ← one row per region (weight, kv_cache, …)
+            ├── kv_block_lifecycle.parquet  ← per-block write / read / eviction timestamps
+            ├── metrics.csv              ← per-region-type summary (human-readable)
+            ├── metadata.json            ← hardware, software, observer effect, run validity
+            ├── manifest.json            ← SHA-256 checksums for all files
+            └── raw/
+                ├── perf.data
+                ├── perf_script.txt
+                └── memray.bin
 ```
 
 ---

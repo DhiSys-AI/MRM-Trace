@@ -77,11 +77,18 @@ from mrm_trace.validate_machine import collect_machine_context
 DEFAULT_MODEL = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
 PROMPTS = [
-    "Explain memory management in operating systems. Focus on virtual memory, paging, and TLB.",
-    "Write a Python function that implements a least-recently-used (LRU) cache using a dict and a deque.",
-    "What are the key differences between supervised, unsupervised, and reinforcement learning? Give one example of each.",
-    "Describe the transformer architecture. Explain how multi-head self-attention differs from single-head attention.",
-    "How does garbage collection work in the JVM? Compare generational GC to reference counting in CPython.",
+    # P1–P5: general history and social topics — accessible to all model sizes
+    "Describe the rise and fall of the Roman Empire. What were the key political and military factors behind its decline?",
+    "What caused the First World War, and how did it reshape the political map of Europe and the wider world?",
+    "How did the Industrial Revolution transform working conditions, daily life, and urbanisation in 19th-century Britain?",
+    "What were the main causes and lasting consequences of the French Revolution? How did its ideals spread beyond France?",
+    "How did the Silk Road shape cultural exchange and trade between Asia, the Middle East, and Europe over centuries?",
+    # P6: long-form prose — drives sustained KV cache growth and extended retention window
+    "Summarise the history of Africa from ancient civilisations through colonialism to independence movements in the 20th century.",
+    # P7: semantic follow-up to P1 (same knowledge domain: Roman Empire) —
+    # exercises KV cache reuse or overwrite: weight regions accessed for P1 are
+    # revisited here, and KV pages written during P1 may be read before P7 overwrites them.
+    "How did the Roman Empire expand and eventually declined. What were the key internal and external factors behind its decline?",
 ]
 
 MODEL_ID = "tinyllama-1.1b-q4km-perf"

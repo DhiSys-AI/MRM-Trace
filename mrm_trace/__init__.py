@@ -1,6 +1,6 @@
 """mrm-trace: LLM inference memory trace platform for MRM research."""
 
-__version__ = "0.1.16"
+__version__ = "0.1.17"
 
 from mrm_trace.api import Experiment
 

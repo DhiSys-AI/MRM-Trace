@@ -420,7 +420,16 @@ cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq colu
 | Reps per config | 3 (rep 0 = warmup, reps 1–2 = data) | 3 |
 | **Total CPU runs** | 6 × 3 × 3 × 3 | **162** |
 
-Output tokens per run: **256** (fixed across all configs).
+Output tokens per run: **256** (default). Override per-run with `--tokens N`:
+```bash
+# Example: 512 output tokens per prompt
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --tokens 512
+```
+The configured ceiling is recorded in `metadata.json` as `generation.output_tokens` and in
+`manifest.csv` as `max_tokens_per_prompt`. The actual tokens generated (which may be lower
+if the model hits EOS before the ceiling) appears as `total_output_tokens` in `manifest.csv`.
 
 ### 8.2 GPU path (cross-validation - transformers, PyTorch GPU)
 
@@ -686,6 +695,8 @@ Do not wait for the full 186-run sweep. After nights 1–2 (TinyLlama + Llama-3.
 
 ```bash
 # Dev machine - test run (tinyllama, fast)
+# --tokens controls max output tokens per prompt (default 128 for perf_mem, 256 for qwen)
+# Recorded in manifest.csv as max_tokens_per_prompt for cross-run comparison
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
   --ctx 2048 --tokens 128 --batch-size 1 --rep 1

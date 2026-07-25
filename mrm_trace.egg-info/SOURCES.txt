@@ -49,6 +49,7 @@ mrm_trace/parser/perf_script_parser.py
 mrm_trace/parser/schema.py
 mrm_trace/parser/writer.py
 mrm_trace/reporter/__init__.py
+mrm_trace/reporter/dataset_manifest.py
 mrm_trace/reporter/figures.py
 mrm_trace/reporter/manifest.py
 mrm_trace/reporter/metrics_csv.py
@@ -65,3 +66,4 @@ mrm_trace/utils/__init__.py
 mrm_trace/utils/files.py
 mrm_trace/utils/ids.py
 mrm_trace/utils/logging.py
+mrm_trace/utils/machine.py
