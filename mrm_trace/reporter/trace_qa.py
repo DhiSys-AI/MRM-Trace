@@ -70,10 +70,10 @@ def _check_column(col: str, cov: float, thresholds: dict, issues: list) -> str:
         return "PASS"
     pass_min, warn_min = limits
     if cov < warn_min:
-        issues.append(f"{col}: {cov:.0%} coverage (need ≥{warn_min:.0%})")
+        issues.append(f"{col}: {cov:.1%} coverage (need ≥{warn_min:.1%})")
         return "FAIL"
     if cov < pass_min:
-        issues.append(f"{col}: {cov:.0%} coverage (expected ≥{pass_min:.0%})")
+        issues.append(f"{col}: {cov:.1%} coverage (expected ≥{pass_min:.1%})")
         return "WARN"
     return "PASS"
 
