@@ -12,10 +12,12 @@ Columns (all nullable):
   peak_temp_c, throttle_events, total_wall_s,
   avg_tok_per_s, total_output_tokens,
   retention_p99_s, write_once_ratio_mean, working_set_pages_total,
-  cpu_model, cpu_freq_scaling_max_mhz, os, kernel, recorded_at
+  cpu_model, cpu_freq_scaling_max_mhz, os, kernel,
+  has_prompt_outputs, recorded_at
 
   max_tokens_per_prompt: the --tokens ceiling passed at run time (the experimental variable).
   total_output_tokens:   actual tokens generated across all prompts (the measurement).
+  has_prompt_outputs:    True when prompt_outputs.json was written for this run.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ def _df_agg(analysis: dict, key: str, col: str, agg: str) -> Optional[float]:
     return round(float(vals.agg(agg)), 4)
 
 
-def build_manifest_row(run_id: str, metadata: dict, analysis: dict) -> dict[str, Any]:
+def build_manifest_row(run_id: str, metadata: dict, analysis: dict, has_prompt_outputs: bool = False) -> dict[str, Any]:
     """
     Build a single flat manifest row from a completed run's metadata + analysis.
 
@@ -80,11 +82,12 @@ def build_manifest_row(run_id: str, metadata: dict, analysis: dict) -> dict[str,
         "cpu_freq_scaling_max_mhz": hw.get("cpu_freq_scaling_max_mhz"),
         "os": sw.get("os"),
         "kernel": sw.get("kernel"),
+        "has_prompt_outputs": has_prompt_outputs,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def append_manifest_row(manifest_path: Path, run_id: str, metadata: dict, analysis: dict) -> Path:
+def append_manifest_row(manifest_path: Path, run_id: str, metadata: dict, analysis: dict, has_prompt_outputs: bool = False) -> Path:
     """
     Append one row to the dataset manifest CSV.
 
@@ -96,7 +99,7 @@ def append_manifest_row(manifest_path: Path, run_id: str, metadata: dict, analys
     """
     manifest_path = Path(manifest_path)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    row = build_manifest_row(run_id, metadata, analysis)
+    row = build_manifest_row(run_id, metadata, analysis, has_prompt_outputs=has_prompt_outputs)
     df = pd.DataFrame([row])
     write_header = not manifest_path.exists()
     df.to_csv(manifest_path, mode="a", header=write_header, index=False)

@@ -213,6 +213,90 @@ The data from these runs is still scientifically valuable: `access_latency_ns` a
 
 ---
 
+## Region classification: which path works, which doesn't
+
+This clarifies a common point of confusion after hitting `Pre-registered 0 weight tensors → 0 pages` and `region_type = unknown` in the output.
+
+### The two classification mechanisms
+
+1. **Symbol-based** — regex rules match C symbol names from `perf script` output: `ggml_*` → weight, `llama_kv_cache_*` → kv_cache. These come from llama.cpp's C library. PyTorch symbols (`at::native::*`, `torch::autograd::*`) never match these rules.
+
+2. **Address-range pre-registration** — before perf collection, enumerate model tensors (`model.named_parameters()` for PyTorch; `/proc/self/maps` diff for llama.cpp), record their virtual address ranges, and pre-classify any perf sample whose address falls inside. This is the `pytorch_regions.json` / `kv_ranges.json` path in `demo_qwen_hf.py`.
+
+### Why `CMAKE_BUILD_TYPE=Debug pip install llama-cpp-python` doesn't help PyTorch runs
+
+The debug build makes `ggml_*` symbols visible in perf script output — mechanism (1) above. It has zero effect on PyTorch/HuggingFace runs because:
+- PyTorch symbols (`at::native::*`) still don't match the labeller rules.
+- The llama.cpp library isn't even loaded in a PyTorch run.
+
+The debug build is only relevant for `demo_perf_mem.py` (GGUF model via llama.cpp). It will not fix region classification in `demo_qwen_hf.py`.
+
+### Why `Pre-registered 0 weight tensors → 0 pages` even with the pre-scan wired up
+
+`demo_qwen_hf.py` uses `--device auto` by default, which becomes `device_map="auto"` in HuggingFace. On a machine with a CUDA GPU, `device_map="auto"` loads the model into GPU VRAM. Every tensor then has `device.type == "cuda"`, and `extract_pytorch_regions()` explicitly skips non-CPU tensors:
+
+```python
+if tensor.device.type != "cpu":
+    return
+```
+
+This is correct behaviour — GPU VRAM addresses are not accessible to the CPU PMU — but it means `pytorch_regions.json` is written as an empty list `[]`, and the pre-registration prints `0 weight tensors`.
+
+**Workaround:** force CPU with `--device cpu`. The model runs slowly but every weight access is now captured by `perf mem`:
+
+```bash
+sudo -E venv/bin/python notebooks/scripts/demo_qwen_hf.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct --device cpu \
+  --ctx 512 --tokens 32 --batch-size 1 --rep 0
+```
+
+### The correct path for publication data with classified regions
+
+Use `demo_perf_mem.py` with a GGUF model and a debug-symbol build of `llama-cpp-python`. The `ggml_*` symbols are then visible in `perf script` output and the labeller classifies weight and KV cache regions correctly:
+
+```bash
+CMAKE_BUILD_TYPE=Debug pip install --no-binary llama-cpp-python --force-reinstall llama-cpp-python
+
+sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py \
+  --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --ctx 512 --tokens 32 --batch-size 1 --rep 0
+```
+
+Note: `CMAKE_BUILD_TYPE=Debug` only takes effect during a **source compilation**. If pip resolves to a pre-built wheel (no `--no-binary`), the env var is silently ignored and the installed binary is still stripped.
+
+### Summary table
+
+| Script | Backend | GPU present | Classified regions? | Fix |
+|---|---|---|---|---|
+| `demo_perf_mem.py` | llama.cpp GGUF | n/a | Yes — with debug build | `CMAKE_BUILD_TYPE=Debug pip install --no-binary ...` |
+| `demo_qwen_hf.py` | PyTorch | Yes (default) | No — tensors on CUDA | `--device cpu` |
+| `demo_qwen_hf.py` | PyTorch | No / `--device cpu` | Partial — weights yes, KV maybe | Use CPU machine or force `--device cpu` |
+| `demo_tinyllama.py` | llama.cpp / memray | n/a | No — pip strips C symbols | memray can't see ggml symbols without debug build |
+
+---
+
+## TinyLlama prompt behaviour — partial output is acceptable
+
+TinyLlama 1.1B Q4_K_M emits EOS immediately (0 tokens) for most multi-sentence analytical history questions. This was observed in a live run:
+
+```
+[1/7] Describe the rise and fall of the Roman Empire...  → 27 tokens @ 2.9 tok/s
+[2/7] What caused the First World War...                 →  0 tokens @ 0.0 tok/s
+[3/7] How did the Industrial Revolution...               →  0 tokens @ 0.0 tok/s
+[4/7] What were the main causes...French Revolution...   →  0 tokens @ 0.0 tok/s
+[5/7] How did the Silk Road...                           →  0 tokens @ 0.0 tok/s
+[6/7] Summarise the history of Africa...                 →  0 tokens @ 0.0 tok/s
+[7/7] How did the Roman Empire expand...                 → 20 tokens @ 2.7 tok/s
+```
+
+**Decision: keep the original prompts and accept 0-token responses from TinyLlama.** Prompts that generate 0 tokens still produce valid trace data — the model processes the full prompt through its attention layers (weight accesses, KV writes) even when it declines to generate output. The `prompt_tokens` count is non-zero and the memory access pattern during prefill is captured. Only the generation phase KV retention is absent.
+
+This is expected model-capability behaviour, not an instrumentation bug. The same prompts run correctly on Qwen 2.5 and any model ≥ 3B parameters. TinyLlama's 0-token responses are flagged in `prompt_outputs.json` (empty `output` field) so dataset consumers can filter them out if needed.
+
+The prompts are identical across all three demo scripts for cross-model comparability.
+
+---
+
 ## Low-end machine experiment safety
 
 The `experiment_runner.py` accepts `--fast` to skip larger/slower model configurations. On a machine like an i5-8300H (16 GB RAM, no discrete GPU), safe models are those that fit in quantised form within available RAM with headroom for the OS and tracing overhead:

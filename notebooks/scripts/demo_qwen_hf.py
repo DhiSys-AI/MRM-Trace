@@ -716,6 +716,7 @@ def main():
         analysis=analysis, metadata=metadata, run_id=run_id,
         trace_already_written=trace_prewritten,
         manifest_csv=results_root / "manifest.csv",
+        prompt_outputs=gen_results,
     )
     print(f"  Output: {out_dir}/")
     for fname in sorted(export_result.file_names):

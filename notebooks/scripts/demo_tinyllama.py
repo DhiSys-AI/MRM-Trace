@@ -29,7 +29,6 @@ region_map note:
 """
 
 import argparse
-import dataclasses
 import json
 import os
 import pathlib
@@ -172,7 +171,14 @@ def _run_generation(engine: LlamaCppEngine) -> "tuple[list, int, int]":
         print(f"  [{i}/{len(PROMPTS)}] {raw_prompt[:60]}...")
         print("          generating", end="", flush=True)
         result = engine.generate(prompt)
-        gen_results.append(result)
+        gen_results.append({
+            "prompt": raw_prompt,
+            "output_text": result.text,
+            "prompt_tokens": result.prompt_tokens,
+            "output_tokens": result.output_tokens,
+            "duration_s": result.duration_s,
+            "tokens_per_second": result.tokens_per_second,
+        })
         print(f" → {result.output_tokens} tokens @ {result.tokens_per_second:.1f} tok/s")
     return gen_results, gen_start_ns, time.time_ns()
 
@@ -264,7 +270,7 @@ def run_headless(args) -> None:
     results = {
         "gen_start_ns": gen_start_ns,
         "gen_end_ns": gen_end_ns,
-        "gen_results": [dataclasses.asdict(r) for r in gen_results],
+        "gen_results": gen_results,
         "phase_records": phase_records_raw,
     }
     results_path.write_text(json.dumps(results))
@@ -428,7 +434,7 @@ def collect_with_memray(args, raw_dir: pathlib.Path, run_id: str,
 
     labelled = pd.read_parquet(trace_path)
 
-    gen_results_raw = [dataclasses.asdict(r) for r in gen_results]
+    gen_results_raw = gen_results
     collector_info = {
         "type": "memray",
         "output_file": collector_meta.output_file,
@@ -584,6 +590,7 @@ def main():
         trace=labelled, region_map=region_map, kv_lifecycle=kv_lifecycle,
         analysis=analysis, metadata=metadata, run_id=run_id,
         trace_already_written=trace_prewritten,
+        prompt_outputs=gen_results_raw,
     )
     print(f"  Output: {out_dir}/")
     for fname in sorted(export_result.file_names):

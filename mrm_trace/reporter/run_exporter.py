@@ -24,6 +24,26 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+
+def _write_prompt_outputs(run_dir: Path, gen_results: list) -> Path:
+    """Write prompt_outputs.json — one entry per prompt with text and token counts."""
+    data = {
+        "prompts": [
+            {
+                "index": i,
+                "prompt": r.get("prompt", ""),
+                "output": r.get("output_text", ""),
+                "prompt_tokens": r.get("prompt_tokens"),
+                "tokens_generated": r.get("output_tokens"),
+                "duration_s": r.get("duration_s"),
+            }
+            for i, r in enumerate(gen_results)
+        ]
+    }
+    path = Path(run_dir) / "prompt_outputs.json"
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
 import pandas as pd
 
 from mrm_trace.reporter.dataset_manifest import append_manifest_row
@@ -69,6 +89,7 @@ class RunExporter:
         figures: bool = True,
         trace_already_written: bool = False,
         manifest_csv: Optional[Path] = None,
+        prompt_outputs: Optional[List[dict]] = None,
     ) -> "ExportResult":
         """
         Write all artifacts and return an ExportResult.
@@ -110,10 +131,16 @@ class RunExporter:
         if figures:
             written.extend(generate_all_figures(analysis, self.run_dir))
 
+        if prompt_outputs is not None:
+            written.append(_write_prompt_outputs(self.run_dir, prompt_outputs))
+
         manifest_path = write_manifest(self.run_dir, run_id, files=written)
 
         if manifest_csv is not None and metadata is not None:
-            append_manifest_row(Path(manifest_csv), run_id, metadata, analysis)
+            append_manifest_row(
+                Path(manifest_csv), run_id, metadata, analysis,
+                has_prompt_outputs=(prompt_outputs is not None),
+            )
 
         return ExportResult(
             run_dir=self.run_dir,

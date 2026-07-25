@@ -358,6 +358,8 @@ def run_headless(args) -> None:
         print("          generating", end="", flush=True)
         result = engine.generate(prompt)
         gen_results.append({
+            "prompt": prompt,
+            "output_text": result.text,
             "output_tokens": result.output_tokens,
             "prompt_tokens": result.prompt_tokens,
             "duration_s": result.duration_s,
@@ -720,6 +722,7 @@ def main():
         trace=labelled, region_map=region_map, kv_lifecycle=kv_lifecycle,
         analysis=analysis, metadata=metadata, run_id=run_id,
         manifest_csv=results_root / "manifest.csv",
+        prompt_outputs=gen_results,
     )
     print(f"  Output: {out_dir}/")
     for fname in sorted(export_result.file_names):
