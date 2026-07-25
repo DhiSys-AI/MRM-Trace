@@ -24,9 +24,11 @@ import argparse
 import json
 import os
 import pathlib
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -292,17 +294,36 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
             text=True,
         )
 
-        # Stream output while monitoring temperature and timeout
+        # Read stdout on a background thread so the main loop can poll
+        # temperature and enforce the timeout independently of child output.
+        # Without this, blocking readline() during silent phases (model load,
+        # 30–120 s) prevents temperature updates and timeout enforcement.
+        line_queue: queue.Queue = queue.Queue()
+
+        def _reader(pipe, q):
+            try:
+                for line in pipe:
+                    q.put(line.rstrip())
+            finally:
+                q.put(None)  # sentinel
+
+        reader_thread = threading.Thread(target=_reader, args=(proc.stdout, line_queue), daemon=True)
+        reader_thread.start()
+
         output_lines = []
-        while True:
-            line = proc.stdout.readline()
-            if line:
-                line = line.rstrip()
+        reader_done = False
+        while not reader_done or proc.poll() is None:
+            # Drain all available lines without blocking
+            while True:
+                try:
+                    line = line_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if line is None:
+                    reader_done = True
+                    break
                 output_lines.append(line)
                 log_fn(f"    | {line}")
-                # Track peak temperature from our own readings
-            elif proc.poll() is not None:
-                break
 
             temp = _get_cpu_package_temp()
             peak_temp = max(peak_temp, temp)
@@ -314,6 +335,9 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
                 proc.wait()
                 error = f"Timeout after {elapsed:.0f}s"
                 break
+
+            if not reader_done:
+                time.sleep(0.5)
 
         if proc.poll() is not None:
             returncode = proc.returncode
@@ -384,7 +408,11 @@ def _resolve_run_validity(output_dir: Optional[str], peak_temp: float) -> str:
                 return validity
         except (OSError, ValueError):
             pass
-    return "contaminated" if peak_temp > TEMP_CONTAMINATED_FALLBACK_C else "unknown"
+    if peak_temp > TEMP_CONTAMINATED_FALLBACK_C:
+        return "contaminated"
+    if peak_temp > TEMP_WARN_C:
+        return "marginal"
+    return "unknown"
 
 
 # ── Matrix builder ─────────────────────────────────────────────────────────────

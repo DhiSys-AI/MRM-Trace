@@ -23,6 +23,7 @@ _CLEAN_BASELINE_CPU = 15.0
 _MARGINAL_CPU = 20.0
 _MARGINAL_MEM_FRAC = 0.15
 _MARGINAL_THROTTLE = 2
+_MARGINAL_BASELINE_CPU = 30.0
 
 # Temperature thresholds — exported so experiment_runner.py can use the same values.
 TEMP_RUNNING_WARN_C: float = 75.0   # running warm; log but continue
@@ -101,6 +102,7 @@ def classify_run(
         observer_cpu_overhead_pct_max < _MARGINAL_CPU
         and observer_memory_frac < _MARGINAL_MEM_FRAC
         and thermal_throttle_events <= _MARGINAL_THROTTLE
+        and baseline_cpu_pct < _MARGINAL_BASELINE_CPU
         and not io_contention_detected
         and peak_temp_c <= TEMP_CONTAMINATED_C
     )

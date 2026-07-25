@@ -40,6 +40,7 @@ def capture_baseline(
         Interval between CPU samples.
     """
     cpu_samples = []
+    psutil.cpu_percent(interval=None)  # discard — establishes the measurement window
     t_start = time.monotonic()
     t_end = t_start + duration_s
 

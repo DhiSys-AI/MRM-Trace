@@ -52,10 +52,24 @@ class ProcessMonitor:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._start_mono: float = 0.0
+        self._procs: dict = {}  # pid → psutil.Process, cached across samples
 
     def start(self) -> None:
         """Start the background sampling thread."""
         self._start_mono = time.monotonic()
+        # Build and warm the Process cache before the loop starts.
+        # psutil.cpu_percent() returns 0.0 on the first call for any Process
+        # object because it has no prior reference interval — subsequent calls
+        # return the real value. Creating a new Process(pid) each sample would
+        # make every reading 0.0, making observer_cpu_overhead_pct_max always 0.
+        self._procs = {}
+        for pid in self._pids:
+            try:
+                proc = psutil.Process(pid)
+                proc.cpu_percent()  # discard — establishes the reference interval
+                self._procs[pid] = proc
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="process-monitor"
@@ -89,7 +103,14 @@ class ProcessMonitor:
 
     def _sample(self, pid: int, t_s: float) -> Optional[ProcessSample]:
         try:
-            proc = psutil.Process(pid)
+            proc = self._procs.get(pid)
+            if proc is None:
+                # PID appeared after start() (e.g. child spawned mid-run).
+                # Warm immediately and cache; first reading will be 0.0 but
+                # subsequent ones will be correct.
+                proc = psutil.Process(pid)
+                proc.cpu_percent()
+                self._procs[pid] = proc
             mem = proc.memory_info()
             io = proc.io_counters() if hasattr(proc, "io_counters") else None
             ctx = proc.num_ctx_switches() if hasattr(proc, "num_ctx_switches") else None

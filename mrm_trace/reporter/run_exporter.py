@@ -24,6 +24,19 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import pandas as pd
+
+from mrm_trace.reporter.dataset_manifest import append_manifest_row
+from mrm_trace.reporter.figures import generate_all_figures
+from mrm_trace.reporter.manifest import write_manifest
+from mrm_trace.reporter.metrics_csv import write_metrics_csv
+from mrm_trace.reporter.parquet_export import (
+    export_kv_lifecycle,
+    export_region_map,
+    export_trace,
+)
+from mrm_trace.utils.files import ensure_dir
+
 
 def _write_prompt_outputs(run_dir: Path, gen_results: list) -> Path:
     """Write prompt_outputs.json — one entry per prompt with text and token counts."""
@@ -43,19 +56,6 @@ def _write_prompt_outputs(run_dir: Path, gen_results: list) -> Path:
     path = Path(run_dir) / "prompt_outputs.json"
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
-
-import pandas as pd
-
-from mrm_trace.reporter.dataset_manifest import append_manifest_row
-from mrm_trace.reporter.figures import generate_all_figures
-from mrm_trace.reporter.manifest import write_manifest
-from mrm_trace.reporter.metrics_csv import write_metrics_csv
-from mrm_trace.reporter.parquet_export import (
-    export_kv_lifecycle,
-    export_region_map,
-    export_trace,
-)
-from mrm_trace.utils.files import ensure_dir
 
 
 class RunExporter:

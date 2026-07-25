@@ -404,6 +404,13 @@ sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
 RUN_DIR=$(ls -td results/tinyllama-1.1b-q4km-perf/*/ 2>/dev/null | head -1)
 cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq columns,
                               # with rows for region_type: weight, kv_cache, unknown
+
+# 9. Validity test suite — run before dataset release
+#    Verifies that known synthetic inputs produce known metric outputs.
+#    These are the most important tests: a 30 s weight-retention trace must
+#    yield retention_p99_s ≈ 30.0, a write-once trace must yield ratio ≈ 1.0, etc.
+#    All must pass before any data is exported or uploaded.
+"$MRM_ROOT/venv/bin/python" -m pytest -m validity -q
 ```
 
 ---

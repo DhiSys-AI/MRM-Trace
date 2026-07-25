@@ -43,6 +43,8 @@ from mrm_trace.reporter.trace_qa import check_trace_quality
 from mrm_trace.telemetry.baseline import capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
 from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, GpuMonitor, read_cpu_freq_limits
+from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
+from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
 from mrm_trace.utils.machine import machine_slug
 from mrm_trace.validate_machine import collect_machine_context
@@ -289,6 +291,9 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     baseline = capture_baseline(duration_s=2.0)
     cpu_freq_mon = CpuFreqMonitor()
     gpu_mon = GpuMonitor()
+    start_temp_c = read_package_temp_c()
+    thermal_monitor = ThermalMonitor()
+    thermal_monitor.begin()
     proc = subprocess.Popen(perf_cmd)
     observer_mon = ProcessMonitor([proc.pid], poll_interval_ms=500)
     cpu_freq_mon.start()
@@ -298,6 +303,15 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     observer_samples = observer_mon.stop()
     cpu_freq_stats = cpu_freq_mon.stop()
     gpu_stats = gpu_mon.stop()
+    peak_temp_c = read_package_temp_c()
+    throttle_events = thermal_monitor.end()
+    thermal_meta = {
+        "start_temp_c": round(start_temp_c, 1),
+        "peak_temp_c": round(peak_temp_c, 1),
+        "end_temp_c": round(peak_temp_c, 1),
+        "throttle_events": throttle_events,
+        "throttled": throttle_events > 0,
+    }
 
     if proc.returncode != 0:
         print(f"ERROR: perf mem record exited {proc.returncode}", file=sys.stderr)
@@ -394,7 +408,7 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     observer_effect = compute_observer_effect(
         observer_samples=observer_samples,
         target_samples=[],
-        thermal_throttle_events=0,
+        thermal_throttle_events=throttle_events,
         baseline_cpu_pct=baseline.cpu_pct,
     )
     if target_peak_rss_mb > 0:
@@ -409,7 +423,7 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     return (
         labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
         collector_info, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
-        machine_ctx,
+        machine_ctx, thermal_meta,
     )
 
 
@@ -437,6 +451,9 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
     self_mon = ProcessMonitor([os.getpid()], poll_interval_ms=500)
 
     print("Starting memray collector (generation phase only) ...")
+    start_temp_c = read_package_temp_c()
+    thermal_monitor = ThermalMonitor()
+    thermal_monitor.begin()
     runner.start(target_pids=[], output_dir=raw_dir)
     cpu_freq_mon.start()
     gpu_mon.start()
@@ -450,6 +467,15 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
     self_samples = self_mon.stop()
     cpu_freq_stats = cpu_freq_mon.stop()
     gpu_stats = gpu_mon.stop()
+    peak_temp_c = read_package_temp_c()
+    throttle_events = thermal_monitor.end()
+    thermal_meta = {
+        "start_temp_c": round(start_temp_c, 1),
+        "peak_temp_c": round(peak_temp_c, 1),
+        "end_temp_c": round(peak_temp_c, 1),
+        "throttle_events": throttle_events,
+        "throttled": throttle_events > 0,
+    }
     print()
     print(f"Capture complete — {collector_meta.output_file_size_bytes:,} bytes")
     print()
@@ -497,14 +523,14 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
     observer_effect = compute_observer_effect(
         observer_samples=self_samples,
         target_samples=self_samples,
-        thermal_throttle_events=0,
+        thermal_throttle_events=throttle_events,
         baseline_cpu_pct=baseline.cpu_pct,
     )
 
     return (
         labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
         collector_info, True, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
-        machine_ctx,
+        machine_ctx, thermal_meta,
     )
 
 
@@ -549,16 +575,30 @@ def _gpu_section(gpu_stats, machine_ctx) -> dict:
     return section
 
 
+def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
+    oe = observer_effect or {}
+    validity = classify_run(
+        observer_cpu_overhead_pct_max=oe.get("observer_cpu_overhead_pct_max", 0.0),
+        observer_memory_frac=oe.get("observer_memory_overhead_frac", 0.0),
+        thermal_throttle_events=thermal_meta["throttle_events"],
+        baseline_cpu_pct=baseline.cpu_pct if baseline else 0.0,
+        io_contention_detected=oe.get("io_contention_detected", False),
+        peak_temp_c=thermal_meta.get("peak_temp_c", 0.0),
+    )
+    return {**thermal_meta, "run_validity": validity.run_validity}
+
+
 def build_metadata(
     model_id, run_id, gen_results, collector_info, phase_boundaries, args,
     baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
-    machine_ctx=None, machine_id=None,
+    machine_ctx=None, thermal_meta=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
+    machine_id = (machine_ctx or {}).get("machine_id", "")
     metadata = {
         "run_id": run_id,
-        "machine_id": machine_id or "",
+        "machine_id": machine_id,
         "model": {"id": model_id, "hf_repo": args.model, "backend": "transformers"},
         "generation": {
             "prompts": len(gen_results),
@@ -582,6 +622,8 @@ def build_metadata(
         metadata["gpu"] = gpu
     if observer_effect is not None:
         metadata["observer_effect"] = observer_effect
+    if thermal_meta is not None:
+        metadata["thermal"] = _thermal_section(thermal_meta, baseline, observer_effect)
     return metadata
 
 
@@ -679,7 +721,7 @@ def main():
         (
             labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
             collector_info, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
-            machine_ctx,
+            machine_ctx, thermal_meta,
         ) = collect_with_perf_mem(args, raw_dir, run_id)
         trace_prewritten = False
     else:
@@ -691,8 +733,10 @@ def main():
         (
             labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
             collector_info, trace_prewritten, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
-            machine_ctx,
+            machine_ctx, thermal_meta,
         ) = collect_with_memray(model, tokenizer, args, raw_dir, run_id, load_start_ns, load_end_ns)
+    if machine_ctx is not None:
+        machine_ctx["machine_id"] = mslug
     print()
 
     if labelled.empty:
@@ -708,7 +752,7 @@ def main():
         model_slug, run_id, gen_results, collector_info, phase_boundaries, args,
         baseline=baseline, cpu_freq_limits=cpu_freq_limits, cpu_freq_stats=cpu_freq_stats,
         gpu_stats=gpu_stats, observer_effect=observer_effect, machine_ctx=machine_ctx,
-        machine_id=mslug,
+        thermal_meta=thermal_meta,
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(
