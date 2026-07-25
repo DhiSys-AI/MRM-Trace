@@ -355,9 +355,11 @@ ls /sys/bus/event_source/devices/cpu/events/mem-loads 2>/dev/null && echo "mem-l
 ```
 
 ## Experiment Runner
-```
+```bash
 sudo -E venv/bin/python notebooks/scripts/experiment_runner.py --low-end
+
 sudo -E venv/bin/python notebooks/scripts/experiment_runner.py --low-end --cpu-only
+
 sudo -E venv/bin/python notebooks/scripts/experiment_runner.py --low-end --dry-run   # preview first
 ```
 
@@ -373,8 +375,8 @@ ruff check mrm_trace/ --select E,F,W --ignore E501
 pip install build && python -m build
 
 # Tag release (version must match pyproject.toml)
-git tag v0.1.15
-git push origin v0.1.15
+git tag v0.1.16
+git push origin v0.1.16
 
 source venv/bin/activate && python -m pytest --tb=short -q 2>&1 | tail -60
 ```

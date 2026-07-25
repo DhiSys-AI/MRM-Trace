@@ -26,6 +26,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -607,6 +608,7 @@ def collect_machine_context(out_dir: str = ".") -> dict:
         "software": {
             "os": f"{platform.system()} {platform.release()}",
             "kernel": platform.release(),
+            "hostname": socket.gethostname(),
             "is_wsl2": is_wsl2,
             "perf_bin": perf_bin,
             "perf_version": perf_version,

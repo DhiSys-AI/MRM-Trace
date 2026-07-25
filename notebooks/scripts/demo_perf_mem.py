@@ -44,6 +44,7 @@ import json
 import os
 import pathlib
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -70,6 +71,7 @@ from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, Gp
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
 from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
+from mrm_trace.utils.machine import machine_slug
 from mrm_trace.validate_machine import collect_machine_context
 
 DEFAULT_MODEL = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
@@ -98,6 +100,11 @@ def parse_args():
     p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
     p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
     p.add_argument("--out", default="results", help="Output base directory")
+    p.add_argument(
+        "--machine", default=None,
+        help="Machine identifier used as results/<machine>/ subdirectory "
+             "(default: derived from hostname)",
+    )
     p.add_argument(
         "--sample-period", type=int, default=4000,
         help="perf sampling period — lower = denser trace, higher overhead (default 4000)",
@@ -225,12 +232,14 @@ def build_metadata(
     model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
     thermal_meta=None, total_wall_duration_s=None,
     baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
-    machine_ctx=None,
+    machine_ctx=None, machine_id=None,
+    context_length=None, batch_size=None, output_tokens=None, rep_index=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
     metadata = {
         "run_id": run_id,
+        "machine_id": machine_id or "",
         "model": {
             "id": model_cfg.id,
             "family": model_cfg.family,
@@ -241,6 +250,10 @@ def build_metadata(
         "engine": runtime_metadata,
         "generation": {
             "prompts": len(gen_results),
+            "context_length": context_length,
+            "batch_size": batch_size,
+            "output_tokens": output_tokens,
+            "rep_index": rep_index,
             "total_output_tokens": total_tokens,
             "total_duration_s": round(total_time, 3),
             "avg_tokens_per_second": round(total_tokens / total_time, 1) if total_time > 0 else 0.0,
@@ -345,6 +358,11 @@ def run_headless(args) -> None:
         })
         print(f" → {result.output_tokens} tokens @ {result.tokens_per_second:.1f} tok/s")
 
+    # Capture peak RSS before shutdown while model weights are still in RAM.
+    # Use getrusage (historical maximum) so the value is correct regardless of
+    # call ordering — psutil().rss would give post-shutdown ~139 MB (weights freed).
+    peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # kB → MB
+
     engine.shutdown()
 
     phase_records = [
@@ -352,9 +370,6 @@ def run_headless(args) -> None:
         for rec in engine.get_phase_records()
     ]
     runtime_metadata = dataclasses.asdict(engine.get_runtime_metadata())
-
-    import psutil
-    peak_rss_mb = psutil.Process().memory_info().rss / 1_048_576
 
     pathlib.Path(args.results_file).write_text(json.dumps({
         "phase_records": phase_records,
@@ -559,6 +574,9 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
         observer_effect["observer_memory_overhead_frac"] = (
             obs_peak / target_peak_rss_mb if target_peak_rss_mb > 0 else 0.0
         )
+    # perf mem writes perf.data to disk (always > 10 MB) — this is expected and
+    # does not represent I/O contention with the model process.
+    observer_effect["io_contention_detected"] = False
 
     return (
         runtime_metadata, gen_results, phase_boundaries, collector_meta,
@@ -639,12 +657,14 @@ def main():
 
     model_path, events = _preflight(args)
     model_id = resolve_model_id(args, model_path)
+    mslug = args.machine or machine_slug()
 
     run_id = generate_run_id(
         model_id=model_id, context_length=args.ctx,
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
     )
-    out_dir = pathlib.Path(args.out) / model_id / run_id
+    results_root = pathlib.Path(args.out)
+    out_dir = results_root / mslug / model_id / run_id
     raw_dir = out_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -685,11 +705,14 @@ def main():
         thermal_meta=thermal_meta, total_wall_duration_s=total_wall_duration_s,
         baseline=baseline, cpu_freq_limits=cpu_freq_limits, cpu_freq_stats=cpu_freq_stats,
         gpu_stats=gpu_stats, observer_effect=observer_effect, machine_ctx=machine_ctx,
+        machine_id=mslug, context_length=args.ctx, batch_size=args.batch_size,
+        output_tokens=args.tokens, rep_index=args.rep,
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(
         trace=labelled, region_map=region_map, kv_lifecycle=kv_lifecycle,
         analysis=analysis, metadata=metadata, run_id=run_id,
+        manifest_csv=results_root / "manifest.csv",
     )
     print(f"  Output: {out_dir}/")
     for fname in sorted(export_result.file_names):

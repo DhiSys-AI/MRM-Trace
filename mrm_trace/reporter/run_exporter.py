@@ -1,17 +1,21 @@
 """
 RunExporter — orchestrates writing all publication-ready artifacts to a run dir.
 
-Output layout (per ADR-7):
-  results/<model_id>/<run_id>/
-    trace.parquet
-    region_map.parquet
-    kv_block_lifecycle.parquet
-    metrics.csv
-    metadata.json
-    manifest.json
-    retention_histogram.png   (if matplotlib available)
-    working_set.png           (if matplotlib available)
-    write_once.png            (if matplotlib available)
+Output layout (per ADR-7, updated for multi-machine):
+  results/
+    manifest.csv                        ← dataset-level, one row per run (all machines)
+    <machine_id>/
+      <model_id>/
+        <run_id>/
+          trace.parquet
+          region_map.parquet
+          kv_block_lifecycle.parquet
+          metrics.csv                   ← per-run analysis (one row per region_type)
+          metadata.json
+          manifest.json
+          retention_histogram.png       (if matplotlib available)
+          working_set.png
+          write_once.png
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 
+from mrm_trace.reporter.dataset_manifest import append_manifest_row
 from mrm_trace.reporter.figures import generate_all_figures
 from mrm_trace.reporter.manifest import write_manifest
 from mrm_trace.reporter.metrics_csv import write_metrics_csv
@@ -63,6 +68,7 @@ class RunExporter:
         run_id: str = "unknown",
         figures: bool = True,
         trace_already_written: bool = False,
+        manifest_csv: Optional[Path] = None,
     ) -> "ExportResult":
         """
         Write all artifacts and return an ExportResult.
@@ -79,6 +85,8 @@ class RunExporter:
         figures               : whether to generate figures (skipped if matplotlib absent)
         trace_already_written : set True when trace.parquet was written by the caller
                                 (e.g. via streaming write_parquet). Avoids a second write.
+        manifest_csv          : path to the dataset-level manifest.csv (results root).
+                                When provided, one summary row is appended after export.
         """
         ensure_dir(self.run_dir)
 
@@ -103,6 +111,9 @@ class RunExporter:
             written.extend(generate_all_figures(analysis, self.run_dir))
 
         manifest_path = write_manifest(self.run_dir, run_id, files=written)
+
+        if manifest_csv is not None and metadata is not None:
+            append_manifest_row(Path(manifest_csv), run_id, metadata, analysis)
 
         return ExportResult(
             run_dir=self.run_dir,

@@ -34,6 +34,7 @@ from typing import Dict, List, Optional
 
 from mrm_trace.telemetry.thermal import read_package_temp_c
 from mrm_trace.telemetry.validity import TEMP_CONTAMINATED_C, TEMP_WARN_C
+from mrm_trace.utils.machine import machine_slug
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -226,7 +227,7 @@ def _now() -> str:
 
 # ── Run execution ─────────────────────────────────────────────────────────────
 
-def _build_command(spec: RunSpec, models_dir: pathlib.Path) -> List[str]:
+def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> List[str]:
     if spec.path_type == "cpu":
         model_path = models_dir / spec.model_file
         return [
@@ -238,6 +239,7 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path) -> List[str]:
             "--tokens", str(OUTPUT_TOKENS),
             "--batch-size", str(spec.batch),
             "--rep", str(spec.rep),
+            "--machine", machine,
             "--out", str(RESULTS_DIR),
         ]
     else:  # gpu
@@ -249,18 +251,19 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path) -> List[str]:
             "--tokens", str(OUTPUT_TOKENS),
             "--batch-size", str(spec.batch),
             "--rep", str(spec.rep),
+            "--machine", machine,
             "--collector", "auto",
             "--out", str(RESULTS_DIR),
         ]
 
 
-def run_one(spec: RunSpec, models_dir: pathlib.Path, log_fn) -> RunResult:
+def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> RunResult:
     started_at = _now()
     start_time = time.time()
     start_temp = _get_cpu_package_temp()
     peak_temp = start_temp
 
-    cmd = _build_command(spec, models_dir)
+    cmd = _build_command(spec, models_dir, machine)
     log_fn(f"  CMD: {' '.join(cmd)}")
 
     proc = None
@@ -526,9 +529,10 @@ def print_status(state: Dict, all_specs: List[RunSpec]) -> None:
     print()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main helpers ──────────────────────────────────────────────────────────────
 
 _shutdown_requested = False
+
 
 def _handle_sigint(sig, frame):
     global _shutdown_requested
@@ -539,9 +543,8 @@ def _handle_sigint(sig, frame):
     print("\n[Ctrl+C] Shutdown after current run completes. Press again to force-exit.")
 
 
-def main():
-    global _shutdown_requested
-
+def _parse_cli() -> "tuple":
+    """Parse CLI arguments. Returns (args, machine_slug)."""
     parser = argparse.ArgumentParser(description="MRM-trace experiment runner")
     parser.add_argument("--status",       action="store_true", help="Show status and exit")
     parser.add_argument("--restart",      action="store_true", help="Discard state, restart from scratch")
@@ -554,30 +557,24 @@ def main():
     parser.add_argument("--gpu-only",     action="store_true", dest="gpu_only")
     parser.add_argument("--models-dir",   default="models", dest="models_dir",
                         help="Directory containing GGUF model files (default: models/)")
+    parser.add_argument(
+        "--machine", default=None,
+        help="Machine identifier for results/<machine>/ subdirectory and manifest.csv "
+             "(default: derived from hostname)",
+    )
     args = parser.parse_args()
+    return args, args.machine or machine_slug()
 
-    models_dir = pathlib.Path(args.models_dir)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    signal.signal(signal.SIGINT, _handle_sigint)
-
-    log = Logger(LOG_FILE)
-    log(f"experiment_runner.py started — pid {os.getpid()}")
-
-    # Build the full experiment matrix
-    all_specs = build_matrix(fast=args.fast, cpu_only=args.cpu_only, gpu_only=args.gpu_only,
-                             low_end=args.low_end)
-    log(f"Matrix: {len(all_specs)} runs planned")
-
-    # Load or reset state
+def _init_state(args, all_specs: List[RunSpec], log) -> Dict:
+    """Load/reset state and apply --retry-failed. Returns the state dict."""
     if args.restart:
         log("--restart: discarding existing state")
-        state = {"version": 1, "created_at": _now(), "last_updated": _now(), "runs": {}}
+        state: Dict = {"version": 1, "created_at": _now(), "last_updated": _now(), "runs": {}}
         _save_state(state)
     else:
         state = _load_state()
 
-    # Reset failed runs if requested
     if args.retry_failed:
         for key, v in list(state["runs"].items()):
             if v.get("status") == "failed":
@@ -585,38 +582,47 @@ def main():
                 log(f"  Reset failed run: {key}")
         _save_state(state)
 
-    # --status: just print and exit
-    if args.status:
-        print_status(state, all_specs)
+    return state
+
+
+def _verify_model_files(all_specs: List[RunSpec], models_dir: pathlib.Path) -> None:
+    """Exit with a clear message if any required GGUF model files are missing."""
+    missing = [
+        str(models_dir / s.model_file)
+        for s in all_specs
+        if s.path_type == "cpu" and not (models_dir / s.model_file).exists()
+    ]
+    if not missing:
         return
+    print("\nMissing model files:")
+    for m in missing:
+        print(f"  {m}")
+    print("\nDownload them per experiment-workplan.md Section 6.1, then re-run.")
+    sys.exit(1)
 
-    # --dry-run: print the pending runs
-    if args.dry_run:
-        print_status(state, all_specs)
-        print("Pending runs (would execute):")
-        for s in all_specs:
-            if state["runs"].get(s.key, {}).get("status") != "done":
-                print(f"  {s.key}")
-        return
 
-    # Verify model files exist
-    missing = []
-    for s in all_specs:
-        if s.path_type == "cpu":
-            p = models_dir / s.model_file
-            if not p.exists():
-                missing.append(str(p))
-    if missing:
-        print("\nMissing model files:")
-        for m in missing:
-            print(f"  {m}")
-        print("\nDownload them per experiment-workplan.md Section 6.1, then re-run.")
-        sys.exit(1)
+def _result_flag(result: RunResult) -> str:
+    """Return the bracketed status tag to append to the DONE log line."""
+    if result.contaminated:
+        return " [CONTAMINATED — excluded from dataset]"
+    if result.throttled or result.peak_temp_c > TEMP_CONTAMINATED_C:
+        return " [THROTTLED — check quality]"
+    if result.peak_temp_c > TEMP_WARN_C:
+        return " [WARM — thermal warning, at most marginal]"
+    return ""
 
-    # Print starting summary
-    print_status(state, all_specs)
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
+def _do_cooldown(spec: RunSpec, log) -> None:
+    """Mandatory inter-run cooldown per workplan §9.3."""
+    cool_time = MIN_COOL_SECONDS + (LARGE_MODEL_EXTRA_COOL if spec.params_b >= 7.0 else 0)
+    log(f"   Mandatory {cool_time}s cooldown before next run...")
+    time.sleep(cool_time)
+    wait_for_cool(TEMP_COOL_TARGET, log)
+
+
+def _run_loop(all_specs: List[RunSpec], state: Dict,
+              models_dir: pathlib.Path, machine: str, log) -> None:
+    """Execute all pending runs in order, respecting thermal limits and shutdown."""
     run_count = 0
     last_progress_time = time.time()
 
@@ -625,11 +631,9 @@ def main():
             log("Shutdown requested — stopping after saving state.")
             break
 
-        existing = state["runs"].get(spec.key, {})
-        if existing.get("status") == "done":
-            continue  # already completed
+        if state["runs"].get(spec.key, {}).get("status") == "done":
+            continue
 
-        # Periodic progress re-print
         if time.time() - last_progress_time > PROGRESS_INTERVAL:
             print_status(state, all_specs)
             last_progress_time = time.time()
@@ -642,57 +646,75 @@ def main():
             f"{'WARMUP' if spec.is_warmup else 'DATA'}")
         log(f"   CPU temp: {temp:.1f}°C")
 
-        # Wait to cool if needed
         if temp > TEMP_START_MAX:
             log(f"   Too hot ({temp:.1f}°C > {TEMP_START_MAX}°C). Waiting to cool...")
             wait_for_cool(TEMP_START_MAX, log)
             log(f"   Cool enough ({_get_cpu_package_temp():.1f}°C). Starting run.")
 
-        # Mark as running in state (allows detection of mid-run crashes)
         state["runs"][spec.key] = {"status": "running", "started_at": _now()}
         _save_state(state)
 
-        # Execute
-        result = run_one(spec, models_dir, log)
+        result = run_one(spec, models_dir, machine, log)
         _mark(state, spec.key, result)
         _save_state(state)
         run_count += 1
 
         if result.status == "done":
-            flag = ""
-            if result.contaminated:
-                flag = " [CONTAMINATED — excluded from dataset]"
-            elif result.throttled or result.peak_temp_c > TEMP_CONTAMINATED_C:
-                flag = " [THROTTLED — check quality]"
-            elif result.peak_temp_c > TEMP_WARN_C:
-                flag = " [WARM — thermal warning, at most marginal]"
-            log(f"   DONE in {result.duration_s:.0f}s, peak {result.peak_temp_c:.1f}°C{flag}")
+            log(f"   DONE in {result.duration_s:.0f}s, "
+                f"peak {result.peak_temp_c:.1f}°C{_result_flag(result)}")
         else:
             log(f"   FAILED: {result.error}")
 
         if _shutdown_requested:
             break
 
-        # §9.3: mandatory cooldown then extended wait until TEMP_COOL_TARGET
-        cool_time = MIN_COOL_SECONDS
-        if spec.params_b >= 7.0:
-            cool_time += LARGE_MODEL_EXTRA_COOL
-        log(f"   Mandatory {cool_time}s cooldown before next run...")
-        time.sleep(cool_time)
-        wait_for_cool(TEMP_COOL_TARGET, log)
+        _do_cooldown(spec, log)
 
-    # ── Final summary ──────────────────────────────────────────────────────────
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    global _shutdown_requested
+
+    args, machine = _parse_cli()
+
+    models_dir = pathlib.Path(args.models_dir)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    log = Logger(LOG_FILE)
+    log(f"experiment_runner.py started — pid {os.getpid()}, machine={machine}")
+
+    all_specs = build_matrix(fast=args.fast, cpu_only=args.cpu_only,
+                             gpu_only=args.gpu_only, low_end=args.low_end)
+    log(f"Matrix: {len(all_specs)} runs planned")
+
+    state = _init_state(args, all_specs, log)
+
+    if args.status:
+        print_status(state, all_specs)
+        return
+
+    if args.dry_run:
+        print_status(state, all_specs)
+        print("Pending runs (would execute):")
+        for s in all_specs:
+            if state["runs"].get(s.key, {}).get("status") != "done":
+                print(f"  {s.key}")
+        return
+
+    _verify_model_files(all_specs, models_dir)
+    print_status(state, all_specs)
+    _run_loop(all_specs, state, models_dir, machine, log)
     print_status(state, all_specs)
 
     runs = state["runs"]
     done = sum(1 for s in all_specs if runs.get(s.key, {}).get("status") == "done")
     total = len(all_specs)
-
     if done == total:
         log("All runs complete!")
     else:
         log(f"{done}/{total} runs complete. Re-run to resume.")
-
     log.close()
 
 

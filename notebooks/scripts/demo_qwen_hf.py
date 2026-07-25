@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import pathlib
+import resource
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,7 @@ from mrm_trace.telemetry.baseline import capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
 from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, GpuMonitor, read_cpu_freq_limits
 from mrm_trace.utils.ids import generate_run_id
+from mrm_trace.utils.machine import machine_slug
 from mrm_trace.validate_machine import collect_machine_context
 
 DEFAULT_MODEL_HF = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -103,6 +105,11 @@ def parse_args():
     p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
     p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
     p.add_argument("--out", default="results")
+    p.add_argument(
+        "--machine", default=None,
+        help="Machine identifier used as results/<machine>/ subdirectory "
+             "(default: derived from hostname)",
+    )
     p.add_argument("--device", default="auto")
     p.add_argument("--collector", choices=["auto", "memray", "perf-mem"], default="auto")
     p.add_argument("--sample-every-n", dest="sample_every_n", type=int, default=25)
@@ -216,14 +223,16 @@ def run_headless(args) -> None:
     gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens)
     kv_ranges = collect_kv_ranges()
     uninstall_transformers_kv_monitor()
+
+    # Capture peak RSS before releasing the model — getrusage tracks the
+    # historical maximum so this is correct even across the full process lifetime.
+    target_peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # kB → MB
+
     del model, tokenizer
 
     kv_file = pathlib.Path(args.results_file).with_name("kv_ranges.json")
     kv_file.write_text(json.dumps(kv_ranges))
     print(f"  KV cache ranges recorded: {len(kv_ranges)} tensors")
-
-    import psutil
-    target_peak_rss_mb = psutil.Process().memory_info().rss / 1_048_576
 
     results = {
         "load_start_ns": load_start_ns,
@@ -385,6 +394,8 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         observer_effect["observer_memory_overhead_frac"] = (
             obs_peak / target_peak_rss_mb
         )
+    # perf mem writes perf.data to disk (always > 10 MB) — expected, not contention.
+    observer_effect["io_contention_detected"] = False
 
     return (
         labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
@@ -532,15 +543,20 @@ def _gpu_section(gpu_stats, machine_ctx) -> dict:
 def build_metadata(
     model_id, run_id, gen_results, collector_info, phase_boundaries, args,
     baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
-    machine_ctx=None,
+    machine_ctx=None, machine_id=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
     metadata = {
         "run_id": run_id,
+        "machine_id": machine_id or "",
         "model": {"id": model_id, "hf_repo": args.model, "backend": "transformers"},
         "generation": {
             "prompts": len(gen_results),
+            "context_length": args.ctx,
+            "batch_size": args.batch_size,
+            "output_tokens": args.tokens,
+            "rep_index": args.rep,
             "total_output_tokens": total_tokens,
             "total_duration_s": round(total_time, 3),
             "avg_tokens_per_second": round(total_tokens / total_time, 1) if total_time > 0 else 0.0,
@@ -638,11 +654,13 @@ def main():
     collector = _resolve_collector(args, is_root)
 
     model_slug = args.model.split("/")[-1].lower()
+    mslug = args.machine or machine_slug()
     run_id = generate_run_id(
         model_id=model_slug, context_length=args.ctx,
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
     )
-    out_dir = pathlib.Path(args.out) / model_slug / run_id
+    results_root = pathlib.Path(args.out)
+    out_dir = results_root / mslug / model_slug / run_id
     raw_dir = out_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -681,12 +699,14 @@ def main():
         model_slug, run_id, gen_results, collector_info, phase_boundaries, args,
         baseline=baseline, cpu_freq_limits=cpu_freq_limits, cpu_freq_stats=cpu_freq_stats,
         gpu_stats=gpu_stats, observer_effect=observer_effect, machine_ctx=machine_ctx,
+        machine_id=mslug,
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(
         trace=labelled, region_map=region_map, kv_lifecycle=kv_lifecycle,
         analysis=analysis, metadata=metadata, run_id=run_id,
         trace_already_written=trace_prewritten,
+        manifest_csv=results_root / "manifest.csv",
     )
     print(f"  Output: {out_dir}/")
     for fname in sorted(export_result.file_names):
