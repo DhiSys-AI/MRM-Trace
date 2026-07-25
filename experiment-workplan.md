@@ -491,20 +491,20 @@ sudo nvidia-smi -pl 50   # 50 W out of 150 W max during CPU runs
 
 | Threshold | Meaning |
 |---|---|
-| < 50°C | Safe to start a new run |
-| 50–70°C | Running, acceptable |
-| 70–80°C | Running warm - log but continue |
-| > 80°C | **Thermal warning** - run flagged as potentially contaminated |
+| < 60°C | Safe to start a new run |
+| 60–75°C | Running, acceptable |
+| 75–85°C | Running warm - log but continue |
+| > 85°C | **Thermal warning** - run flagged as potentially contaminated |
 | > 90°C | **Hard throttle likely** - run flagged as contaminated, discard from primary dataset |
 
 ### 9.3 Cooling between runs
 
 The experiment runner enforces:
 - **Mandatory 5-minute cooldown** after every run regardless of temperature
-- **Extended wait** until CPU package temp < 50°C before starting the next run
+- **Extended wait** until CPU package temp < 55°C before starting the next run
 - Checks temperature every 60 seconds during the wait
 
-For large model runs (7B–8B @ 32K context): allow 10–15 minutes between runs.
+For large model runs (7B–8B @ 32K context): allow 5 minutes between runs.
 
 ### 9.4 Practical advice
 

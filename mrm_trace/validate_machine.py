@@ -515,6 +515,119 @@ def check_disk(out_dir: str = ".", min_gb: int = 50) -> Check:
 
 
 # --------------------------------------------------------------------------- #
+# Machine context snapshot — for embedding in run metadata.json
+# --------------------------------------------------------------------------- #
+
+def collect_machine_context(out_dir: str = ".") -> dict:
+    """
+    Fast, non-destructive machine snapshot for embedding in metadata.json.
+
+    Skips the smoke test (expensive). Safe to call at the start of every run.
+    Returns a dict with three top-level keys:
+      - "software"         → OS, kernel, perf version, paranoid, memray, mrm_trace
+      - "hardware_context" → CPU model/vendor/PMU, AC power, turbo, disk free
+      - "gpu_power_draw_w" → current GPU power draw in watts, or None
+    """
+    import importlib.util as _ilu
+    import mrm_trace as _mrm
+
+    # ── software ──────────────────────────────────────────────────────────────
+    blob = (_read("/proc/version") + " " + _read("/proc/sys/kernel/osrelease")).lower()
+    is_wsl2 = "microsoft" in blob or "wsl" in blob
+
+    perf_bin = shutil.which("perf")
+    perf_version = None
+    if perf_bin:
+        _, out, err = _run(["perf", "--version"], timeout=5)
+        perf_version = (out + err).strip() or None
+
+    paranoid_raw = _read("/proc/sys/kernel/perf_event_paranoid")
+    paranoid: int | None = None
+    if paranoid_raw.lstrip("-").isdigit():
+        paranoid = int(paranoid_raw)
+
+    memray_installed = False
+    try:
+        memray_installed = _ilu.find_spec("memray") is not None
+    except Exception:
+        pass
+
+    # ── hardware context ──────────────────────────────────────────────────────
+    vendor = _cpuinfo_field("vendor_id")
+    cpu_model = _cpuinfo_field("model name") or platform.processor()
+
+    pmu_type: str | None = {
+        "GenuineIntel": "PEBS",
+        "AuthenticAMD": "IBS",
+    }.get(vendor)
+    if pmu_type is None and ("aarch64" in platform.machine() or "arm" in platform.machine().lower()):
+        pmu_type = "SPE"
+
+    ldlat = _exists_any([
+        "/sys/bus/event_source/devices/cpu/format/ldlat",
+        "/sys/bus/event_source/devices/cpu_core/format/ldlat",
+    ])
+    memloads = _exists_any([
+        "/sys/bus/event_source/devices/cpu/events/mem-loads",
+        "/sys/bus/event_source/devices/cpu_core/events/mem-loads",
+    ])
+    pmu_facility = bool(ldlat and memloads)
+
+    ac_power = False
+    ac_dir = Path("/sys/class/power_supply")
+    if ac_dir.exists():
+        for online in ac_dir.glob("A*/online"):
+            if _read(str(online)) == "1":
+                ac_power = True
+                break
+
+    no_turbo = _read("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    turbo_enabled: bool | None = (no_turbo == "0") if no_turbo != "" else None
+
+    disk_free_gb: float | None = None
+    try:
+        disk_free_gb = round(shutil.disk_usage(out_dir).free / 1e9, 1)
+    except OSError:
+        pass
+
+    # ── GPU power draw (one-time snapshot) ───────────────────────────────────
+    gpu_power_draw_w: float | None = None
+    if shutil.which("nvidia-smi"):
+        try:
+            rc, out, _ = _run(
+                ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                timeout=5,
+            )
+            if rc == 0 and out.strip():
+                gpu_power_draw_w = float(out.strip().splitlines()[0].strip())
+        except Exception:
+            pass
+
+    return {
+        "software": {
+            "os": f"{platform.system()} {platform.release()}",
+            "kernel": platform.release(),
+            "is_wsl2": is_wsl2,
+            "perf_bin": perf_bin,
+            "perf_version": perf_version,
+            "perf_event_paranoid": paranoid,
+            "memray_installed": memray_installed,
+            "mrm_trace_version": getattr(_mrm, "__version__", None),
+        },
+        "hardware_context": {
+            "cpu_model": cpu_model,
+            "cpu_vendor": vendor,
+            "pmu_type": pmu_type,
+            "pmu_facility_available": pmu_facility,
+            "ac_power": ac_power,
+            "turbo_enabled": turbo_enabled,
+            "disk_free_gb": disk_free_gb,
+        },
+        "gpu_power_draw_w": gpu_power_draw_w,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration + verdict
 # --------------------------------------------------------------------------- #
 

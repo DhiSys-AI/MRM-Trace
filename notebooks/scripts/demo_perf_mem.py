@@ -70,6 +70,7 @@ from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, Gp
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
 from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
+from mrm_trace.validate_machine import collect_machine_context
 
 DEFAULT_MODEL = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
@@ -223,6 +224,7 @@ def build_metadata(
     model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
     thermal_meta=None, total_wall_duration_s=None,
     baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
+    machine_ctx=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
@@ -257,11 +259,18 @@ def build_metadata(
             "total_wall_duration_s": round(total_wall_duration_s, 3),
         }
 
-    if baseline is not None:
-        metadata["hardware"] = _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits)
+    if machine_ctx is not None:
+        metadata["software"] = machine_ctx["software"]
 
+    if baseline is not None:
+        hw = _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits)
+        if machine_ctx is not None:
+            hw.update(machine_ctx["hardware_context"])
+        metadata["hardware"] = hw
+
+    gpu_section: dict = {}
     if gpu_stats is not None:
-        metadata["gpu"] = {
+        gpu_section = {
             "name": gpu_stats.name,
             "vram_total_mb": gpu_stats.vram_total_mb,
             "vram_start_used_mb": gpu_stats.vram_start_used_mb,
@@ -269,6 +278,10 @@ def build_metadata(
             "vram_end_used_mb": gpu_stats.vram_end_used_mb,
             "gpu_util_pct_mean": round(gpu_stats.gpu_util_pct_mean, 1),
         }
+    if machine_ctx is not None and machine_ctx.get("gpu_power_draw_w") is not None:
+        gpu_section["power_draw_w"] = machine_ctx["gpu_power_draw_w"]
+    if gpu_section:
+        metadata["gpu"] = gpu_section
 
     if thermal_meta is not None:
         metadata["thermal"] = _thermal_section(thermal_meta, baseline, observer_effect)
@@ -444,6 +457,7 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     current_pid = os.getpid()
     print(f"Starting perf mem collector (spawn mode, launcher PID {current_pid}) ...")
 
+    machine_ctx = collect_machine_context(str(out_dir))
     cpu_freq_limits = read_cpu_freq_limits()
     baseline = capture_baseline(duration_s=2.0)
     cpu_freq_mon = CpuFreqMonitor()
@@ -548,6 +562,7 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     return (
         runtime_metadata, gen_results, phase_boundaries, collector_meta,
         thermal_meta, address_regions, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
+        machine_ctx,
     )
 
 
@@ -652,6 +667,7 @@ def main():
     (
         runtime_metadata, gen_results, phase_boundaries, collector_meta,
         thermal_meta, address_regions, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
+        machine_ctx,
     ) = _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run_id)
 
     labelled, region_map, kv_lifecycle = _parse_and_label(
@@ -667,7 +683,7 @@ def main():
         model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
         thermal_meta=thermal_meta, total_wall_duration_s=total_wall_duration_s,
         baseline=baseline, cpu_freq_limits=cpu_freq_limits, cpu_freq_stats=cpu_freq_stats,
-        gpu_stats=gpu_stats, observer_effect=observer_effect,
+        gpu_stats=gpu_stats, observer_effect=observer_effect, machine_ctx=machine_ctx,
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(
