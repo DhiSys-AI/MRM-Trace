@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mrm-trace"
-version = "0.1.14"
+version = "0.1.15"
 description = "Scientific instrumentation for LLM inference memory trace collection and MRM research"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -77,7 +77,11 @@ addopts = "-v --tb=short -m 'not slow and not performance'"
 
 [tool.coverage.run]
 source = ["mrm_trace"]
-omit = ["tests/*"]
+omit = [
+    "tests/*",
+    "mrm_trace/validate_machine.py",        # hardware-polling CLI, requires root + PMU
+    "mrm_trace/telemetry/system_monitor.py", # daemon threads polling nvidia-smi / psutil.cpu_freq
+]
 
 [tool.coverage.report]
 show_missing = true
