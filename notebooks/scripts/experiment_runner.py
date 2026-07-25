@@ -27,13 +27,13 @@ import pathlib
 import signal
 import subprocess
 import sys
-import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from mrm_trace.telemetry.thermal import read_package_temp_c
+from mrm_trace.telemetry.validity import TEMP_CONTAMINATED_C, TEMP_WARN_C
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -48,23 +48,20 @@ SCRIPT_HF_GPU = pathlib.Path("notebooks/scripts/demo_qwen_hf.py")
 # Python interpreter: the current venv's python (runner must be started via venv)
 PYTHON = sys.executable
 
-# Thermal thresholds (°C)
-TEMP_START_MAX = 60      # do not start a run above this
-TEMP_WARN = 90           # flag run as warm
-# Fallback-only: used when the child run's metadata.json (which now records real
-# thermal_throttle_events) can't be read — e.g. GPU path, or a run that failed
-# before writing metadata. 95°C sits just under typical consumer x86 Tjmax
-# (~100-105°C), where sustained throttling is effectively guaranteed. The
-# previous value (120°C) was above any real package temperature and never
-# fired, silently letting every throttled run through as "not contaminated".
-TEMP_CONTAMINATED_FALLBACK_C = 95
-COOL_CHECK_INTERVAL = 60 # seconds between temperature checks while waiting
+# Thermal thresholds (°C) — workplan §9.2
+# TEMP_WARN_C and TEMP_CONTAMINATED_C are imported from validity.py (single source of truth).
+TEMP_START_MAX = 60             # do not start a run above this (§9.2: < 60°C safe to start)
+TEMP_COOL_TARGET = 55           # extended post-run wait target (§9.3: wait until < 55°C)
+# Fallback-only: used when child's metadata.json can't be read.
+# Matches TEMP_CONTAMINATED_C from validity.py (> 90°C → contaminated).
+TEMP_CONTAMINATED_FALLBACK_C = TEMP_CONTAMINATED_C
+COOL_CHECK_INTERVAL = 60        # seconds between temperature checks while cooling
 
-# Timing
-MIN_COOL_SECONDS = 60          # mandatory cooldown between runs (5 min)
-LARGE_MODEL_EXTRA_COOL = 60    # extra cooldown for 7B+ models (5 min)
+# Timing — workplan §9.3
+MIN_COOL_SECONDS = 300          # mandatory 5-minute cooldown after every run
+LARGE_MODEL_EXTRA_COOL = 300    # extra 5 minutes for 7B–8B models
 MAX_RUN_SECONDS = 7200          # 2-hour hard timeout per run
-PROGRESS_INTERVAL = 120         # re-print progress every 5 min
+PROGRESS_INTERVAL = 120         # re-print progress every 2 min
 
 # Output tokens (fixed across all runs for comparability)
 OUTPUT_TOKENS = 256
@@ -452,7 +449,7 @@ def print_status(state: Dict, all_specs: List[RunSpec]) -> None:
 
     print()
     print("=" * 60)
-    print(f"  MRM-Trace Experiment Runner — Status")
+    print("  MRM-Trace Experiment Runner — Status")
     print(f"  Last updated : {state.get('last_updated', 'n/a')}")
     print("-" * 60)
     print(f"  Total runs   : {total}")
@@ -622,10 +619,10 @@ def main():
             flag = ""
             if result.contaminated:
                 flag = " [CONTAMINATED — excluded from dataset]"
-            elif result.throttled:
+            elif result.throttled or result.peak_temp_c > TEMP_CONTAMINATED_C:
                 flag = " [THROTTLED — check quality]"
-            elif result.peak_temp_c > TEMP_WARN:
-                flag = " [WARM — check quality]"
+            elif result.peak_temp_c > TEMP_WARN_C:
+                flag = " [WARM — thermal warning, at most marginal]"
             log(f"   DONE in {result.duration_s:.0f}s, peak {result.peak_temp_c:.1f}°C{flag}")
         else:
             log(f"   FAILED: {result.error}")
@@ -633,12 +630,13 @@ def main():
         if _shutdown_requested:
             break
 
-        # Mandatory cooldown between runs
+        # §9.3: mandatory cooldown then extended wait until TEMP_COOL_TARGET
         cool_time = MIN_COOL_SECONDS
         if spec.params_b >= 7.0:
             cool_time += LARGE_MODEL_EXTRA_COOL
-        log(f"   Cooling {cool_time}s before next run...")
+        log(f"   Mandatory {cool_time}s cooldown before next run...")
         time.sleep(cool_time)
+        wait_for_cool(TEMP_COOL_TARGET, log)
 
     # ── Final summary ──────────────────────────────────────────────────────────
     print_status(state, all_specs)

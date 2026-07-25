@@ -6,7 +6,10 @@ Acceptance criterion: contaminated/clean fixture runs classify correctly.
 
 import pytest
 
-from mrm_trace.telemetry.validity import classify_from_summary, classify_run
+from mrm_trace.telemetry.validity import (
+    classify_from_summary, classify_run,
+    TEMP_WARN_C, TEMP_CONTAMINATED_C,
+)
 
 
 class TestCleanFixtureClassifiesCorrectly:
@@ -138,3 +141,32 @@ class TestClassificationBoundaries:
     def test_baseline_cpu_15_0_breaks_clean(self):
         r = classify_run(0.0, 0.0, 0, 15.0)
         assert r.run_validity != "clean"
+
+    # ── Temperature thresholds (workplan §9.2) ────────────────────────────────
+
+    def test_temp_below_warn_is_clean(self):
+        r = classify_run(0.0, 0.0, 0, 0.0, peak_temp_c=TEMP_WARN_C - 0.1)
+        assert r.run_validity == "clean"
+
+    def test_temp_at_warn_breaks_clean(self):
+        r = classify_run(0.0, 0.0, 0, 0.0, peak_temp_c=TEMP_WARN_C + 0.1)
+        assert r.run_validity != "clean"
+
+    def test_temp_between_warn_and_contaminated_is_marginal(self):
+        mid = (TEMP_WARN_C + TEMP_CONTAMINATED_C) / 2
+        r = classify_run(0.0, 0.0, 0, 0.0, peak_temp_c=mid)
+        assert r.run_validity == "marginal"
+
+    def test_temp_above_contaminated_is_contaminated(self):
+        r = classify_run(0.0, 0.0, 0, 0.0, peak_temp_c=TEMP_CONTAMINATED_C + 0.1)
+        assert r.run_validity == "contaminated"
+
+    def test_temp_contaminated_overrides_other_clean_factors(self):
+        # Even if observer and throttle are fine, > 90°C → contaminated.
+        r = classify_run(1.0, 0.001, 0, 5.0, peak_temp_c=91.0)
+        assert r.run_validity == "contaminated"
+        assert any("peak_temp" in reason for reason in r.failure_reasons)
+
+    def test_temp_warn_failure_reason_recorded(self):
+        r = classify_run(0.0, 0.0, 0, 0.0, peak_temp_c=87.0)
+        assert any("peak_temp" in reason for reason in r.failure_reasons)

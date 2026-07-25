@@ -216,6 +216,7 @@ def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
         thermal_throttle_events=thermal_meta["throttle_events"],
         baseline_cpu_pct=baseline.cpu_pct if baseline else 0.0,
         io_contention_detected=oe.get("io_contention_detected", False),
+        peak_temp_c=thermal_meta.get("peak_temp_c", 0.0),
     )
     return {**thermal_meta, "run_validity": validity.run_validity}
 

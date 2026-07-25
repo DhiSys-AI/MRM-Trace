@@ -1,11 +1,16 @@
 """
 Run validity classification.
 
-Thresholds (from CLAUDE.md):
+Observer-effect thresholds (from CLAUDE.md):
   clean       : observer CPU < 10%  AND observer mem_frac < 0.05 AND throttle == 0
                 AND baseline_cpu < 15%
   marginal    : observer CPU < 20%  AND observer mem_frac < 0.15 AND throttle ≤ 2
   contaminated: anything worse than marginal
+
+Temperature thresholds (from experiment-workplan.md §9.2):
+  TEMP_RUNNING_WARN_C  = 75  : running warm — log but continue
+  TEMP_WARN_C          = 85  : thermal warning — at most marginal (potentially contaminated)
+  TEMP_CONTAMINATED_C  = 90  : hard throttle likely — contaminated, discard from primary dataset
 """
 
 from dataclasses import dataclass
@@ -18,6 +23,11 @@ _CLEAN_BASELINE_CPU = 15.0
 _MARGINAL_CPU = 20.0
 _MARGINAL_MEM_FRAC = 0.15
 _MARGINAL_THROTTLE = 2
+
+# Temperature thresholds — exported so experiment_runner.py can use the same values.
+TEMP_RUNNING_WARN_C: float = 75.0   # running warm; log but continue
+TEMP_WARN_C: float = 85.0           # thermal warning; run is at most marginal
+TEMP_CONTAMINATED_C: float = 90.0   # hard throttle likely; run is contaminated
 
 
 @dataclass
@@ -39,6 +49,7 @@ def classify_run(
     thermal_throttle_events: int,
     baseline_cpu_pct: float = 0.0,
     io_contention_detected: bool = False,
+    peak_temp_c: float = 0.0,
 ) -> ValidityResult:
     """
     Classify a run as clean, marginal, or contaminated.
@@ -50,6 +61,7 @@ def classify_run(
     thermal_throttle_events       : CPU thermal throttle events during run
     baseline_cpu_pct              : mean system CPU before the run started
     io_contention_detected        : True if observer caused significant I/O
+    peak_temp_c                   : peak CPU package temperature during run (°C)
 
     Returns
     -------
@@ -73,6 +85,15 @@ def classify_run(
         )
     if io_contention_detected:
         failures.append("io_contention_detected=True")
+    if peak_temp_c > TEMP_CONTAMINATED_C:
+        failures.append(
+            f"peak_temp {peak_temp_c:.1f}°C > {TEMP_CONTAMINATED_C}°C "
+            f"(hard throttle likely — contaminated)"
+        )
+    elif peak_temp_c > TEMP_WARN_C:
+        failures.append(
+            f"peak_temp {peak_temp_c:.1f}°C > {TEMP_WARN_C}°C (thermal warning — at most marginal)"
+        )
 
     is_clean = len(failures) == 0
 
@@ -81,6 +102,7 @@ def classify_run(
         and observer_memory_frac < _MARGINAL_MEM_FRAC
         and thermal_throttle_events <= _MARGINAL_THROTTLE
         and not io_contention_detected
+        and peak_temp_c <= TEMP_CONTAMINATED_C
     )
 
     if is_clean:

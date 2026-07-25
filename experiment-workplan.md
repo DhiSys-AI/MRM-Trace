@@ -371,7 +371,7 @@ cat results/machine_validation.json | python -m json.tool | grep verdict
 ls -lh models/*.gguf | awk '{print $5, $9}'
 # Expected: 6 files totalling ~14 GB
 
-# 6. Temperature baseline (must be < 50°C before starting)
+# 6. Temperature baseline (must be < 60°C before starting)
 sensors | grep -E "Core|Package|temp"
 
 # 7. Disk space
@@ -463,7 +463,7 @@ The experiment runner handles this order automatically.
 
 ## 9. Thermal Protocol (CRITICAL - no AC)
 
-The i9-11980HK in the Alienware x17 chassis will heat-soak under sustained load. A throttled run is a contaminated run - its retention duration and latency values are artifacts of the thermal state, not the memory access pattern.
+The PC chassis will heat-soak under sustained load. A throttled run is a contaminated run - its retention duration and latency values are artifacts of the thermal state, not the memory access pattern.
 
 ### 9.1 Pre-experiment setup
 
