@@ -66,7 +66,7 @@ from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import check_trace_quality
 from mrm_trace.telemetry.baseline import capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
-from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, GpuMonitor
+from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, GpuMonitor, read_cpu_freq_limits
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
 from mrm_trace.telemetry.validity import classify_run
 from mrm_trace.utils.ids import generate_run_id
@@ -187,7 +187,8 @@ def build_phase_boundaries(phase_records):
     return boundaries
 
 
-def _hardware_section(baseline, cpu_freq_stats) -> dict:
+def _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits=None) -> dict:
+    lim: CpuFreqLimits = cpu_freq_limits or CpuFreqLimits(None, None, None, None)
     return {
         "baseline_cpu_pct": round(baseline.cpu_pct, 2),
         "baseline_cpu_pct_max": round(baseline.cpu_pct_max, 2),
@@ -195,6 +196,10 @@ def _hardware_section(baseline, cpu_freq_stats) -> dict:
         "mem_available_mb": round(baseline.mem_available_mb, 0),
         "mem_used_pct": round(baseline.mem_used_pct, 1),
         "load_avg_1m": round(baseline.load_avg_1m, 2) if baseline.load_avg_1m is not None else None,
+        "cpu_freq_hw_max_mhz": round(lim.hw_max_mhz, 0) if lim.hw_max_mhz else None,
+        "cpu_freq_scaling_max_mhz": round(lim.scaling_max_mhz, 0) if lim.scaling_max_mhz else None,
+        "cpu_freq_scaling_min_mhz": round(lim.scaling_min_mhz, 0) if lim.scaling_min_mhz else None,
+        "cpu_freq_governor": lim.governor,
         "cpu_freq_start_mhz": round(cpu_freq_stats.start_mhz, 0) if cpu_freq_stats else None,
         "cpu_freq_min_mhz": round(cpu_freq_stats.min_mhz, 0) if cpu_freq_stats else None,
         "cpu_freq_mean_mhz": round(cpu_freq_stats.mean_mhz, 0) if cpu_freq_stats else None,
@@ -217,7 +222,7 @@ def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
 def build_metadata(
     model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
     thermal_meta=None, total_wall_duration_s=None,
-    baseline=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
+    baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
@@ -253,7 +258,7 @@ def build_metadata(
         }
 
     if baseline is not None:
-        metadata["hardware"] = _hardware_section(baseline, cpu_freq_stats)
+        metadata["hardware"] = _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits)
 
     if gpu_stats is not None:
         metadata["gpu"] = {
@@ -439,6 +444,7 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     current_pid = os.getpid()
     print(f"Starting perf mem collector (spawn mode, launcher PID {current_pid}) ...")
 
+    cpu_freq_limits = read_cpu_freq_limits()
     baseline = capture_baseline(duration_s=2.0)
     cpu_freq_mon = CpuFreqMonitor()
     gpu_mon = GpuMonitor()
@@ -541,7 +547,7 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
 
     return (
         runtime_metadata, gen_results, phase_boundaries, collector_meta,
-        thermal_meta, address_regions, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+        thermal_meta, address_regions, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
     )
 
 
@@ -645,7 +651,7 @@ def main():
     model_cfg = build_model_cfg(model_path, model_id)
     (
         runtime_metadata, gen_results, phase_boundaries, collector_meta,
-        thermal_meta, address_regions, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+        thermal_meta, address_regions, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
     ) = _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run_id)
 
     labelled, region_map, kv_lifecycle = _parse_and_label(
@@ -660,7 +666,7 @@ def main():
     metadata = build_metadata(
         model_cfg, run_id, runtime_metadata, gen_results, collector_meta,
         thermal_meta=thermal_meta, total_wall_duration_s=total_wall_duration_s,
-        baseline=baseline, cpu_freq_stats=cpu_freq_stats,
+        baseline=baseline, cpu_freq_limits=cpu_freq_limits, cpu_freq_stats=cpu_freq_stats,
         gpu_stats=gpu_stats, observer_effect=observer_effect,
     )
     exporter = RunExporter(out_dir)

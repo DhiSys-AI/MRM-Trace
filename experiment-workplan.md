@@ -227,8 +227,11 @@ Llama-3.x and some other models require a HuggingFace account and license accept
 
 ```bash
 pip install huggingface_hub
-huggingface-cli login
+hf auth login
 # Paste your HF token (read-only scope is fine)
+
+# To verify if you're already logged in
+hf models ls --search "gemma"
 ```
 
 Then go to each model's HuggingFace page and click "Agree and access repository":

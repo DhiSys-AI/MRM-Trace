@@ -1,19 +1,66 @@
 """
 Background monitors for CPU clock frequency and GPU memory during a run.
 
-CpuFreqMonitor: polls psutil.cpu_freq() every 500 ms on a daemon thread.
-                Gives start/min/mean/end MHz — detects frequency scaling under
-                thermal throttle even when sysfs throttle counters don't fire.
+CpuFreqMonitor:  polls psutil.cpu_freq() every 500 ms on a daemon thread.
+                 Gives start/min/mean/end MHz — detects frequency scaling under
+                 thermal throttle even when sysfs throttle counters don't fire.
 
-GpuMonitor:     polls nvidia-smi every 2 s on a daemon thread.
-                No-op (available=False, stop() returns None) if nvidia-smi is absent.
+read_cpu_freq_limits: one-shot sysfs read of the governor-configured ceiling
+                 (scaling_max_freq), hardware ceiling (cpuinfo_max_freq), floor,
+                 and active governor.  Call once before the run; these are static
+                 per-machine values needed to interpret the runtime CpuFreqStats.
+                 E.g. if scaling_max_mhz=2300 and cpu_freq_min_mhz=2280, that is
+                 not throttling — the machine was simply capped at 2.3 GHz.
+
+GpuMonitor:      polls nvidia-smi every 2 s on a daemon thread.
+                 No-op (available=False, stop() returns None) if nvidia-smi is absent.
 """
 
 import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
+
+
+@dataclass
+class CpuFreqLimits:
+    """Static per-machine CPU frequency policy — read once before the run."""
+
+    hw_max_mhz: Optional[float]       # cpuinfo_max_freq  (hardware ceiling)
+    scaling_max_mhz: Optional[float]  # governor-set upper bound
+    scaling_min_mhz: Optional[float]  # governor-set lower bound
+    governor: Optional[str]           # e.g. "performance", "powersave"
+
+
+def read_cpu_freq_limits(cpu: int = 0) -> CpuFreqLimits:
+    """
+    Read CPU frequency policy from sysfs for the given logical CPU.
+
+    Returns None fields on non-Linux systems or when sysfs is unavailable
+    (containers, WSL without cpufreq, etc.).
+    """
+    base = Path(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq")
+
+    def _read_khz(name: str) -> Optional[float]:
+        try:
+            return int((base / name).read_text().strip()) / 1_000.0
+        except Exception:
+            return None
+
+    def _read_str(name: str) -> Optional[str]:
+        try:
+            return (base / name).read_text().strip()
+        except Exception:
+            return None
+
+    return CpuFreqLimits(
+        hw_max_mhz=_read_khz("cpuinfo_max_freq"),
+        scaling_max_mhz=_read_khz("scaling_max_freq"),
+        scaling_min_mhz=_read_khz("scaling_min_freq"),
+        governor=_read_str("scaling_governor"),
+    )
 
 
 @dataclass

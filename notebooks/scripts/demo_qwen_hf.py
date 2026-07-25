@@ -41,7 +41,7 @@ from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import check_trace_quality
 from mrm_trace.telemetry.baseline import capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
-from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, GpuMonitor
+from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, GpuMonitor, read_cpu_freq_limits
 from mrm_trace.utils.ids import generate_run_id
 
 DEFAULT_MODEL_HF = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -267,6 +267,7 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     print("  perf will instrument the full process: model load → generation")
     print()
 
+    cpu_freq_limits = read_cpu_freq_limits()
     baseline = capture_baseline(duration_s=2.0)
     cpu_freq_mon = CpuFreqMonitor()
     gpu_mon = GpuMonitor()
@@ -385,7 +386,7 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
 
     return (
         labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
-        collector_info, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+        collector_info, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
     )
 
 
@@ -405,6 +406,7 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
         {"phase": "weight_load", "start_ns": load_start_ns, "end_ns": load_end_ns},
     ]
 
+    cpu_freq_limits = read_cpu_freq_limits()
     baseline = capture_baseline(duration_s=1.0)
     cpu_freq_mon = CpuFreqMonitor()
     gpu_mon = GpuMonitor()
@@ -477,7 +479,7 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
 
     return (
         labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
-        collector_info, True, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+        collector_info, True, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
     )
 
 
@@ -485,7 +487,7 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
 
 def build_metadata(
     model_id, run_id, gen_results, collector_info, phase_boundaries, args,
-    baseline=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
+    baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
@@ -502,6 +504,7 @@ def build_metadata(
         "phase_boundaries": phase_boundaries,
     }
     if baseline is not None:
+        lim: CpuFreqLimits = cpu_freq_limits or CpuFreqLimits(None, None, None, None)
         metadata["hardware"] = {
             "baseline_cpu_pct": round(baseline.cpu_pct, 2),
             "baseline_cpu_pct_max": round(baseline.cpu_pct_max, 2),
@@ -509,6 +512,10 @@ def build_metadata(
             "mem_available_mb": round(baseline.mem_available_mb, 0),
             "mem_used_pct": round(baseline.mem_used_pct, 1),
             "load_avg_1m": round(baseline.load_avg_1m, 2) if baseline.load_avg_1m is not None else None,
+            "cpu_freq_hw_max_mhz": round(lim.hw_max_mhz, 0) if lim.hw_max_mhz else None,
+            "cpu_freq_scaling_max_mhz": round(lim.scaling_max_mhz, 0) if lim.scaling_max_mhz else None,
+            "cpu_freq_scaling_min_mhz": round(lim.scaling_min_mhz, 0) if lim.scaling_min_mhz else None,
+            "cpu_freq_governor": lim.governor,
             "cpu_freq_start_mhz": round(cpu_freq_stats.start_mhz, 0) if cpu_freq_stats else None,
             "cpu_freq_min_mhz": round(cpu_freq_stats.min_mhz, 0) if cpu_freq_stats else None,
             "cpu_freq_mean_mhz": round(cpu_freq_stats.mean_mhz, 0) if cpu_freq_stats else None,
@@ -619,7 +626,7 @@ def main():
     if collector == "perf-mem":
         (
             labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
-            collector_info, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+            collector_info, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
         ) = collect_with_perf_mem(args, raw_dir, run_id)
         trace_prewritten = False
     else:
@@ -630,7 +637,7 @@ def main():
         print()
         (
             labelled, region_map, kv_lifecycle, gen_results, phase_boundaries,
-            collector_info, trace_prewritten, baseline, cpu_freq_stats, gpu_stats, observer_effect,
+            collector_info, trace_prewritten, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,
         ) = collect_with_memray(model, tokenizer, args, raw_dir, run_id, load_start_ns, load_end_ns)
     print()
 
@@ -645,7 +652,7 @@ def main():
     print("Exporting ...")
     metadata = build_metadata(
         model_slug, run_id, gen_results, collector_info, phase_boundaries, args,
-        baseline=baseline, cpu_freq_stats=cpu_freq_stats,
+        baseline=baseline, cpu_freq_limits=cpu_freq_limits, cpu_freq_stats=cpu_freq_stats,
         gpu_stats=gpu_stats, observer_effect=observer_effect,
     )
     exporter = RunExporter(out_dir)

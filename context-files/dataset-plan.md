@@ -69,15 +69,22 @@ These are *logical* properties of the inference algorithm, not the memory substr
 
 | Requirement | Status |
 |---|---|
-| Bare-metal Linux (not WSL2) | ✓ kernel `6.8.0-107-generic` |
-| Intel PEBS-capable CPU | ✓ i5-8300H (Coffee Lake) |
+| Bare-metal Linux (not WSL2) | ✓ kernel `6.8.0-136-generic` |
+| Intel PEBS-capable CPU | ✓ i5-8300H (Coffee Lake), PEBS fmt3+, 24,382 smoke samples |
 | RAPL power measurement | ✓ `/sys/class/powercap/intel-rapl/` |
-| `perf` binary | ✓ `/usr/bin/perf` |
+| `perf` binary | ✓ `/usr/bin/perf version 6.8.12` |
 | Root for collection | ✓ already using `sudo -E venv/bin/python` |
-| Disk space | ✓ 267 GB free |
+| Disk space | ✓ 281 GB free |
 | RAM | ✓ 31 GB (fits 1B–7B Q4 models) |
+| CPU governor / turbo | ⚠ `governor=powersave, turbo=on` — WARN, not a blocker. Pin before sweep (see command below). |
 
-**`perf_event_paranoid = 4`** - Ubuntu 24.04 default. Does NOT block collection. Root overrides it. Every collection run needs `sudo`, which the demo scripts already require.
+Pin governor and disable turbo before any sweep run:
+```bash
+sudo cpupower frequency-set -g performance
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+```
+
+**`perf_event_paranoid = 0`** (set to 0 on this machine; root overrides in any case). Every collection run needs `sudo`, which the demo scripts already require.
 
 ---
 
