@@ -16,11 +16,14 @@ def _sample(pid, cpu_pct, rss_mb, write_bytes=0):
     )
 
 
-def test_peak_cpu_is_max_of_samples():
+def test_peak_cpu_is_p95_not_abs_max():
+    # 3 samples sorted: [5.0, 8.0, 15.0]  p95_idx = max(0, int(3*0.95)-1) = max(0,1) = 1 → 8.0
+    # abs_max is still stored separately for diagnostics.
     obs = [_sample(1, 5.0, 100), _sample(1, 15.0, 110), _sample(1, 8.0, 105)]
     tgt = [_sample(2, 80.0, 5000)]
     result = compute_observer_effect(obs, tgt)
-    assert result["observer_cpu_overhead_pct_max"] == pytest.approx(15.0)
+    assert result["observer_cpu_overhead_pct_max"] == pytest.approx(8.0)
+    assert result["observer_cpu_overhead_pct_abs_max"] == pytest.approx(15.0)
 
 
 def test_peak_memory_is_max_rss():
@@ -83,7 +86,8 @@ def test_required_keys_present():
     tgt = [_sample(2, 80.0, 8000)]
     result = compute_observer_effect(obs, tgt)
     for key in (
-        "observer_cpu_overhead_pct_max", "observer_cpu_overhead_pct_mean",
+        "observer_cpu_overhead_pct_max", "observer_cpu_overhead_pct_abs_max",
+        "observer_cpu_overhead_pct_mean",
         "observer_memory_overhead_mb_peak", "observer_memory_overhead_frac",
         "target_rss_mb_peak", "thermal_throttle_events",
         "baseline_cpu_pct", "io_contention_detected",

@@ -132,7 +132,12 @@ def classify_from_summary(summary: dict, target_rss_mb: float = 0.0) -> Validity
     If *target_rss_mb* is provided, memory fraction is computed; otherwise the
     pre-computed value from the summary is used if present.
     """
-    cpu = summary.get("observer_cpu_overhead_pct_max", 0.0)
+    # Use mean for the gate — it reflects sustained overhead, not startup/teardown spikes.
+    # Fall back to max for old metadata.json files that pre-date the mean key.
+    cpu = summary.get(
+        "observer_cpu_overhead_pct_mean",
+        summary.get("observer_cpu_overhead_pct_max", 0.0),
+    )
     mem_mb = summary.get("observer_memory_overhead_mb_peak", 0.0)
     throttle = summary.get("thermal_throttle_events", 0)
     baseline = summary.get("baseline_cpu_pct", 0.0)

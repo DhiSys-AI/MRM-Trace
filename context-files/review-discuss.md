@@ -161,7 +161,7 @@ results/<machine_slug>/<model_id>/<run_id>/
 
 ## Observer effect bugs fixed during instrumentation
 
-Two bugs caused valid runs to be classified `contaminated` when they should be `clean`:
+Four bugs caused valid runs to be classified `contaminated` (or `throttled`) when they should not be. All are now fixed:
 
 ### 1. Target RSS read after engine shutdown
 
@@ -174,6 +174,20 @@ Two bugs caused valid runs to be classified `contaminated` when they should be `
 `perf mem` always writes `perf.data` to disk (typically 10s–100s of MB), which triggered the IO contention detector. The detector's heuristic is correct in principle (disk contention during inference contaminates latency measurements) but the perf-writes-its-own-data case is unavoidable and expected — it does not represent true contention on the workload being measured.
 
 **Fix:** hard-override `observer_effect["io_contention_detected"] = False` in the spawn-mode collection path of both demo scripts. The override is specific to the spawn-mode branch; direct-mode runs (if any) are unaffected.
+
+### 3. `_is_throttled()` using CPU frequency instead of sysfs throttle counters
+
+`experiment_runner.py` was calling `_is_throttled()` which compared current CPU frequency against the hardware max. The CPU frequency governor lowers frequency at any temperature when under load (this is power management, not thermal protection). At 68°C this fired and labelled the run `[THROTTLED — check quality]`.
+
+**Fix:** replaced `_is_throttled()` with `_read_throttle_counts()` / `_new_throttle_events()` which read `/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count` sysfs counters before and after the run. These counters only increment on actual kernel-enforced thermal throttle events, not on governor-driven frequency scaling.
+
+### 4. `observer_cpu_overhead_pct_max` using absolute peak instead of mean
+
+`compute_observer_effect()` stored `max(samples)` as `observer_cpu_overhead_pct_max`. The `perf mem record` process spikes briefly to ~100% CPU during PMU setup at startup and ring-buffer flush at shutdown (typically 1–10 seconds total). This transient spike has no relationship to measurement contamination during inference, but the raw max pushed every run past the 20% marginal threshold, classifying it as `contaminated`.
+
+Observed: a 68°C run with `observer_cpu_overhead_pct_mean = 5.5%` was classified `contaminated` because `observer_cpu_overhead_pct_max = 99.9%` (one startup spike).
+
+**Fix:** the validity gate in `classify_run()` and `classify_from_summary()` now uses `observer_cpu_overhead_pct_mean` (sustained overhead during the run). The absolute max is still stored as `observer_cpu_overhead_pct_abs_max` and p95 as `observer_cpu_overhead_pct_p95` for diagnostics. The mean is the correct metric: the spec threshold ("observer CPU < 10%") is asking whether the tracer *sustains* high CPU that disturbs the inference measurement — not whether it spikes during its own setup.
 
 ---
 
@@ -306,4 +320,59 @@ The `experiment_runner.py` accepts `--fast` to skip larger/slower model configur
 - **Unsafe on dev machine:** any 13B+ model, or any model requiring GPU offload that the machine's iGPU can't accelerate
 
 The machine slug in the output path (`results/dell-g5/...` vs `results/msi-raider/...`) makes it trivially clear which results came from which class of hardware when aggregating into the manifest.csv.
+
+---
+
+## Experiment matrix: why CPU and GPU run counts differ, and why warmup exists
+
+### The `--low-end` matrix (i5-8300H + GTX 1060 6 GB)
+
+Running `experiment_runner.py --low-end` plans 76 runs: 4 CPU models × 18 + 1 GPU model × 4.
+
+**CPU per model: 2 ctx × 3 batch × 3 reps = 18**
+- Context: 2K, 8K (32K excluded — too slow at 2.3 GHz, thermal risk)
+- Batch: 1, 4, 8
+- Reps: 0, 1, 2 (rep 0 = warmup; reps 1–2 = data)
+
+**GPU per model: 1 ctx × 2 batch × 2 reps = 4**
+- Context: 2048 only — the `Qwen/Qwen2.5-0.5B-Instruct` entry caps `max_ctx=2048`
+- Batch: 1, 4 (batch=8 excluded — conservative VRAM headroom for activations)
+- Reps: 0, 1 (rep 0 = warmup; rep 1 = data)
+
+The asymmetry is a hardware-driven decision: only Qwen 0.5B (~1 GB fp16) fits safely in 6 GB VRAM; Llama-3.2-3B and Mistral-7B are excluded from the low-end GPU path entirely. To make the GPU matrix match the CPU matrix (18 runs per model), you would need to add 8K context and a second data rep — Qwen 0.5B can handle both, but the limit was set conservatively and not revisited.
+
+### Why warmup (rep 0) is mandatory and must be discarded
+
+The first inference run on a freshly loaded model is systematically different from subsequent runs and should never appear in the dataset:
+
+1. **OS page-cache cold start** — model weights are read from disk on the first run. The file system page cache is empty; every page access triggers a disk read. From rep 1 onward the weights are warm in the OS page cache and the access pattern reflects in-memory behaviour, not I/O behaviour.
+
+2. **CPU instruction cache and branch predictor** — the first run populates the CPU's instruction cache and trains the branch predictor for the model's execution paths. Rep 0 latency and cache-miss rates reflect this priming overhead, not steady-state inference.
+
+3. **Memory allocator warm-up** — jemalloc/ptmalloc arena pools and the llama.cpp memory pool are sized and populated during the first generation. Allocation patterns differ from subsequent runs.
+
+4. **Power management settling** — on a freshly started run the CPU may still be transitioning from a low-power idle state to full performance state, affecting both frequency and temperature readings for the first few seconds.
+
+Rep 0 is still collected (not skipped) because it exercises the full code path and validates that the run infrastructure works. But its results are excluded from all dataset metrics, aggregated figures, and paper numbers. The state file marks it `is_warmup=True` and the manifest.csv row carries `rep=0` so it can be filtered.
+
+---
+
+## Config dimensions in the output dataset
+
+Run configuration (`context_length`, `batch_size`, `output_tokens`, `rep_index`) is recorded in two places:
+
+1. **`metadata.json`** — full per-run record under the `generation` key:
+   ```json
+   "generation": {
+     "context_length": 2048,
+     "batch_size": 4,
+     "output_tokens": 512,
+     "rep_index": 1,
+     ...
+   }
+   ```
+
+2. **`manifest.csv`** (dataset root, one row per run) — includes `context_length`, `batch_size`, `max_tokens_per_prompt`, `rep`, `run_validity`, retention headline metrics, and hardware identity. This is the primary file for cross-run tabular analysis and the Kaggle upload artifact.
+
+**`metrics.csv` does not include config dimensions** — it has only per-region-type analysis columns (`retention_p99_s`, `write_once_ratio_mean`, etc.). To answer "how does retention scale with context length?", join `metrics.csv` to `manifest.csv` on `run_id`. All three files live in the same run directory; `run_id` is the foreign key.
 

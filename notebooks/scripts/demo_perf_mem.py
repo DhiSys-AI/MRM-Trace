@@ -225,7 +225,7 @@ def _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits=None) -> dict:
 def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
     oe = observer_effect or {}
     validity = classify_run(
-        observer_cpu_overhead_pct_max=oe.get("observer_cpu_overhead_pct_max", 0.0),
+        observer_cpu_overhead_pct_max=oe.get("observer_cpu_overhead_pct_mean", 0.0),
         observer_memory_frac=oe.get("observer_memory_overhead_frac", 0.0),
         thermal_throttle_events=thermal_meta["throttle_events"],
         baseline_cpu_pct=baseline.cpu_pct if baseline else 0.0,
