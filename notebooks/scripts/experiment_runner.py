@@ -73,14 +73,21 @@ OUTPUT_TOKENS = 512
 # ── Experiment Matrix ──────────────────────────────────────────────────────────
 
 # CPU path: GGUF models via demo_perf_mem.py + perf mem
-# Each entry: (model_id, model_file, params_b)
+# Each entry: (model_id, model_file, params_b, sample_period)
+#
+# sample_period: perf event sampling frequency — keep perf.data < ~500 MB.
+# Llama-3.2-1B at period=4000 produced 2 GB (30M events, 11-min run) → OOM during
+# perf-script text conversion. TinyLlama at 4000 is fine (~250 MB, 3-min run).
+# params_b is NOT a reliable proxy: Llama-3.2-1B (1.0B) runs slower than TinyLlama
+# (1.1B) on this CPU, producing more events per run despite fewer parameters.
+# 7.5M–15M samples is sufficient for retention/write-once characterisation.
 CPU_MODELS = [
-    ("tinyllama-1.1b",  "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",       1.1),
-    ("llama-3.2-1b",    "Llama-3.2-1B-Instruct-Q4_K_M.gguf",          1.0),
-    ("llama-3.2-3b",    "Llama-3.2-3B-Instruct-Q4_K_M.gguf",          3.0),
-    ("phi-3.5-mini",    "Phi-3.5-mini-instruct-Q4_K_M.gguf",           3.8),
-    ("mistral-7b",      "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",        7.0),
-    ("llama-3.1-8b",    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",      8.0),
+    ("tinyllama-1.1b",  "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",       1.1,   4_000),
+    ("llama-3.2-1b",    "Llama-3.2-1B-Instruct-Q4_K_M.gguf",          1.0,  16_000),
+    ("llama-3.2-3b",    "Llama-3.2-3B-Instruct-Q4_K_M.gguf",          3.0,  16_000),
+    ("phi-3.5-mini",    "Phi-3.5-mini-instruct-Q4_K_M.gguf",           3.8,  16_000),
+    ("mistral-7b",      "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",        7.0,  32_000),
+    ("llama-3.1-8b",    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",      8.0,  32_000),
 ]
 
 CONTEXT_LENGTHS = [2048, 8192, 32768]
@@ -141,6 +148,7 @@ class RunSpec:
     ctx: int
     batch: int
     rep: int
+    sample_period: int = 4_000
     is_warmup: bool = False
     max_runtime: int = MAX_RUN_SECONDS
 
@@ -256,6 +264,7 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             "--rep", str(spec.rep),
             "--machine", machine,
             "--out", str(RESULTS_DIR),
+            "--sample-period", str(spec.sample_period),
         ]
     else:  # gpu
         return [
@@ -432,7 +441,7 @@ _FAST_SPEC = RunSpec(
 
 def _cpu_specs(models, ctx_lengths) -> List[RunSpec]:
     specs = []
-    for model_id, model_file, params_b in models:
+    for model_id, model_file, params_b, sample_period in models:
         for ctx in ctx_lengths:
             for batch in BATCH_SIZES:
                 for rep in REPS:
@@ -445,6 +454,7 @@ def _cpu_specs(models, ctx_lengths) -> List[RunSpec]:
                         ctx=ctx,
                         batch=batch,
                         rep=rep,
+                        sample_period=sample_period,
                         is_warmup=(rep == 0),
                         max_runtime=MAX_RUN_SECONDS,
                     ))
@@ -478,7 +488,7 @@ def build_matrix(fast: bool = False, cpu_only: bool = False, gpu_only: bool = Fa
     if fast:
         return [_FAST_SPEC]
 
-    cpu_models = [(m, f, p) for m, f, p in CPU_MODELS
+    cpu_models = [(m, f, p, sp) for m, f, p, sp in CPU_MODELS
                   if not low_end or p <= LOW_END_MAX_PARAMS_B]
     ctx_lengths = [c for c in CONTEXT_LENGTHS
                    if not low_end or c <= LOW_END_MAX_CTX]

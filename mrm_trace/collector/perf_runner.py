@@ -75,7 +75,7 @@ class PerfMemRunner(BaseCollector):
         pid_str = ",".join(str(p) for p in target_pids)
         output_file = str(output_dir / "perf.data")
 
-        cmd: List[str] = [perf_bin, "mem", "record", "-p", pid_str]
+        cmd: List[str] = [perf_bin, "mem", "record", "-c", str(self._sample_period), "-p", pid_str]
         for ev in self._events:
             cmd += ["-e", ev]
         cmd += ["-o", output_file]

@@ -116,6 +116,10 @@ def parse_args():
         "--sample-period", type=int, default=4000,
         help="perf sampling period — lower = denser trace, higher overhead (default 4000)",
     )
+    p.add_argument(
+        "--num-prompts", dest="num_prompts", type=int, default=None,
+        help="Limit to first N prompts (default: all). Useful for quick debug runs.",
+    )
     # Internal flags used when perf spawns this script as the traced workload
     p.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--results-file", dest="results_file", default=None, help=argparse.SUPPRESS)
@@ -352,9 +356,10 @@ def run_headless(args) -> None:
     print("Model loaded.")
     print()
 
+    prompts = PROMPTS[:args.num_prompts] if args.num_prompts else PROMPTS
     gen_results = []
-    for i, prompt in enumerate(PROMPTS, 1):
-        print(f"  [{i}/{len(PROMPTS)}] {prompt[:60]}...")
+    for i, prompt in enumerate(prompts, 1):
+        print(f"  [{i}/{len(prompts)}] {prompt[:60]}...")
         print("          generating", end="", flush=True)
         result = engine.generate(prompt)
         gen_results.append({
@@ -474,7 +479,9 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
         "--rep", str(args.rep),
         "--results-file", str(results_file),
     ]
-    perf_cmd = [perf_bin, "mem", "record", "-o", str(perf_data)]
+    if args.num_prompts:
+        inner_cmd += ["--num-prompts", str(args.num_prompts)]
+    perf_cmd = [perf_bin, "mem", "record", "-c", str(args.sample_period), "-o", str(perf_data)]
     for ev in (events or []):
         perf_cmd += ["-e", ev]
     perf_cmd += ["--"] + inner_cmd
