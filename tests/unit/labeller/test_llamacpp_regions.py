@@ -33,7 +33,7 @@ def _entry(start, size, perms="rw-p", path=""):
 
 def _extract(monkeypatch, post_maps, pre_maps=(), model_path="models/tiny.gguf", **kw):
     monkeypatch.setattr(
-        "mrm_trace.labeller.llamacpp_regions._parse_proc_maps",
+        "mrm_trace.labeller.llamacpp_regions.parse_proc_maps",
         lambda: list(post_maps),
     )
     return extract_llamacpp_regions(model_path, list(pre_maps), **kw)

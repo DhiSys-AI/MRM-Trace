@@ -194,7 +194,12 @@ class PerfMemRunner(BaseCollector):
                         # omitting it avoids "Cannot print 'cpu' field" exit 255.
                         # weight = PEBS load-latency cycles; data_src encodes
                         # cache hierarchy level and NUMA node.
-                        "-F", "comm,pid,time,event,addr,sym,dso,weight,data_src",
+                        #
+                        # ip is required for sym/dso to be emitted at all: perf
+                        # silently drops both fields when ip is absent from the
+                        # list, which is why symbol coverage read 0.0% on every
+                        # run regardless of whether llama.cpp carried symbols.
+                        "-F", "comm,pid,time,event,ip,addr,sym,dso,weight,data_src",
                     ],
                     stdout=fh,
                     stderr=subprocess.PIPE,

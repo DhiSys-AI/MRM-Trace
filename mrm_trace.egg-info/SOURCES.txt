@@ -40,6 +40,7 @@ mrm_trace/labeller/kv_address_monitor.py
 mrm_trace/labeller/kv_lifecycle.py
 mrm_trace/labeller/labeller.py
 mrm_trace/labeller/llamacpp_regions.py
+mrm_trace/labeller/proc_maps.py
 mrm_trace/labeller/pytorch_regions.py
 mrm_trace/labeller/symbol_rules.py
 mrm_trace/orchestration/__init__.py

@@ -161,7 +161,8 @@ class TraceLabeller:
         Returns the number of pages whose classification was set or upgraded.
         """
         def _get(r, key):
-            return r[key] if isinstance(r, dict) else getattr(r, key, None)
+            # source is optional — pytorch_regions.TensorRegion has no such field.
+            return r.get(key) if isinstance(r, dict) else getattr(r, key, None)
 
         page_count = 0
         for r in regions:

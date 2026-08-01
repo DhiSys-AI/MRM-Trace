@@ -324,3 +324,26 @@ def test_prescan_returns_upgrade_count():
 def test_prescan_ignores_rows_without_symbol_or_dso():
     lab = TraceLabeller()
     assert lab.prescan_symbols([_row(symbol="", dso="")]) == 0
+
+
+def test_register_address_ranges_accepts_regions_without_source():
+    """
+    pytorch_regions.TensorRegion has no `source` field — reading it with [] instead
+    of .get() raised KeyError and crashed the whole PyTorch collection path.
+    """
+    lab = TraceLabeller()
+    n = lab.register_address_ranges([
+        {"region_type": "weight", "addr_start": _ADDR, "addr_end": _ADDR + 0x1000},
+    ])
+    assert n == 1
+    assert _label_one(lab)["region_type"] == "weight"
+
+
+def test_sourceless_weight_range_outranks_coarse_runtime_range():
+    """Tensor-derived weights must win over the /proc/maps runtime baseline."""
+    lab = TraceLabeller()
+    lab.register_address_ranges(_ranges("runtime", "file_mapping"))
+    lab.register_address_ranges([
+        {"region_type": "weight", "addr_start": _ADDR, "addr_end": _ADDR + 0x1000},
+    ])
+    assert _label_one(lab)["region_type"] == "weight"

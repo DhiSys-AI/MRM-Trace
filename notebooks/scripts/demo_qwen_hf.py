@@ -38,6 +38,7 @@ import pandas as pd
 from mrm_trace.analyser import compute_all
 from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.labeller import TraceLabeller
+from mrm_trace.labeller.proc_maps import summarise_regions
 from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import check_trace_quality
 from mrm_trace.telemetry.baseline import capture_baseline
@@ -224,7 +225,9 @@ def run_headless(args) -> None:
         uninstall_transformers_kv_monitor,
         collect_kv_ranges,
     )
+    from mrm_trace.labeller.proc_maps import classify_runtime_maps, snapshot_proc_maps
 
+    pre_load_maps = snapshot_proc_maps()
     load_start_ns = _mono_ns()
     model, tokenizer = load_model_and_tokenizer(args.model, args.device)
     load_end_ns = _mono_ns()
@@ -254,6 +257,17 @@ def run_headless(args) -> None:
     kv_file = pathlib.Path(args.results_file).with_name("kv_ranges.json")
     kv_file.write_text(json.dumps(kv_ranges))
     print(f"  KV cache ranges recorded: {len(kv_ranges)} tensors")
+
+    # Baseline classification for the rest of the address space — thread stacks,
+    # heap, arenas, shared libraries.  Without it every address the two
+    # extractors above do not recognise becomes region_type=unknown, which on a
+    # perf mem trace is the large majority of samples.  Captured after generation
+    # so lazily-created thread stacks are included; the labeller ranks the weight
+    # and KV claims above these coarse labels where they overlap.
+    runtime_regions = classify_runtime_maps(pre_load_maps)
+    runtime_file = pathlib.Path(args.results_file).with_name("runtime_regions.json")
+    runtime_file.write_text(json.dumps(runtime_regions))
+    print(f"  Runtime mappings recorded: {len(runtime_regions)}")
 
     results = {
         "load_start_ns": load_start_ns,
@@ -403,7 +417,27 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     else:
         print("  kv_ranges.json not found — KV lifecycle will be empty")
 
-    labelled = pd.DataFrame(list(labeller.label(iter(rows)))) if rows else pd.DataFrame()
+    # Registered last and deliberately: these are the weakest claims, and the
+    # labeller's evidence ranking keeps the tensor-derived weight/KV ranges above
+    # them wherever they overlap.
+    runtime_file = raw_dir.parent / "runtime_regions.json"
+    if runtime_file.exists():
+        runtime_data = json.loads(runtime_file.read_text())
+        n_rt_pages = labeller.register_address_ranges(runtime_data)
+        print(f"  Pre-registered {len(runtime_data)} runtime mappings → {n_rt_pages:,} pages")
+        for source, row in sorted(
+            summarise_regions(runtime_data).items(), key=lambda kv: -kv[1]["bytes"]
+        )[:6]:
+            print(f"    runtime  {source:<16} {row['count']:>4} mappings  "
+                  f"{row['bytes'] / 1e6:>9.1f} MB")
+    else:
+        print("  runtime_regions.json not found — non-model addresses stay unknown")
+
+    rows_list = list(rows)
+    n_sym = labeller.prescan_symbols(rows_list)
+    print(f"  Symbol evidence upgraded {n_sym:,} granules")
+
+    labelled = pd.DataFrame(list(labeller.label(rows_list))) if rows_list else pd.DataFrame()
     region_map = pd.DataFrame(labeller.region_map())
     kv_lifecycle = pd.DataFrame(labeller.kv_lifecycle())
     print(f"  {len(labelled):,} labelled records")

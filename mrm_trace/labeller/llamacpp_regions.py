@@ -1,35 +1,31 @@
 """
 llama-cpp-python memory region extraction for perf-mem region pre-classification.
 
-perf mem captures load/store events — there are no malloc/free pairs, and ggml_*
-symbols are stripped in pip-installed llama-cpp-python.  The memory layout is
+perf mem captures load/store events — there are no malloc/free pairs, and the
+pip wheel of llama-cpp-python ships stripped libraries.  The memory layout is
 therefore recovered from /proc/self/maps.
 
-Spec §5 requires five region classes (weight, kv_cache, activation, runtime,
-unknown).  Every mapping in /proc/self/maps is classified, not just the model
-buffers — otherwise thread stacks, the heap, and shared libraries fall through to
-``unknown`` and dominate the trace (they account for ~86% of perf mem samples on
-a llama.cpp run).  ``unknown`` should mean "we could not account for this
-address", not "we only looked at two of the mappings".
+This module supplies the two model-data claims; everything else is classified as
+``runtime`` by :mod:`mrm_trace.labeller.proc_maps`, so no address is left for the
+labeller to guess at.
 
   weight    : GGUF file is mmap'd read-only — entries with the model filename
-  kv_cache  : llama.cpp allocates the KV cache as a large anonymous mmap *after*
-              model creation; comparing maps before vs after Llama() isolates it
-  runtime   : thread stacks, malloc arenas, the heap, shared libraries, and any
-              other mapping that is not model data
+  kv_cache  : a new anonymous mapping whose size matches the KV cache implied by
+              the GGUF geometry.  Size alone is NOT evidence — see below.
 
 Usage::
 
     pre = snapshot_proc_maps()       # BEFORE Llama() construction
     llm = Llama(model_path=...)      # Llama() allocates weights + KV cache
-    regions = extract_llamacpp_regions(model_path, pre)
+    kv = expected_kv_bytes(llm.metadata, n_ctx)
+    regions = extract_llamacpp_regions(model_path, pre, expected_kv=kv)
     llm("warm up")                   # threadpool + compute buffers appear here
-    regions += extract_llamacpp_regions(model_path, pre)   # catch late mappings
+    regions += extract_llamacpp_regions(model_path, pre, expected_kv=kv)
     labeller.register_address_ranges(regions)
 
 The second call is not optional in practice: llama.cpp creates its threadpool at
 generation time, so the worker-thread stacks do not exist yet at the first call.
-``register_address_ranges`` de-duplicates by page (first classification wins), so
+``register_address_ranges`` resolves overlaps by evidence strength, so
 overlapping snapshots are safe to concatenate.
 """
 
@@ -38,6 +34,15 @@ from __future__ import annotations
 import pathlib
 from typing import List, Optional
 
+from mrm_trace.labeller.proc_maps import (
+    MAX_REGION_PAGES,
+    classify_mapping_source,
+    is_guard,
+    parse_proc_maps,
+    snapshot_proc_maps,
+    summarise_regions,
+)
+
 _MIN_KV_BYTES = 2 * 1024 * 1024  # 2 MB — ignore tiny anonymous regions
 
 # A mapping counts as the KV cache only if its size matches the size implied by
@@ -45,112 +50,17 @@ _MIN_KV_BYTES = 2 * 1024 * 1024  # 2 MB — ignore tiny anonymous regions
 # window is loose — but it is still a check, which "large and new" was not.
 _KV_SIZE_TOLERANCE = (0.75, 2.0)
 
-# A pthread stack is one anonymous rw mapping immediately preceded by a PROT_NONE
-# guard mapping.  glibc's default is 8 MiB + a 4 KiB guard; musl and explicit
-# pthread_attr_setstacksize() use other sizes, so the range is deliberately wide.
-_MIN_STACK_BYTES = 64 * 1024
-_MAX_STACK_BYTES = 64 * 1024 * 1024
-
-# Refuse to page-expand absurdly large reservations (some runtimes reserve TB of
-# PROT_NONE address space).  4 GiB = 1M pages is far above any real model buffer.
-_MAX_REGION_PAGES = 1 << 20
-
-_KERNEL_PATHS = frozenset({"[vvar]", "[vdso]", "[vsyscall]", "[vvar_vclock]"})
+__all__ = [
+    "expected_kv_bytes",
+    "extract_llamacpp_regions",
+    "snapshot_proc_maps",
+    "summarise_regions",
+]
 
 
-def _parse_proc_maps() -> List[dict]:
-    """Return all /proc/self/maps entries as dicts, in address order."""
-    regions: List[dict] = []
-    try:
-        with open("/proc/self/maps") as fh:
-            for line in fh:
-                parts = line.split()
-                if not parts:
-                    continue
-                try:
-                    start_s, end_s = parts[0].split("-")
-                    start = int(start_s, 16)
-                    end = int(end_s, 16)
-                except ValueError:
-                    continue
-                perms = parts[1] if len(parts) > 1 else ""
-                path = parts[5] if len(parts) >= 6 else ""
-                regions.append({
-                    "addr_start": start,
-                    "addr_end": end,
-                    "size": end - start,
-                    "perms": perms,
-                    "path": path,
-                })
-    except OSError:
-        pass
-    return regions
-
-
-def snapshot_proc_maps() -> List[dict]:
-    """
-    Snapshot /proc/self/maps.  Call this BEFORE constructing a Llama() object so
-    that extract_llamacpp_regions() can diff before vs after to find new regions.
-    """
-    return _parse_proc_maps()
-
-
-def _is_guard(entry: Optional[dict]) -> bool:
-    """True if *entry* is an anonymous PROT_NONE mapping (a guard page)."""
-    return (
-        entry is not None
-        and not entry["path"]
-        and entry["perms"].startswith("---")
-    )
-
-
-def _classify_anonymous(
-    entry: dict,
-    prev: Optional[dict],
-    nxt: Optional[dict],
-    is_new: bool,
-    min_kv_bytes: int,
-    expected_kv_bytes: Optional[int],
-) -> "tuple[str, str]":
-    """
-    Classify an anonymous mapping.  Returns (region_type, source).
-
-    Discriminating KV cache from thread stacks and malloc arenas matters: all
-    three are new anonymous rw mappings of several MB, and a size-only rule
-    mislabels stacks as kv_cache, which then dominates the KV lifecycle output.
-
-      thread stack : guard page immediately BELOW  (stack grows down into it)
-      malloc arena : PROT_NONE tail immediately ABOVE (unused arena remainder)
-      kv cache     : new mapping whose size matches the model geometry
-
-    A new anonymous mapping that is merely *large* is NOT the KV cache.  On a
-    Llama-3.2-1B / ctx=512 run the post-load mappings are 262 MB, 778 MB, 536 MB
-    and 2 MB, while the geometry implies a 16.8 MB KV cache — llama.cpp carves it
-    out of a larger backend arena, so it is not separable at page granularity.
-    Labelling those arenas ``kv_cache`` produces confident, wrong KV lifecycle
-    data; they are reported as ``runtime``/``anon_post_load`` instead so the gap
-    stays visible rather than being silently coerced.
-    """
-    if not entry["perms"].startswith("rw"):
-        return "runtime", "anon_noaccess" if entry["perms"].startswith("---") else "anon_ro"
-
-    if _MIN_STACK_BYTES <= entry["size"] <= _MAX_STACK_BYTES and _is_guard(prev):
-        return "runtime", "thread_stack"
-
-    if _is_guard(nxt):
-        return "runtime", "malloc_arena"
-
-    if is_new and entry["size"] >= min_kv_bytes:
-        if expected_kv_bytes:
-            lo, hi = _KV_SIZE_TOLERANCE
-            if lo * expected_kv_bytes <= entry["size"] <= hi * expected_kv_bytes:
-                return "kv_cache", "anon_kv_sized"
-        return "runtime", "anon_post_load"
-
-    return "runtime", "anon"
-
-
-def expected_kv_bytes(gguf_metadata: dict, n_ctx: int, bytes_per_element: int = 2) -> Optional[int]:
+def expected_kv_bytes(
+    gguf_metadata: dict, n_ctx: int, bytes_per_element: int = 2
+) -> Optional[int]:
     """
     KV cache size implied by GGUF model geometry, or None if the keys are absent.
 
@@ -179,50 +89,33 @@ def expected_kv_bytes(gguf_metadata: dict, n_ctx: int, bytes_per_element: int = 
     return 2 * n_layer * n_ctx * n_head_kv * head_dim * bytes_per_element
 
 
-def _classify_entry(
-    entry: dict,
-    prev: Optional[dict],
-    nxt: Optional[dict],
-    model_filename: str,
-    pre_addrs: set,
-    min_kv_bytes: int,
-    expected_kv: Optional[int],
-) -> "tuple[str, str]":
-    """Classify one /proc/self/maps entry.  Returns (region_type, source)."""
-    path = entry["path"]
+def _is_kv_sized(size: int, expected_kv: Optional[int]) -> bool:
+    """
+    True if *size* matches the KV cache implied by the model geometry.
 
-    # weight: GGUF file mmap'd (may appear as multiple segments)
-    if model_filename and (
-        path.endswith(model_filename) or path.endswith(model_filename + " (deleted)")
-    ):
-        return "weight", "mmap_gguf"
-
-    if path == "[stack]":
-        return "runtime", "main_stack"
-    if path == "[heap]":
-        return "runtime", "heap"
-    if path in _KERNEL_PATHS:
-        return "runtime", "kernel_map"
-    if path.startswith("["):
-        return "runtime", "special_map"
-    if path:
-        return "runtime", "file_mapping"
-
-    is_new = (entry["addr_start"], entry["addr_end"]) not in pre_addrs
-    return _classify_anonymous(entry, prev, nxt, is_new, min_kv_bytes, expected_kv)
+    A new anonymous mapping that is merely *large* is NOT the KV cache.  On a
+    Llama-3.2-1B / ctx=512 run the post-load mappings are 262 MB, 778 MB, 536 MB
+    and 2 MB, while the geometry implies 16.8 MB — llama.cpp carves the KV cache
+    out of a larger backend arena, so it is not separable at page granularity.
+    Labelling those arenas ``kv_cache`` produces confident, wrong KV lifecycle
+    data; without a size match they stay ``runtime`` so the gap remains visible.
+    """
+    if not expected_kv:
+        return False
+    lo, hi = _KV_SIZE_TOLERANCE
+    return lo * expected_kv <= size <= hi * expected_kv
 
 
 def extract_llamacpp_regions(
     model_path: str,
     pre_load_maps: List[dict],
     min_kv_bytes: int = _MIN_KV_BYTES,
-    max_region_pages: int = _MAX_REGION_PAGES,
+    max_region_pages: int = MAX_REGION_PAGES,
     expected_kv: Optional[int] = None,
 ) -> List[dict]:
     """
     Return address regions for the current process, classified into the spec's
-    region classes.  Every mapping is classified; nothing is left for the
-    labeller to guess at.
+    region classes.  Every mapping is classified; nothing is left to guess at.
 
     Parameters
     ----------
@@ -247,7 +140,7 @@ def extract_llamacpp_regions(
     size_bytes, source.
     """
     filename = pathlib.Path(model_path).name
-    post_maps = _parse_proc_maps()
+    post_maps = parse_proc_maps()
     pre_addrs = {(r["addr_start"], r["addr_end"]) for r in pre_load_maps}
 
     regions: List[dict] = []
@@ -256,9 +149,22 @@ def extract_llamacpp_regions(
             continue
         prev = post_maps[i - 1] if i > 0 else None
         nxt = post_maps[i + 1] if i + 1 < len(post_maps) else None
-        region_type, source = _classify_entry(
-            entry, prev, nxt, filename, pre_addrs, min_kv_bytes, expected_kv
-        )
+
+        path = entry["path"]
+        if filename and (
+            path.endswith(filename) or path.endswith(filename + " (deleted)")
+        ):
+            region_type, source = "weight", "mmap_gguf"
+        else:
+            source = classify_mapping_source(entry, prev, nxt, pre_addrs)
+            region_type = "runtime"
+            if (
+                source == "anon_post_load"
+                and entry["size"] >= min_kv_bytes
+                and _is_kv_sized(entry["size"], expected_kv)
+            ):
+                region_type, source = "kv_cache", "anon_kv_sized"
+
         regions.append({
             "region_type": region_type,
             "addr_start": entry["addr_start"],
@@ -267,21 +173,3 @@ def extract_llamacpp_regions(
             "source": source,
         })
     return regions
-
-
-def summarise_regions(regions: List[dict]) -> "dict[str, dict]":
-    """
-    Aggregate regions by source for logging: {source: {count, bytes, region_type}}.
-
-    Printing this makes a misclassification visible at run time — e.g. a
-    ``thread_stack`` count that does not match the engine's thread count, or a
-    ``kv_cache`` byte total far from the configured context size.
-    """
-    summary: "dict[str, dict]" = {}
-    for r in regions:
-        row = summary.setdefault(
-            r["source"], {"count": 0, "bytes": 0, "region_type": r["region_type"]}
-        )
-        row["count"] += 1
-        row["bytes"] += r["size_bytes"]
-    return summary

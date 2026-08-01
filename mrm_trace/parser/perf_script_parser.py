@@ -113,14 +113,57 @@ def _parse_before_pipe(tokens: list) -> "tuple[str, str, Optional[float]]":
     return "", "", None
 
 
+_UNRESOLVED = "[unknown]"
+
+# End of the decoded data_src block.  Its final "|" precedes the BLK field, so
+# rfind("|") lands *inside* the block rather than after it — the fields that
+# follow (weight, ip, sym, dso) must be measured from the end of BLK instead.
+_DECODED_END_RE = re.compile(r"\|BLK\s+\S+")
+
+
+def _parse_after_data_src(text: str) -> "tuple[Optional[int], str, str]":
+    """
+    Parse the fields following the decoded data_src: ``weight [ip sym (dso)]``.
+
+    ``perf script`` only emits sym and dso when ``ip`` is also in the ``-F``
+    list, and appends ``ip sym (dso)`` *after* the weight:
+
+        with ip:     ``   39     5d6a80 _PyEval_EvalFrameDefault (/usr/bin/python3.12)``
+        without ip:  ``   39``
+
+    Returns (weight_cycles, sym, dso); unresolved ``[unknown]`` entries become
+    empty strings so symbol coverage reflects genuine resolution.
+    """
+    parts = text.split()
+    if not parts:
+        return None, "", ""
+
+    weight = int(parts[0]) if parts[0].isdigit() else None
+    if len(parts) < 3:
+        return weight, "", ""
+
+    # parts[1] is the ip.  The dso is the final parenthesised token; anything
+    # between it and the ip is the symbol, which may contain spaces once C++
+    # names are demangled.
+    sym_tokens, dso = parts[2:], ""
+    if sym_tokens[-1].startswith("(") and sym_tokens[-1].endswith(")"):
+        dso = sym_tokens[-1][1:-1]
+        sym_tokens = sym_tokens[:-1]
+
+    sym = " ".join(sym_tokens).split("+")[0]
+    return weight, "" if sym == _UNRESOLVED else sym, "" if dso == _UNRESOLVED else dso
+
+
 def _parse_mem_tail(
     tail: str,
 ) -> "tuple[str, str, Optional[int], Optional[str], Optional[float]]":
     """
     Parse everything after the addr field in a perf mem script line.
 
-    Handles both formats:
-      New (perf 6.8 with weight,data_src):
+    Handles three formats:
+      With ip (current):
+        data_src_hex  |decoded|  weight  ip  sym (dso)
+      Without ip (traces collected before ip was added to -F):
         [sym+off /dso]  data_src_hex  |decoded|  weight
       Old (no weight/data_src):
         [sym+off /dso]
@@ -136,16 +179,16 @@ def _parse_mem_tail(
         dso = parts[1] if len(parts) > 1 else ""
         return sym, dso, None, None, None
 
-    # New format: ... data_src_hex |decoded| weight
-    last_pipe = tail.rfind("|")
-    decoded = tail[pipe_idx : last_pipe + 1]
+    end_match = _DECODED_END_RE.search(tail)
+    decoded_end = end_match.end() if end_match else tail.rfind("|") + 1
+    decoded = tail[pipe_idx:decoded_end]
     cache_level = _lvl_from_decoded(decoded)
 
-    after_parts = tail[last_pipe + 1:].split()
-    weight = int(after_parts[-1]) if after_parts and after_parts[-1].isdigit() else None
+    weight, sym, dso = _parse_after_data_src(tail[decoded_end:])
 
-    sym, dso, numa_node = _parse_before_pipe(tail[:pipe_idx].split())
-    return sym, dso, weight, cache_level, numa_node
+    before_sym, before_dso, numa_node = _parse_before_pipe(tail[:pipe_idx].split())
+    # Pre-ip traces carry sym/dso ahead of the pipe; keep them when present.
+    return sym or before_sym, dso or before_dso, weight, cache_level, numa_node
 
 
 def _parse_line(line: str) -> "Optional[tuple]":
