@@ -24,10 +24,44 @@ _DEFAULT_EVENTS: List[str] = []
 _DEFAULT_SAMPLE_PERIOD = 4000
 _PERF_SCRIPT_TIMEOUT_S = 120
 
+# Sample timestamps must live in the same clock domain as the engine's phase
+# events, or phase annotation silently produces NULL for every row (ADR-3).
+# CLOCK_MONOTONIC is what Python's time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+# reports, so pinning perf to it makes the two directly comparable.  perf's
+# default sample clock is usually monotonic-aligned already, but that is an
+# implementation detail of the kernel's local clock — asking for it explicitly
+# is what makes the alignment auditable.
+_CLOCKID = "CLOCK_MONOTONIC"
+
 
 def _find_perf() -> Optional[str]:
     """Return the absolute path to the ``perf`` binary, or None."""
     return shutil.which("perf")
+
+
+def perf_supports_clockid(perf_bin: Optional[str] = None) -> bool:
+    """Return True if this ``perf`` build accepts ``-k CLOCK_MONOTONIC``."""
+    perf_bin = perf_bin or _find_perf()
+    if not perf_bin:
+        return False
+    try:
+        result = subprocess.run(
+            [perf_bin, "record", "--clockid"],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        return False
+    # Missing option → "unknown option"; supported but valueless → "requires a value".
+    stderr = (result.stderr or b"").decode(errors="replace")
+    return "requires a value" in stderr
+
+
+def clock_args(perf_bin: Optional[str] = None) -> List[str]:
+    """
+    Return the ``perf record`` arguments that pin sample timestamps to
+    CLOCK_MONOTONIC, or an empty list if this perf build does not support it.
+    """
+    return ["-k", _CLOCKID] if perf_supports_clockid(perf_bin) else []
 
 
 class PerfMemRunner(BaseCollector):
@@ -48,6 +82,7 @@ class PerfMemRunner(BaseCollector):
         self._proc: Optional[subprocess.Popen] = None
         self._output_dir: Optional[Path] = None
         self._warnings: List[str] = []
+        self._clock_args: List[str] = []
 
     @property
     def name(self) -> str:
@@ -76,6 +111,8 @@ class PerfMemRunner(BaseCollector):
         output_file = str(output_dir / "perf.data")
 
         cmd: List[str] = [perf_bin, "mem", "record", "-c", str(self._sample_period), "-p", pid_str]
+        self._clock_args = clock_args(perf_bin)
+        cmd += self._clock_args
         for ev in self._events:
             cmd += ["-e", ev]
         cmd += ["-o", output_file]
@@ -135,6 +172,7 @@ class PerfMemRunner(BaseCollector):
             output_file_size_bytes=output_size,
             parse_success=perf_script_ok,
             warnings=warnings,
+            extra={"clockid": _CLOCKID if self._clock_args else "perf_default"},
         )
 
     def _run_perf_script(self, perf_data: Path, warnings: List[str]) -> bool:

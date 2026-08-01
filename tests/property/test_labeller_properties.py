@@ -67,20 +67,21 @@ def test_region_id_always_nonnegative(address, symbol, op_type, phase):
     base_address=st.integers(min_value=4096, max_value=2**40),
 )
 @settings(max_examples=100)
-def test_weight_region_id_always_1(n, base_address):
+def test_weight_pages_get_one_region_each(n, base_address):
     """
-    Any number of weight rows must all get region_id=1.
-    This invariant is required by the retention windowing algorithm.
+    Distinct weight pages must get distinct region_ids, so retention has one
+    sample per page rather than one sample in total (spec §6.1 asks for a
+    distribution: p50/p90/p99/max/mean/std).
     """
     rows = [
         _row(base_address + i * 4096, "ggml_init", "store", "weight_load")
         for i in range(n)
     ]
     labeller = TraceLabeller()
-    labelled = list(labeller.label(rows))
-    for r in labelled:
-        if r["region_type"] == "weight":
-            assert r["region_id"] == 1
+    labelled = [r for r in labeller.label(rows) if r["region_type"] == "weight"]
+    pages = {r["address_page"] for r in labelled}
+    ids = {r["region_id"] for r in labelled}
+    assert len(ids) == len(pages)
 
 
 @given(

@@ -53,7 +53,8 @@ class TestWeightLabelling:
         rows = list(TraceLabeller().label([row]))
         assert rows[0]["region_type"] == "weight"
 
-    def test_weight_rows_all_get_region_id_1(self):
+    def test_weight_pages_get_one_region_each(self):
+        """One region per page — retention needs a distribution, not one sample."""
         raw = [
             _raw_row(0x7F00_0000_0000 + i * 4096, "ggml_init",
                      phase="weight_load", op_type="store",
@@ -61,7 +62,8 @@ class TestWeightLabelling:
             for i in range(10)
         ]
         rows = list(TraceLabeller().label(raw))
-        assert all(r["region_id"] == 1 for r in rows)
+        assert all(r["region_type"] == "weight" for r in rows)
+        assert len({r["region_id"] for r in rows}) == 10
 
     def test_weight_compute_kernel_classified_as_weight(self):
         row = _raw_row(0x7F00_0000_0000, "ggml_vec_dot_q4_K",

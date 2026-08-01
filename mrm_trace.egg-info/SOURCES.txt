@@ -12,6 +12,7 @@ mrm_trace.egg-info/entry_points.txt
 mrm_trace.egg-info/requires.txt
 mrm_trace.egg-info/top_level.txt
 mrm_trace/analyser/__init__.py
+mrm_trace/analyser/granularity.py
 mrm_trace/analyser/iai.py
 mrm_trace/analyser/locality.py
 mrm_trace/analyser/read_freq.py

@@ -11,7 +11,7 @@ Standalone (before venv/package is installed):
     python mrm_trace/validate_machine.py      # direct, no package needed
 
 Exit codes:
-    0  classified publication-grade perf-mem collection available
+    0  READY — publication-grade perf-mem collection with region labelling available
     1  degraded only (memray fallback; no nanosecond timestamps, empty region_map)
     2  cannot collect at all
 
@@ -59,6 +59,19 @@ class Check:
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+
+def _use_colour() -> bool:
+    """True when it is safe to emit ANSI colour on stdout."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM", "") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+def _green(text: str) -> str:
+    return f"\033[32m{text}\033[0m" if _use_colour() else text
+
 
 def _read(path: str) -> str:
     try:
@@ -358,7 +371,7 @@ def check_perf_mem_smoke() -> Check:
             return Check(
                 "smoke", Status.PASS,
                 f"captured {n_samples:,} samples (>{_CONFIDENT_THRESHOLD} threshold) "
-                "-- classified perf mem collection works",
+                "-- full-quality perf mem collection works",
                 data={"samples": n_samples},
             )
 
@@ -384,7 +397,7 @@ def check_perf_mem_smoke() -> Check:
             return Check(
                 "smoke", Status.PASS,
                 f"captured {n_samples} samples with non-zero data addresses -- "
-                "classified perf mem collection works",
+                "full-quality perf mem collection works",
                 data={"samples": n_samples},
             )
         return Check(
@@ -669,8 +682,8 @@ def verdict(checks: list[Check]) -> tuple[str, int]:
         # still collectible, just note the caveat.
         return s.status in (Status.PASS, Status.WARN) and s.data.get("samples", 0) > 0
 
-    classified_blockers = ["os", "wsl2", "perf_installed", "facility"]
-    can_classify = not any(failed(n) for n in classified_blockers) and smoke_ok()
+    ready_blockers = ["os", "wsl2", "perf_installed", "facility"]
+    is_ready = not any(failed(n) for n in ready_blockers) and smoke_ok()
 
     smoke = by.get("smoke")
     smoke_caveat = (
@@ -679,11 +692,12 @@ def verdict(checks: list[Check]) -> tuple[str, int]:
         if smoke and smoke.status == Status.WARN else ""
     )
 
-    if can_classify:
+    if is_ready:
         return (
-            "CLASSIFIED publication-grade perf mem collection AVAILABLE"
+            "READY: publication-grade perf mem collection AVAILABLE "
+            "(nanosecond timestamps + memory-region labelling)"
             + smoke_caveat
-            + ". Note: classified region_map requires llama.cpp GGUF models; "
+            + ". Note: region labelling (region_map) requires llama.cpp GGUF models; "
             "PyTorch/transformers runs report region_type=unknown.",
             0,
         )
@@ -707,7 +721,7 @@ def validate_machine(out_dir: str = ".", json_output: bool = False) -> int:
     This is the public entry point. The typer CLI imports *this* function;
     `main()` below is only the argv shim for standalone `python validate_machine.py`.
 
-        0  classified publication-grade perf-mem collection available
+        0  READY — publication-grade perf-mem collection with region labelling
         1  degraded only (memray fallback)
         2  cannot collect at all
     """
@@ -727,7 +741,7 @@ def validate_machine(out_dir: str = ".", json_output: bool = False) -> int:
         if c.remediation and c.status in (Status.FAIL, Status.WARN):
             print(f"        -> {c.remediation}")
     print("  " + "-" * 48)
-    print(f"  VERDICT: {summary}\n")
+    print(f"  VERDICT: {_green(summary) if code == 0 else summary}\n")
     return code
 
 

@@ -174,9 +174,21 @@ def generate_one(model, tokenizer, prompt: str, max_new_tokens: int) -> "tuple[s
     return tokenizer.decode(new_ids, skip_special_tokens=True), prompt_len, len(new_ids), duration
 
 
+def _mono_ns() -> int:
+    """
+    CLOCK_MONOTONIC nanoseconds — the clock domain perf sample timestamps use.
+
+    Phase boundaries must NOT come from time.time_ns(): that is the UNIX epoch
+    (~1.78e18), while perf script emits seconds since boot (~2e12).  Mixing them
+    makes every phase window unreachable and leaves phase=NULL on every trace
+    row, silently disabling phase-aware labelling (ADR-3, spec §5).
+    """
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
 def run_generation(model, tokenizer, max_new_tokens: int) -> "tuple[list, int, int]":
     gen_results = []
-    gen_start_ns = time.time_ns()
+    gen_start_ns = _mono_ns()
     for i, prompt in enumerate(PROMPTS, 1):
         print(f"  [{i}/{len(PROMPTS)}] {prompt[:60]}...")
         print("          generating", end="", flush=True)
@@ -189,7 +201,7 @@ def run_generation(model, tokenizer, max_new_tokens: int) -> "tuple[list, int, i
             "duration_s": duration,
         })
         print(f" → {output_tokens} tokens @ {output_tokens / duration:.1f} tok/s")
-    return gen_results, gen_start_ns, time.time_ns()
+    return gen_results, gen_start_ns, _mono_ns()
 
 
 # ── Headless mode (spawned by perf mem record) ────────────────────────────────
@@ -213,9 +225,9 @@ def run_headless(args) -> None:
         collect_kv_ranges,
     )
 
-    load_start_ns = time.time_ns()
+    load_start_ns = _mono_ns()
     model, tokenizer = load_model_and_tokenizer(args.model, args.device)
-    load_end_ns = time.time_ns()
+    load_end_ns = _mono_ns()
     print(f"Model loaded in {(load_end_ns - load_start_ns) / 1e9:.1f}s")
 
     # Extract weight tensor address ranges while the model is in memory.
@@ -280,7 +292,10 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         "--device", args.device,
         "--results-file", str(results_file),
     ]
-    perf_cmd = [perf, "mem", "record", "-o", str(perf_data), "--"] + inner_cmd
+    # -k CLOCK_MONOTONIC puts sample timestamps in the same domain as _mono_ns().
+    from mrm_trace.collector.perf_runner import clock_args
+    perf_cmd = ([perf, "mem", "record", "-o", str(perf_data)]
+                + clock_args(perf) + ["--"] + inner_cmd)
 
     print("Launching perf mem record (spawn mode) ...")
     print("  perf will instrument the full process: model load → generation")
@@ -725,9 +740,9 @@ def main():
         ) = collect_with_perf_mem(args, raw_dir, run_id)
         trace_prewritten = False
     else:
-        load_start_ns = time.time_ns()
+        load_start_ns = _mono_ns()
         model, tokenizer = load_model_and_tokenizer(args.model, args.device)
-        load_end_ns = time.time_ns()
+        load_end_ns = _mono_ns()
         print(f"Model loaded in {(load_end_ns - load_start_ns) / 1e9:.1f}s")
         print()
         (

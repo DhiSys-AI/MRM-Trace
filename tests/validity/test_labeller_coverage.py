@@ -36,25 +36,47 @@ def _raw(address, symbol, dso="lib.so", phase=None, op_type="load",
     }
 
 
-def test_weight_region_id_is_always_1():
+def test_weight_pages_get_distinct_region_ids():
     """
-    All weight-classified pages must share region_id=1.
-    Any other id would corrupt weight retention windowing which relies on
-    all weight pages belonging to a single region.
+    Each weight page must get its own region_id.
+
+    Retention is reported per region_type as p50/p90/p99/max/mean/std (spec §6.1).
+    Collapsing every weight page into a single region_id yields exactly one
+    retention sample, so all percentiles coincide and the reported "distribution"
+    is a point — which is what the pre-2026-08 output showed for weight.
     """
     labeller = TraceLabeller()
+    n = 20
     weight_rows = [
         _raw(0x7F00_0000_0000 + i * 4096, "ggml_init",
-             phase="weight_load", op_type="store",
+             phase="weight_load", op_type="store", dso="libggml.so",
              timestamp_ns=i, sample_id=i)
-        for i in range(20)
+        for i in range(n)
     ]
     labelled = list(labeller.label(weight_rows))
-    for row in labelled:
-        assert row["region_id"] == 1, (
-            f"Weight row has region_id={row['region_id']}, expected 1. "
-            "All weight pages must share region_id=1 for correct retention analysis."
-        )
+    assert all(r["region_type"] == "weight" for r in labelled)
+    ids = {r["region_id"] for r in labelled}
+    assert len(ids) == n, (
+        f"Expected {n} distinct weight region ids (one per page), got {len(ids)}. "
+        "Merged ids collapse the retention distribution to a single sample."
+    )
+
+
+def test_same_page_accesses_share_a_region_id():
+    """Retention needs several samples per region — same page must mean same region."""
+    labeller = TraceLabeller()
+    rows = [
+        _raw(0x7F00_0000_0000 + off, "ggml_init",
+             phase="weight_load", op_type="store", dso="libggml.so",
+             timestamp_ns=i, sample_id=i)
+        for i, off in enumerate((0, 8, 64, 4095))
+    ]
+    ids = {r["region_id"] for r in labeller.label(rows)}
+    assert len(ids) == 1, (
+        "Byte offsets within one page must map to one region — perf reports "
+        "arbitrary addresses inside an object, and splitting them gives every "
+        "region a single access and therefore retention == 0."
+    )
 
 
 def test_kv_cache_blocks_have_unique_region_ids():
@@ -189,9 +211,24 @@ def test_labelling_synthetic_trace_fixture(synthetic_trace_factory):
         "KV rows not classified as 'kv_cache'. "
         "Phase 5 acceptance criterion: test fixtures must classify KV regions."
     )
-    assert all(r["region_id"] == 1 for r in weight_rows)
+    # The 50 weight rows span 50 * 64 B = 3200 B — one page, so one region.
+    assert len({r["region_id"] for r in weight_rows}) == 1
 
+    # The 20 KV rows are 256 B apart, spanning 5120 B — two pages at the default
+    # 4 KiB granularity.  Region identity is per granule, not per address: perf
+    # reports arbitrary byte addresses inside a block, so per-address ids give
+    # every region exactly one access and retention == 0 by construction.
     kv_ids = {r["region_id"] for r in kv_rows if r["op_type"] == "store"}
-    assert len(kv_ids) == n_kv, (
-        f"Expected {n_kv} distinct KV block ids, got {len(kv_ids)}."
+    assert len(kv_ids) == 2, f"Expected 2 KV granules at 4 KiB, got {len(kv_ids)}"
+
+    # Finer granularity resolves the individual 256 B blocks — the parameter is
+    # what makes this an auditable choice rather than a hidden assumption.
+    fine = TraceLabeller(region_granularity_bytes=256)
+    fine_labelled = list(fine.label(raw_rows))
+    fine_kv = {
+        r["region_id"] for r in fine_labelled
+        if r["sample_id"] > n_weight and r["op_type"] == "store"
+    }
+    assert len(fine_kv) == n_kv, (
+        f"Expected {n_kv} distinct KV blocks at 256 B granularity, got {len(fine_kv)}"
     )

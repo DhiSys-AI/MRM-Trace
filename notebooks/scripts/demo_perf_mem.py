@@ -53,15 +53,24 @@ import time
 
 import pandas as pd
 
-from mrm_trace.analyser import compute_all
+from mrm_trace.analyser import (
+    compute_all,
+    recommend_granularity,
+    retention_granularity_sweep,
+)
 from mrm_trace.collector.base import CollectorMeta
-from mrm_trace.collector.perf_runner import PerfMemRunner
+from mrm_trace.collector.perf_runner import PerfMemRunner, clock_args
 from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.config.schema import EngineType, ModelConfig, RunConfig
 from mrm_trace.engines.base import PhaseEvent
 from mrm_trace.engines.llamacpp import LlamaCppEngine
 from mrm_trace.labeller import TraceLabeller
-from mrm_trace.labeller.llamacpp_regions import extract_llamacpp_regions, snapshot_proc_maps
+from mrm_trace.labeller.llamacpp_regions import (
+    expected_kv_bytes,
+    extract_llamacpp_regions,
+    snapshot_proc_maps,
+    summarise_regions,
+)
 from mrm_trace.parser.perf_script_parser import parse_perf_script
 from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import check_trace_quality
@@ -75,6 +84,12 @@ from mrm_trace.utils.machine import machine_slug
 from mrm_trace.validate_machine import collect_machine_context
 
 DEFAULT_MODEL = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+
+# Address granularity at which a "region" is defined for retention analysis.
+# 4 KiB (one page) is the unit the OS and hardware manage, but it is frequently
+# too fine for perf mem's sample density — see the sweep printed at the end of
+# every run, and override with --region-granularity when it says so.
+_REGION_GRANULARITY_BYTES = 4096
 
 PROMPTS = [
     # P1–P5: general history and social topics — accessible to all model sizes
@@ -115,6 +130,13 @@ def parse_args():
     p.add_argument(
         "--sample-period", type=int, default=4000,
         help="perf sampling period — lower = denser trace, higher overhead (default 4000)",
+    )
+    p.add_argument(
+        "--region-granularity", dest="region_granularity", type=int,
+        default=_REGION_GRANULARITY_BYTES,
+        help="Bytes per region for retention analysis (default 4096 = one page). "
+             "The end-of-run sweep reports whether this value is usable for the "
+             "trace's sample density.",
     )
     p.add_argument(
         "--num-prompts", dest="num_prompts", type=int, default=None,
@@ -179,11 +201,14 @@ def build_model_cfg(model_path, model_id: str) -> ModelConfig:
 
 def build_phase_boundaries(phase_records):
     """
-    Convert serialized phase records ({"event": ..., "wall_ns": ...} dicts) to
-    parse_perf_script phase_boundaries.
+    Convert serialized phase records to parse_perf_script phase_boundaries.
 
-    With perf mem, trace timestamps are hardware nanosecond wall clocks, so
-    phase annotation works correctly — each sample gets its phase label.
+    MUST use mono_ns, not wall_ns.  perf sample timestamps are CLOCK_MONOTONIC
+    (seconds since boot, pinned via ``perf record -k CLOCK_MONOTONIC``), while
+    wall_ns is time.time_ns() — the UNIX epoch, ~1.78e18 today.  Comparing the
+    two puts every boundary ~56 years in the future, so _annotate_phase matches
+    nothing and every row lands with phase=NULL.  That silently disables the
+    phase-aware labelling mandated by ADR-3 and spec §5.
     """
     boundaries = []
     starts = {}
@@ -193,15 +218,21 @@ def build_phase_boundaries(phase_records):
     }
     for rec in phase_records:
         event = rec["event"]
-        wall_ns = rec["wall_ns"]
+        if "mono_ns" not in rec:
+            raise ValueError(
+                "phase record has no mono_ns — the results file was written by an "
+                "older build of this script.  Phase labelling cannot be recovered "
+                "from wall_ns alone (different clock domain); re-run the collection."
+            )
+        mono_ns = rec["mono_ns"]
         if event in phase_map:
-            starts[event] = wall_ns
+            starts[event] = mono_ns
         for start_ev, (end_ev, label) in phase_map.items():
             if event == end_ev and start_ev in starts:
                 boundaries.append({
                     "phase": label,
                     "start_ns": starts.pop(start_ev),
-                    "end_ns": wall_ns,
+                    "end_ns": mono_ns,
                 })
     return boundaries
 
@@ -317,6 +348,43 @@ def build_metadata(
     return metadata
 
 
+def _print_granularity_sweep(labelled, granularity_used: int) -> None:
+    """
+    Report how retention responds to region granularity, per region type.
+
+    Retention is (last access - first access) of a region, so it needs the same
+    region sampled more than once.  perf mem samples sparsely — and its load
+    samples are PEBS cache-miss samples, so re-reads that hit in cache are never
+    recorded.  Too fine a granule gives one sample per region and retention 0 by
+    construction; too coarse and every granule spans the run, so retention just
+    reports how long you ran.  Both look like data in metrics.csv.
+    """
+    for region_type in sorted(set(labelled["region_type"]) - {"unknown"}):
+        sweep = retention_granularity_sweep(labelled, region_type=region_type)
+        if sweep.empty:
+            continue
+        best = recommend_granularity(sweep)
+        print(f"  Retention granularity sweep [{region_type}]:")
+        for _, r in sweep.iterrows():
+            mark = "  <- recommended" if r["granule_bytes"] == best else ""
+            print(f"    {int(r['granule_bytes']) // 1024:>6} KB  "
+                  f"{r['n_regions']:>7} regions  "
+                  f"{r['samples_per_region']:>7.2f} samples/region  "
+                  f"p50={r['p50_s']:>7.3f}s  p99={r['p99_s']:>7.3f}s  "
+                  f"{r['verdict']}{mark}")
+        sys.stdout.flush()   # keep the notes below beneath the table they describe
+        if best is None:
+            print(f"    WARNING: no granule yields a usable retention distribution "
+                  f"for '{region_type}'. Report aggregate figures only, or raise "
+                  f"sample density with a smaller --sample-period.", file=sys.stderr)
+        elif best != granularity_used:
+            print(f"    NOTE: labelling used {granularity_used // 1024} KB "
+                  f"regions but {best // 1024} KB is the smallest usable granule "
+                  f"for '{region_type}' — retention in metrics.csv is an artifact "
+                  f"at the granule actually used.", file=sys.stderr)
+        print()
+
+
 def _df_val(df, col, agg="mean"):
     if df is None or df.empty or col not in df.columns:
         return "n/a"
@@ -352,8 +420,23 @@ def run_headless(args) -> None:
     engine = LlamaCppEngine(model_cfg, run_cfg)
     engine.prepare()
     engine.load_model()
-    address_regions = extract_llamacpp_regions(str(model_path), pre_load_maps)
+
+    # KV cache size implied by the GGUF geometry.  Only a mapping matching this
+    # size is claimed as kv_cache — "large and new" also describes the ggml
+    # backend arenas, which are an order of magnitude bigger.
+    kv_bytes = None
+    gguf_metadata = getattr(getattr(engine, "_llm", None), "metadata", None)
+    if gguf_metadata:
+        kv_bytes = expected_kv_bytes(gguf_metadata, args.ctx)
+    address_regions = extract_llamacpp_regions(
+        str(model_path), pre_load_maps, expected_kv=kv_bytes,
+    )
     print("Model loaded.")
+    if kv_bytes:
+        print(f"  Expected KV cache from model geometry: {kv_bytes / 1e6:.1f} MB")
+    else:
+        print("  WARNING: could not derive KV cache size from GGUF metadata — "
+              "no region will be classified as kv_cache.", file=sys.stderr)
     print()
 
     prompts = PROMPTS[:args.num_prompts] if args.num_prompts else PROMPTS
@@ -372,6 +455,15 @@ def run_headless(args) -> None:
         })
         print(f" → {result.output_tokens} tokens @ {result.tokens_per_second:.1f} tok/s")
 
+        # llama.cpp creates its threadpool (and the worker thread stacks) on the
+        # first generate, after the post-load snapshot above.  Without this second
+        # snapshot those stacks stay unregistered — and they carry ~86% of perf mem
+        # store samples, so they would all fall through to region_type=unknown.
+        if i == 1:
+            address_regions += extract_llamacpp_regions(
+                str(model_path), pre_load_maps, expected_kv=kv_bytes,
+            )
+
     # Capture peak RSS before shutdown while model weights are still in RAM.
     # Use getrusage (historical maximum) so the value is correct regardless of
     # call ordering — psutil().rss would give post-shutdown ~139 MB (weights freed).
@@ -380,7 +472,7 @@ def run_headless(args) -> None:
     engine.shutdown()
 
     phase_records = [
-        {"event": rec.event.value, "wall_ns": rec.wall_ns}
+        {"event": rec.event.value, "wall_ns": rec.wall_ns, "mono_ns": rec.mono_ns}
         for rec in engine.get_phase_records()
     ]
     runtime_metadata = dataclasses.asdict(engine.get_runtime_metadata())
@@ -482,6 +574,14 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     if args.num_prompts:
         inner_cmd += ["--num-prompts", str(args.num_prompts)]
     perf_cmd = [perf_bin, "mem", "record", "-c", str(args.sample_period), "-o", str(perf_data)]
+    # Pin sample timestamps to CLOCK_MONOTONIC so they share a clock domain with
+    # the engine's phase records (PhaseRecord.mono_ns).  Without this the phase
+    # column is NULL for every row.
+    perf_clock_args = clock_args(perf_bin)
+    perf_cmd += perf_clock_args
+    if not perf_clock_args:
+        print("  WARNING: perf does not support -k/--clockid; phase alignment is "
+              "relying on perf's default clock being monotonic.", file=sys.stderr)
     for ev in (events or []):
         perf_cmd += ["-e", ev]
     perf_cmd += ["--"] + inner_cmd
@@ -601,7 +701,8 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     )
 
 
-def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=None) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
+def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=None,
+                     granularity: int = _REGION_GRANULARITY_BYTES) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
     """Parse perf script, label, print symbol summary. Returns (labelled, region_map, kv_lifecycle)."""
     print("Parsing perf script output ...")
     rows = list(parse_perf_script(perf_script_txt, run_id=run_id, phase_boundaries=phase_boundaries))
@@ -622,23 +723,51 @@ def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=
     check_trace_quality(trace, collector_type="perf_mem", fail_fast=True)
 
     print("Labelling ...")
-    labeller = TraceLabeller()
+    labeller = TraceLabeller(region_granularity_bytes=granularity)
     if address_regions:
         n_pages = labeller.register_address_ranges(address_regions)
-        weight_regions = sum(1 for r in address_regions if r.get("region_type") == "weight")
-        kv_regions = sum(1 for r in address_regions if r.get("region_type") == "kv_cache")
-        print(f"  Pre-registered {n_pages:,} pages from /proc/maps "
-              f"({weight_regions} weight mmap, {kv_regions} kv_cache anon)")
-    labelled = pd.DataFrame(list(labeller.label(trace.to_dict(orient="records"))))
+        print(f"  Pre-registered {n_pages:,} pages from /proc/maps:")
+        for source, row in sorted(
+            summarise_regions(address_regions).items(),
+            key=lambda kv: -kv[1]["bytes"],
+        ):
+            print(f"    {row['region_type']:<9} {source:<16} "
+                  f"{row['count']:>4} mappings  {row['bytes'] / 1e6:>9.1f} MB")
+    # Symbol evidence is per row but classification is per region granule, so it
+    # must be collected before labelling — otherwise the first sample on a page
+    # is labelled from address ranges alone and a later sample carrying a
+    # decisive symbol is labelled differently, making output depend on row order.
+    trace_rows = trace.to_dict(orient="records")
+    n_sym = labeller.prescan_symbols(trace_rows)
+    print(f"  Symbol evidence upgraded {n_sym:,} granules "
+          f"(0 means stripped llama.cpp — see workplan §5.1)")
+
+    labelled = pd.DataFrame(list(labeller.label(trace_rows)))
     region_map = pd.DataFrame(labeller.region_map())
     kv_lifecycle = pd.DataFrame(labeller.kv_lifecycle())
     print(f"  Labelled trace : {labelled.shape}")
     print(f"  Region map     : {region_map.shape}")
     print(f"  KV lifecycle   : {kv_lifecycle.shape}")
     if not region_map.empty and "region_type" in region_map.columns:
-        print("  Classified regions:")
-        for _, row in region_map.iterrows():
-            print(f"    {row.get('region_type', '?'):<15} id={row.get('region_id')}  accesses={row.get('access_count', '?')}")
+        # Aggregate — a per-region listing is 48k lines when KV regions are
+        # address-granular, which buries the summary it is meant to provide.
+        print("  Classified regions (region_map):")
+        agg = region_map.groupby("region_type").agg(
+            regions=("region_id", "count"), accesses=("access_count", "sum"),
+        )
+        for rtype, row in agg.iterrows():
+            print(f"    {rtype:<15} {int(row['regions']):>7} regions  "
+                  f"{int(row['accesses']):>10,} accesses")
+
+    # Samples are ~99.6% stores (perf samples stores at a fixed period, but only
+    # samples loads above the PEBS ldlat threshold), and stores land mostly on
+    # thread stacks.  A single blended coverage number is therefore dominated by
+    # store noise and says little about the load samples the MRM metrics rest on.
+    for op in ("load", "store"):
+        sub = labelled[labelled["op_type"] == op]
+        if len(sub):
+            cov = float((sub["region_type"] != "unknown").sum()) / len(sub)
+            print(f"  region classified ({op:<5}): {cov:6.1%}  of {len(sub):,} samples")
 
     check_trace_quality(labelled, collector_type="perf_mem_labelled", fail_fast=True)
 
@@ -708,11 +837,13 @@ def main():
     ) = _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run_id)
 
     labelled, region_map, kv_lifecycle = _parse_and_label(
-        raw_dir / "perf_script.txt", run_id, phase_boundaries, address_regions
+        raw_dir / "perf_script.txt", run_id, phase_boundaries, address_regions,
+        granularity=args.region_granularity,
     )
 
     analysis = compute_all(labelled)
     _print_analysis_summary(analysis)
+    _print_granularity_sweep(labelled, args.region_granularity)
 
     print("Exporting ...")
     total_wall_duration_s = time.time() - run_start_time

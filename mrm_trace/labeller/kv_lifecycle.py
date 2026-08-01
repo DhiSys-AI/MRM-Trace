@@ -27,10 +27,18 @@ class KVBlockEntry:
 
 
 class KVBlockTracker:
-    """Tracks write/read/eviction lifecycle of KV cache blocks."""
+    """
+    Tracks write/read/eviction lifecycle of KV cache blocks.
+
+    Blocks are keyed by the caller's region granule (``block_key``), not by page,
+    so kv_block_lifecycle.parquet and region_map.parquet always agree on what one
+    block is.  When they disagree, per-block retention in one file cannot be
+    joined to region stats in the other — which is how a run once reported 48,000
+    KV "regions" while the lifecycle file tracked only a handful.
+    """
 
     def __init__(self) -> None:
-        self._blocks: Dict[int, KVBlockEntry] = {}  # address_page → entry
+        self._blocks: Dict[int, KVBlockEntry] = {}  # block_key → entry
 
     def record(
         self,
@@ -39,16 +47,18 @@ class KVBlockTracker:
         region_id: int,
         op_type: str,
         timestamp_ns: int,
+        block_key: Optional[int] = None,
     ) -> None:
         """Update block state for one KV cache access."""
-        if address_page not in self._blocks:
-            self._blocks[address_page] = KVBlockEntry(
+        key = address_page if block_key is None else block_key
+        if key not in self._blocks:
+            self._blocks[key] = KVBlockEntry(
                 block_id=region_id,
                 address=address,
                 address_page=address_page,
             )
 
-        entry = self._blocks[address_page]
+        entry = self._blocks[key]
 
         if op_type == "store":
             if entry.write_ns is None:

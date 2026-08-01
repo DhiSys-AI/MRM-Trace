@@ -59,8 +59,10 @@ def e2e_run(tmp_path_factory):
                                      int(2e9) + i * 10_000_000 + (j + 1) * 1_000_000, sid))
             sid += 1
 
-    # Label
-    labeller = TraceLabeller()
+    # Label.  The fixture's ground truth is 50 KV blocks of 256 B, so the
+    # labeller is run at that granularity — at the 4 KiB default those 50 blocks
+    # share 4 pages and would correctly resolve to 4 regions.
+    labeller = TraceLabeller(region_granularity_bytes=256)
     labelled = list(labeller.label(raw_rows))
     trace_df = pd.DataFrame(labelled)
     region_map = labeller.region_map()
@@ -90,10 +92,17 @@ class TestLabellingCorrectness:
         _, _, trace_df, _ = e2e_run
         assert (trace_df["region_type"] != "unknown").all()
 
-    def test_weight_rows_have_region_id_1(self, e2e_run):
+    def test_weight_regions_track_granules_not_a_single_id(self, e2e_run):
+        """
+        The fixture writes weights across 8 pages (base_w + (i % 8) * 4096) at
+        256 B granularity, so weight resolves to 8 distinct regions — giving
+        retention 8 samples to build a distribution from instead of 1.
+        """
         _, _, trace_df, _ = e2e_run
         weight = trace_df[trace_df["region_type"] == "weight"]
-        assert (weight["region_id"] == 1).all()
+        granules = weight["address"] // 256
+        assert weight["region_id"].nunique() == granules.nunique()
+        assert weight["region_id"].nunique() > 1
 
     def test_kv_blocks_have_distinct_region_ids(self, e2e_run):
         _, _, trace_df, _ = e2e_run
@@ -119,10 +128,23 @@ class TestAnalysisCorrectness:
 
     def test_kv_lifecycle_has_50_blocks(self, e2e_run):
         _, _, trace_df, analysis = e2e_run
-        # lifecycle comes from the labeller, check via region counts
         kv_regions = analysis["retention_per_region"]
         kv = kv_regions[kv_regions["region_type"] == "kv_cache"]
         assert len(kv) == 50
+
+    def test_kv_lifecycle_file_agrees_with_region_count(self, e2e_run):
+        """
+        kv_block_lifecycle.parquet and region_map.parquet must count blocks the
+        same way.  They diverged before — region ids were per address while the
+        lifecycle tracker keyed pages — so per-block retention in one file could
+        not be joined to region stats in the other.
+        """
+        _, run_dir, trace_df, analysis = e2e_run
+        lifecycle = pd.read_parquet(run_dir / "kv_block_lifecycle.parquet")
+        kv = analysis["retention_per_region"]
+        kv = kv[kv["region_type"] == "kv_cache"]
+        assert len(lifecycle) == len(kv) == 50
+        assert set(lifecycle["block_id"]) == set(kv["region_id"])
 
 
 class TestExportCompleteness:

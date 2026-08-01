@@ -404,8 +404,14 @@ ruff check mrm_trace/ --select E,F,W --ignore E501
 pip install build && python -m build
 
 # Tag release (version must match pyproject.toml)
-git tag v0.1.24
-git push origin v0.1.24
+git tag v0.1.25
+git push origin v0.1.25
 
 source venv/bin/activate && python -m pytest --tb=short -q 2>&1 | tail -60
+```
+
+## Ensure KV Cache is captured
+```
+CMAKE_BUILD_TYPE=Debug pip install --no-binary llama-cpp-python \
+  --force-reinstall llama-cpp-python
 ```

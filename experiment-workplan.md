@@ -2,7 +2,7 @@
 
 *This document is a standalone reproduction guide. A partner with no prior context should be able to follow it start to finish and produce the complete dataset.*
 
-*Last updated: 2026-07-21*
+*Last updated: 2026-08-01*
 
 ---
 
@@ -189,26 +189,123 @@ mrm-trace --help
 `$MRM_ROOT/venv` provides both the mrm-trace package/CLI and the scripts in
 `notebooks/scripts/` from the same clone — one venv, one repo, per machine.
 
-### 5.1 llama-cpp-python (CPU path)
+### 5.1 llama-cpp-python (CPU path) — MUST be a debug-symbol source build
 
-**Minimum version: 0.3.34.** Versions before 0.3.34 used a monolithic shared library and stripped debug symbols, leaving `region_map` empty. Version 0.3.34+ ships split shared libraries (`libllama.so`, `libggml.so`, `libggml-cpu.so`) that export 1,334 `ggml_*` and 281 `llama_kv_cache*` symbols at link time — no debug build required.
+**Do not install the pre-built wheel.** This is a hard requirement, not an optimisation.
+
+Region labelling has two independent mechanisms (spec §5): symbol rules matching
+`ggml_*` / `llama_kv_cache_*`, and address-range injection from `/proc/self/maps`.
+The pip wheel — including 0.3.34 — ships **stripped** shared libraries, so `perf
+script` resolves no symbols and the symbol mechanism is dead. Measured on a real
+run with the wheel installed: `symbol (non-empty): 0.0%` across 10,082,976 samples.
+
+> An earlier revision of this document claimed 0.3.34+ needed no debug build
+> because it exports symbols "at link time". That was wrong. Verified on the
+> partner machine 2026-08-01: the wheel's `libllama.so` is 3.6 MB and reports
+> `stripped`; the source build is 66 MB and reports `not stripped`.
 
 ```bash
-pip install "llama-cpp-python>=0.3.34" \
-  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# Source build with debug symbols. Takes 5–15 min — it compiles llama.cpp.
+CMAKE_BUILD_TYPE=Debug pip install --no-binary llama-cpp-python \
+  --force-reinstall llama-cpp-python
 ```
 
-Verify:
+`--no-binary` is as important as `CMAKE_BUILD_TYPE`. Without it pip resolves to a
+pre-built wheel, the env var is **silently ignored**, and you get a stripped
+library with no error.
+
+Verify — all three must hold:
 ```bash
-python -c "
-import llama_cpp, importlib.metadata
-ver = importlib.metadata.version('llama-cpp-python')
-print(f'llama-cpp-python {ver} OK')
-from llama_cpp import Llama
-print('import OK')
-"
-# Expected: llama-cpp-python 0.3.34 (or newer) OK
+# 1. Import works and version is >= 0.3.34
+"$MRM_ROOT/venv/bin/python" -c "
+import importlib.metadata
+print('llama-cpp-python', importlib.metadata.version('llama-cpp-python'))
+from llama_cpp import Llama; print('import OK')"
+
+# 2. Libraries are NOT stripped  (this is the check that matters)
+find "$MRM_ROOT/venv" -name 'libllama.so' -o -name 'libggml*.so' | while read f; do
+  printf '%-20s %s  %s\n' "$(basename $f)" "$(file -b "$f" | grep -o 'not stripped\|stripped')" "$(du -h "$f" | cut -f1)"
+done
+# Expected: every line reads "not stripped"; libllama.so ~66 MB (NOT 3.6 MB)
+
+# 3. The symbols the labeller keys on are present
+L=$(find "$MRM_ROOT/venv" -name libllama.so | head -1)
+nm -C --defined-only "$L" | grep -ci kv_cache      # expect > 1000
 ```
+
+If step 2 prints `stripped`, the build fell back to a wheel — re-run with
+`--no-binary` and confirm compilation output scrolls past.
+
+### 5.1.1 Why `kv_cache` may be empty on the llama.cpp path
+
+The KV cache is **not separable from `/proc/self/maps` alone**. llama.cpp carves
+it out of a larger ggml backend arena, so the mapping boundaries do not
+correspond to the KV buffer. Measured on Llama-3.2-1B / ctx=512:
+
+| | |
+|---|---|
+| KV size implied by model geometry | **16.8 MB** |
+| Actual new anonymous mappings after load | 262.7 MB, 778.8 MB, 536.9 MB, 2.1 MB |
+
+An earlier rule labelled *any* new anonymous mapping ≥ 2 MB as `kv_cache`. That
+tagged 1,580 MB of backend arena and thread-stack memory as KV cache and produced
+48,000 bogus "KV regions" with `retention_p99_s = 0.0` and
+`reads_per_write = 0.0007` — a number that would not survive review.
+
+A mapping is now claimed as `kv_cache` only when its size matches
+`2 × n_layer × n_ctx × n_head_kv × head_dim × 2 B` from the GGUF metadata. When
+nothing matches, `kv_cache` and `kv_block_lifecycle.parquet` are **empty, by
+design**. An absent measurement is publishable; a wrong one is not.
+
+To actually obtain KV regions, in order of preference:
+
+1. **Symbol-based labelling** via the Section 5.1 debug build (`llama_kv_cache_*`
+   rules in `mrm_trace/labeller/symbol_rules.py`).
+2. **Phase-aware separation** inside the arena — possible now that the `phase`
+   column is populated (spec §5, ADR-3).
+3. **The GPU/vLLM path**, where KV blocks are explicit PyTorch tensors and
+   `mrm_trace/labeller/kv_address_monitor.py` captures exact addresses.
+   review-discuss §3.5 already requires validating weight-vs-KV lifetime ordering
+   here, so this is on the critical path regardless.
+
+### 5.1.2 Region granularity — a methodology choice the paper must state
+
+Retention is `last access − first access` **of a region**, so it can only be
+estimated when the same region is sampled more than once. `perf mem` samples
+sparsely, and its load samples are PEBS cache-miss samples — a re-read that hits
+in cache is never recorded. Both granularity extremes therefore produce artifacts
+that look like data. Measured on Llama-3.2-1B / ctx=512 / 10.1M samples:
+
+| granule | samples/region | retention > 0 | p50 (s) | p99 (s) | verdict |
+|---|---|---|---|---|---|
+| 4 KB | 1.07 | 7% | 0.000 | 13.587 | undersampled |
+| 16 KB | 1.27 | 23% | 0.000 | 17.471 | undersampled |
+| **64 KB** | **2.27** | **66%** | **5.117** | **19.547** | **usable** |
+| 256 KB | 7.50 | 97% | 16.099 | 20.506 | usable |
+| 1 MB | 27.3 | 92% | 19.769 | 20.868 | saturated |
+| 16 MB | 213 | 80% | 20.831 | 21.526 | saturated |
+
+At 4 KB nearly every region holds one sample, so retention is 0 by construction.
+At ≥ 1 MB every granule is touched near the start and near the end, so retention
+converges on the ~21 s **run duration** — a property of how long you ran, not of
+the data. Only around 64 KB is there real spread.
+
+There is no universally correct value: it depends on sample density and
+working-set size, so it varies with model, context length and `--sample-period`.
+Every run therefore prints a sweep with a `usable` / `undersampled` / `saturated`
+verdict per region type and a recommended granule. **Read it before trusting any
+retention number**, and set `--region-granularity` accordingly:
+
+```bash
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
+  --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --ctx 512 --region-granularity 65536
+```
+
+If the sweep reports no usable granule, that trace cannot support a per-region
+retention distribution — report aggregate figures only, or re-collect with a
+smaller `--sample-period`. Record the granule used alongside every retention
+figure in the paper; it is not a free parameter.
 
 ### 5.2 PyTorch + transformers (GPU path)
 
@@ -313,9 +410,7 @@ These are downloaded automatically on first use by `transformers`. They are cach
 Pre-download:
 ```bash
 
-python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
-  AutoTokenizer.from_pretrained('meta-llama/Llama-3.2-3B-Instruct'); \
-  print('tokenizer OK')"
+hf 
 ```
 
 **VRAM note for Mistral-7B:** With 16 GB VRAM, bf16 weights use ~14 GB leaving ~2 GB for KV cache. Use `--ctx 4096` (not 8192 or 32768) for the GPU path Mistral runs to avoid OOM.
@@ -361,8 +456,12 @@ cat results/machine_validation.json | python -m json.tool | grep verdict
 "$MRM_ROOT/venv/bin/python" -c "import mrm_trace; print(mrm_trace.__version__)"
 "$MRM_ROOT/venv/bin/mrm-trace" validate --config config/default_experiment.yaml
 
-# 3. llama-cpp-python
+# 3. llama-cpp-python — import AND debug symbols (see 5.1; a stripped build
+#    silently disables symbol-based region labelling)
 "$MRM_ROOT/venv/bin/python" -c "from llama_cpp import Llama; print('llama-cpp OK')"
+find "$MRM_ROOT/venv" -name libllama.so | head -1 | xargs file -b | grep -q 'not stripped' \
+  && echo "libllama.so: not stripped OK" \
+  || { echo "FAIL: libllama.so is stripped — redo Section 5.1 with --no-binary"; }
 
 # 4. PyTorch GPU
 "$MRM_ROOT/venv/bin/python" -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
@@ -383,24 +482,34 @@ sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --ctx 512 --tokens 32 --batch-size 1 --rep 0
 # Expected console output (two inline quality gates printed by the pipeline):
 #
-#   Pre-registered N pages from /proc/maps (M weight mmap, K kv_cache anon)
+#   Expected KV cache from model geometry: 16.8 MB
+#   Pre-registered N pages from /proc/maps:
+#     weight    mmap_gguf           1 mappings     799.9 MB
+#     runtime   thread_stack       26 mappings     218.1 MB
+#     runtime   anon_post_load      4 mappings    1580.4 MB
+#     ...
 #
 #   Trace quality gate [perf_mem] — PASS        ← Gate 1: latency + cache_level
-#     Rows parsed          : 300,000+
 #     access_latency_ns    : [████████████████████] 100.0%
 #     cache_level          : [████████████████████] 100.0%
-#     symbol (non-empty)   : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected
-#     region classified    : [░░░░░░░░░░░░░░░░░░░░]   0.0%   ← expected pre-label
+#     symbol (non-empty)   : > 0%     ← REQUIRES the 5.1 debug build; 0.0% = stripped
+#     phase labelled       : [██████████████████░░]  ~92%   ← must NOT be 0.0%
 #
 #   Trace quality gate [perf_mem_labelled] — PASS  ← Gate 2: + region classified
-#     region classified    : [████████...] > 5%   ← weight + kv_cache via /proc/maps
+#     region classified    : [███████████████████░]  ~95%
+#   region classified (load ):  ~99%
+#   region classified (store):  ~95%
 #
-#   Region map     : (N, 8)   ← non-zero (weight + kv_cache regions)
-#   KV lifecycle   : (N, 8)   ← non-zero
+# Two failure modes that produce a healthy-looking run with unusable data:
+#   phase labelled = 0.0%   → collector/engine clock domain mismatch; every
+#                             phase is NULL and phase-aware labelling is dead.
+#                             Gate 2 now FAILs on this.
+#   symbol = 0.0%           → stripped llama-cpp build; redo Section 5.1.
+#
+# kv_cache may legitimately be absent on the llama.cpp path — see Section 5.1.1.
 #
 # If either gate prints FAIL in red, the pipeline exits immediately — the run is
-# NOT exported. Fix the issue (check perf version, PMU availability, llama-cpp ≥ 0.3.34)
-# before continuing.
+# NOT exported. Fix the issue before continuing.
 RUN_DIR=$(ls -td results/tinyllama-1.1b-q4km-perf/*/ 2>/dev/null | head -1)
 cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq columns,
                               # with rows for region_type: weight, kv_cache, unknown
@@ -684,9 +793,10 @@ kaggle_dataset/
 
 - Hardware: CPU model, RAM, GPU, OS, kernel version
 - Collector: perf mem, perf version, ldlat threshold used
-- Region classification: weight regions are identified by diffing `/proc/self/maps` before and after `Llama()` construction — GGUF file mmap ranges → `weight`, new anonymous RW regions ≥ 2 MB → `kv_cache`. Runs where `region_classified < 5%` are rejected by the post-labelling quality gate and excluded from the dataset.
-- Quality gate: every run passed two inline gates: (1) pre-labelling — `access_latency_ns` and `cache_level` ≥ 95% populated; (2) post-labelling — `region_classified` ≥ 5%. Runs that failed either gate were discarded and not re-run until the fault was corrected.
-- Proxy caveat: *"Retention durations are observed lifetimes under a batch schedule on this CPU/GPU's cache hierarchy. The logical access-pattern structure (write-once ratio, read frequency ordering by region type) transfers across substrates and constitutes first-order evidence for MRM silicon design questions. Absolute timing values are machine-specific. Weight and KV-cache regions are classified per-run via /proc/maps address-range injection; Python runtime allocations appear as region_type=unknown and are excluded from region-level retention comparisons."*
+- Region classification: every `/proc/self/maps` entry is classified, snapshotted both after `Llama()` construction and after the first generation (llama.cpp creates its threadpool lazily). GGUF file mmap → `weight`; thread stacks (identified by the adjacent PROT_NONE guard page), malloc arenas, heap, and shared libraries → `runtime`; a new anonymous mapping matching the KV size implied by GGUF geometry → `kv_cache`. Size alone never implies `kv_cache` (see Section 5.1.1). Addresses in no mapping remain `unknown`.
+- Quality gate: every run passed two inline gates: (1) pre-labelling — `access_latency_ns` and `cache_level` ≥ 95% populated, `phase` non-NULL; (2) post-labelling — `region_classified` ≥ 5%. Runs that failed either gate were discarded and not re-run until the fault was corrected.
+- Sample composition caveat: `perf mem` samples stores at a fixed period but samples loads only above the PEBS `ldlat` threshold, so traces are ~99.6% stores. Report load- and store-derived metrics separately; a blended figure is dominated by store samples, most of which land on thread stacks rather than model data.
+- Proxy caveat: *"Retention durations are observed lifetimes under a batch schedule on this CPU/GPU's cache hierarchy. The logical access-pattern structure (write-once ratio, read frequency ordering by region type) transfers across substrates and constitutes first-order evidence for MRM silicon design questions. Absolute timing values are machine-specific. Regions are classified per-run via /proc/maps address-range injection and symbol rules; addresses outside every known mapping appear as region_type=unknown and are excluded from region-level retention comparisons. Where the KV cache could not be isolated from the engine's backend arena, kv_cache is absent rather than approximated."*
 - Schema: column definitions for all parquet files
 - Citations: Legtchenko et al. (2025) "Managed-Retention Memory"
 

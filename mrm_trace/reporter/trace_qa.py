@@ -22,6 +22,7 @@ _THRESHOLDS = {
     "perf_mem": {
         "access_latency_ns": (0.95, 0.50),   # (pass_min, warn_min)
         "cache_level":       (0.85, 0.50),
+        "phase":             (0.30, 0.001),
     },
     # Post-labelling check: region classification must be non-trivial.
     # weight + kv_cache rows depend on /proc/maps injection; < 5% means
@@ -30,10 +31,12 @@ _THRESHOLDS = {
         "access_latency_ns": (0.95, 0.50),
         "cache_level":       (0.85, 0.50),
         "region_classified": (0.05, 0.001),  # FAIL if literally zero
+        "phase":             (0.30, 0.001),
     },
     "memray": {
         "access_latency_ns": (0.0, 0.0),      # always 0 for memray — not a failure
         "cache_level":       (0.0, 0.0),
+        "phase":             (0.0, 0.0),      # memray timestamps are 0; phase can't align
     },
     "default": {
         "access_latency_ns": (0.50, 0.10),
@@ -56,7 +59,9 @@ class TraceQA:
     cache_level_coverage: float
     symbol_coverage: float               # fraction non-empty
     region_classified: float             # fraction region_type != "unknown"
+    # Declared after issues so existing positional construction keeps working.
     issues: list = field(default_factory=list)
+    phase_coverage: float = 0.0          # fraction with a non-null phase label
 
     @property
     def ok(self) -> bool:
@@ -122,13 +127,22 @@ def check_trace_quality(
         float((trace["region_type"] != "unknown").sum()) / n
         if "region_type" in trace.columns else 0.0
     )
+    # A phase column that is present but entirely NULL means the phase boundaries
+    # and the sample timestamps are in different clock domains — phase-aware
+    # labelling (ADR-3, spec §5) is then silently disabled for the whole run.
+    # A trace with no phase column at all is a different thing (synthetic
+    # fixtures, collectors with no phase concept) and is not gated.
+    has_phase_col = "phase" in trace.columns
+    phase_cov = float(trace["phase"].notna().sum()) / n if has_phase_col else 0.0
 
     status = "PASS"
     status = _merge_status(status, _check_column("access_latency_ns", lat_cov, thresholds, issues))
     status = _merge_status(status, _check_column("cache_level",       cl_cov,  thresholds, issues))
     status = _merge_status(status, _check_column("region_classified", reg_cov, thresholds, issues))
+    if has_phase_col:
+        status = _merge_status(status, _check_column("phase", phase_cov, thresholds, issues))
 
-    qa = TraceQA(status, n, lat_cov, cl_cov, sym_cov, reg_cov, issues)
+    qa = TraceQA(status, n, lat_cov, cl_cov, sym_cov, reg_cov, issues, phase_cov)
 
     if print_report:
         _print(qa, collector_type)
@@ -157,6 +171,7 @@ def _print(qa: TraceQA, collector_type: str) -> None:
     print(f"    cache_level          : {_bar(qa.cache_level_coverage)}")
     print(f"    symbol (non-empty)   : {_bar(qa.symbol_coverage)}")
     print(f"    region classified    : {_bar(qa.region_classified)}")
+    print(f"    phase labelled       : {_bar(qa.phase_coverage)}")
     if qa.issues:
         for msg in qa.issues:
             print(f"    {_RED}✗ {msg}{_RESET}")

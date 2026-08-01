@@ -75,7 +75,17 @@ def test_weight_load_store_classifies_weight():
 
 
 def test_weight_load_load_classifies_weight():
-    assert classify_symbol("any_sym", "lib.so", "weight_load", "load") == "weight"
+    assert classify_symbol("any_sym", "libggml.so", "weight_load", "load") == "weight"
+
+
+def test_weight_load_outside_engine_code_is_not_weight():
+    """
+    During weight_load the process also imports modules, grows the heap and
+    spills to thread stacks.  An unconditional phase rule would sweep all of it
+    into the weight region and inflate weight retention and working-set size.
+    """
+    assert classify_symbol("PyObject_Malloc", "libpython3.12.so",
+                           "weight_load", "store") is None
 
 
 def test_kv_cache_symbol_classifies_kv_cache():

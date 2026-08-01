@@ -47,11 +47,21 @@ class SymbolRule:
 
 # Default rules for llama.cpp / vLLM inference traces.
 # Matched in order; first match wins.
+_ENGINE_DSO_RE = r"libggml|libllama|libmtmd|ggml|llama"
+
 DEFAULT_RULES: List[SymbolRule] = [
-    # Phase weight_load + store → weight write (highest priority)
-    SymbolRule(region_type="weight", phase="weight_load", op_type="store"),
-    # Any access during weight_load → weight
-    SymbolRule(region_type="weight", phase="weight_load"),
+    # Phase weight_load + store, inside engine code → weight write.
+    #
+    # The dso condition is load-bearing.  During weight_load the process is also
+    # importing Python modules, growing the heap, and spilling to thread stacks;
+    # an unconditional "any access during weight_load is weight" rule sweeps all
+    # of that into the weight region and inflates the one metric this project
+    # most needs to be right.  These two rules were inert while the phase column
+    # was NULL — they only became reachable once phase labelling was fixed.
+    SymbolRule(region_type="weight", phase="weight_load", op_type="store",
+               dso_re=_ENGINE_DSO_RE),
+    # Any engine-code access during weight_load → weight
+    SymbolRule(region_type="weight", phase="weight_load", dso_re=_ENGINE_DSO_RE),
     # KV cache symbols (before generic weight kernels to avoid false positives)
     SymbolRule(
         region_type="kv_cache",

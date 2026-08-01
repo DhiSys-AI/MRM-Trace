@@ -82,7 +82,7 @@ OUTPUT_TOKENS = 512
 # (1.1B) on this CPU, producing more events per run despite fewer parameters.
 # 7.5M–15M samples is sufficient for retention/write-once characterisation.
 CPU_MODELS = [
-    ("tinyllama-1.1b",  "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",       1.1,   4_000),
+    #("tinyllama-1.1b",  "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",       1.1,   4_000),
     ("llama-3.2-1b",    "Llama-3.2-1B-Instruct-Q4_K_M.gguf",          1.0,  16_000),
     ("llama-3.2-3b",    "Llama-3.2-3B-Instruct-Q4_K_M.gguf",          3.0,  16_000),
     ("phi-3.5-mini",    "Phi-3.5-mini-instruct-Q4_K_M.gguf",           3.8,  16_000),

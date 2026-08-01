@@ -1,5 +1,9 @@
 """Analysis subsystem for mrm-trace — Phase 6."""
 
+from mrm_trace.analyser.granularity import (
+    recommend_granularity,
+    retention_granularity_sweep,
+)
 from mrm_trace.analyser.iai import compute_iai
 from mrm_trace.analyser.locality import compute_locality
 from mrm_trace.analyser.read_freq import compute_read_freq
@@ -16,6 +20,8 @@ __all__ = [
     "compute_locality",
     "compute_iai",
     "classify_suitability",
+    "retention_granularity_sweep",
+    "recommend_granularity",
     "compute_all",
 ]
 
