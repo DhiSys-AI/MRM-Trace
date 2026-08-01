@@ -290,7 +290,7 @@ wget -P models/ --header="Authorization: Bearer $(cat ~/.cache/huggingface/token
 
 Or use the HuggingFace CLI (cleaner for gated models):
 ```bash
-huggingface-cli download bartowski/Llama-3.2-3B-Instruct-GGUF \
+hf download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models/
 ```
 
