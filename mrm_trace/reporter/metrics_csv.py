@@ -35,14 +35,28 @@ def build_metrics_table(analysis: dict) -> pd.DataFrame:
         .reset_index()
     )
 
-    # reads-per-write mean per type
+    # Reads per write for the region type as a whole: total reads over total
+    # writes, not the mean of the per-region ratios.
+    #
+    # Mean-of-ratios is not the ratio of the type.  A region type almost always
+    # contains some read-only sub-regions, whose per-region ratio is infinite
+    # (reads, no writes) — averaging that gives inf for the whole type even
+    # when it has plenty of writes.  Observed on a real run: kv_cache with
+    # 2,988 reads and 17 writes came out as inf rather than 176.
+    #
+    # The column keeps its name for schema compatibility.
+    _rf = analysis["read_freq"].groupby("region_type")[
+        ["total_reads", "total_writes"]
+    ].sum()
     rf = (
-        analysis["read_freq"]
-        .groupby("region_type")["reads_per_write"]
-        .mean()
+        (_rf["total_reads"] / _rf["total_writes"].replace(0, float("nan")))
         .rename("reads_per_write_mean")
         .reset_index()
     )
+    # A type with reads and no writes anywhere is unbounded, not missing.
+    _read_only = (_rf["total_writes"] == 0) & (_rf["total_reads"] > 0)
+    rf.loc[rf["region_type"].isin(_rf.index[_read_only]),
+           "reads_per_write_mean"] = float("inf")
 
     # working set totals
     ws = analysis["working_set_summary"][

@@ -54,11 +54,28 @@ def test_reads_per_write():
     assert result.iloc[0]["reads_per_write"] == pytest.approx(3.0)
 
 
-def test_read_only_region_reads_per_write_zero():
+def test_read_only_region_reads_per_write_is_unbounded():
+    """
+    Reads with no writes is the strongest read-many signal, so reads_per_write
+    is infinite — not zero.
+
+    It used to be 0.0 via fillna, which scored the mmap'd weight region
+    (26,757 reads, 0 writes, because the GGUF file is mapped r--s and the
+    process never stores to it) at the minimum, and through
+    classify_suitability turned the canonical write-once region into low_mrm.
+    """
     trace = _trace(
         _row(1, "weight", "load"),
         _row(1, "weight", "load"),
     )
+    result = compute_read_freq(trace)
+    assert result.iloc[0]["total_writes"] == 0
+    assert result.iloc[0]["reads_per_write"] == float("inf")
+
+
+def test_write_only_region_reads_per_write_is_zero():
+    """0.0 is reserved for its real meaning: writes with no reads."""
+    trace = _trace(_row(1, "weight", "store"))
     result = compute_read_freq(trace)
     assert result.iloc[0]["reads_per_write"] == pytest.approx(0.0)
 

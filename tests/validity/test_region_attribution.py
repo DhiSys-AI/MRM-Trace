@@ -19,6 +19,8 @@ and softmax.  See context-files/04 - Region Attribution Validity.md.
 import importlib.util
 import pathlib
 
+import numpy as np
+
 import pytest
 
 from mrm_trace.collector.kv_allocation import (
@@ -279,3 +281,103 @@ def test_a_mid_run_cap_drop_costs_the_run_its_clean_status():
     steady = {**meta, "collector": {"perf_event_max_sample_rate_before": 100_000,
                                     "perf_event_max_sample_rate_after": 100_000}}
     assert classify_from_metadata(steady).run_validity == "clean"
+
+
+# ── a read-only region must not be scored as the worst MRM candidate ─────────
+
+def _suitability(region_type, reads, writes, p99, p50, wo_ratio=None):
+    import pandas as pd
+    from mrm_trace.analyser.suitability import classify_suitability
+    retention = pd.DataFrame([{
+        "region_type": region_type, "retention_p99_s": p99,
+        "retention_p50_s": p50, "retention_p90_s": p99, "retention_mean_s": p50,
+    }])
+    wo = pd.DataFrame(
+        [] if wo_ratio is None
+        else [{"region_id": 1, "region_type": region_type, "write_once_ratio": wo_ratio}],
+        columns=["region_id", "region_type", "write_once_ratio"],
+    )
+    rf = pd.DataFrame([{"region_id": 1, "region_type": region_type,
+                        "total_reads": reads, "total_writes": writes}])
+    return classify_suitability(retention, wo, rf).iloc[0]
+
+
+def test_a_read_only_long_retention_region_is_high_mrm():
+    """
+    The central claim this instrument tests: weights are write-once, read-many
+    and long-lived.  With use_mmap llama.cpp maps the GGUF read-only, so the
+    process never stores to them — write_once_ratio is 0/0, undefined.
+    Filling that with 0.0 produced `low_mrm` for the weight region, inverting
+    the result.  Measured on a real run: 26,757 reads, 0 writes, retention p99
+    62.5 s -> low_mrm.
+    """
+    row = _suitability("weight", reads=26_757, writes=0, p99=62.5, p50=44.3)
+    assert row["write_observability"] == "read_only_no_writes"
+    assert row["suitability"] == "high_mrm"
+
+
+def test_a_read_only_region_with_no_retention_is_not_promoted():
+    """The exemption is only from the write-once gate, not from retention."""
+    row = _suitability("activation", reads=1000, writes=0, p99=0.2, p50=0.05)
+    assert row["write_observability"] == "read_only_no_writes"
+    assert row["suitability"] == "low_mrm"
+
+
+def test_a_region_with_observed_writes_still_uses_the_write_once_gate():
+    low = _suitability("runtime", reads=100, writes=100, p99=60.0, p50=40.0,
+                       wo_ratio=0.1)
+    assert low["write_observability"] == "observed"
+    assert low["suitability"] == "low_mrm"
+
+    high = _suitability("kv_cache", reads=100, writes=100, p99=60.0, p50=40.0,
+                        wo_ratio=1.0)
+    assert high["suitability"] == "high_mrm"
+
+
+def test_a_region_with_no_accesses_is_not_given_a_verdict():
+    row = _suitability("unknown", reads=0, writes=0, p99=0.0, p50=0.0)
+    assert row["write_observability"] == "no_accesses"
+    assert row["suitability"] == "unknown"
+
+
+def test_reads_per_write_is_a_ratio_of_totals_not_a_mean_of_ratios():
+    """
+    A region type almost always contains some read-only sub-regions, whose
+    per-region ratio is infinite.  Averaging those gives inf for the whole
+    type even when it has plenty of writes — observed on a real run: kv_cache
+    with 2,988 reads and 17 writes reported inf instead of 176.
+    """
+    import pandas as pd
+    import tempfile, pathlib
+    from mrm_trace.reporter.metrics_csv import write_metrics_csv
+
+    analysis = {
+        "read_freq": pd.DataFrame([
+            # two sub-regions with writes, one read-only
+            {"region_id": 1, "region_type": "kv_cache", "total_reads": 1000,
+             "total_writes": 10, "reads_per_write": 100.0},
+            {"region_id": 2, "region_type": "kv_cache", "total_reads": 1988,
+             "total_writes": 7, "reads_per_write": 284.0},
+            {"region_id": 3, "region_type": "kv_cache", "total_reads": 500,
+             "total_writes": 0, "reads_per_write": float("inf")},
+        ]),
+        "retention_summary": pd.DataFrame([{
+            "region_type": "kv_cache", "retention_p50_s": 30.0,
+            "retention_p90_s": 57.0, "retention_p99_s": 63.0,
+            "retention_mean_s": 28.0,
+        }]),
+        "write_once": pd.DataFrame([{"region_id": 1, "region_type": "kv_cache",
+                                     "write_once_ratio": 1.0}]),
+        "working_set_summary": pd.DataFrame([{"region_type": "kv_cache",
+                                              "total_pages": 2364,
+                                              "total_bytes": 9_682_944}]),
+        "suitability": pd.DataFrame([{"region_type": "kv_cache",
+                                      "suitability": "high_mrm"}]),
+    }
+    out = pathlib.Path(tempfile.mkdtemp()) / "metrics.csv"
+    write_metrics_csv(analysis, out)
+    row = pd.read_csv(out).iloc[0]
+
+    # (1000 + 1988 + 500) / (10 + 7) = 205.2, not the mean of 100/284/inf.
+    assert row["reads_per_write_mean"] == pytest.approx(3488 / 17, rel=1e-6)
+    assert np.isfinite(row["reads_per_write_mean"])
