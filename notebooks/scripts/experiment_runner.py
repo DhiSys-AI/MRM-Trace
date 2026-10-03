@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import pathlib
@@ -30,12 +31,16 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from mrm_trace.telemetry.thermal import read_package_temp_c
-from mrm_trace.telemetry.validity import TEMP_CONTAMINATED_C, TEMP_WARN_C
+from mrm_trace.telemetry.validity import (
+    TEMP_CONTAMINATED_C,
+    TEMP_WARN_C,
+    classify_from_metadata,
+)
 from mrm_trace.utils.machine import machine_slug
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -63,7 +68,14 @@ COOL_CHECK_INTERVAL = 60        # seconds between temperature checks while cooli
 # Timing — workplan §9.3
 MIN_COOL_SECONDS = 60           # mandatory cooldown after every run (sensor-settle time)
 LARGE_MODEL_EXTRA_COOL = 60     # extra time for 7B–8B models; wait_for_cool() handles the rest
-MAX_RUN_SECONDS = 7200          # 2-hour hard timeout per run
+# Per-run timeout. A flat 2 hours silently hard-kills every legitimate long
+# run: at OUTPUT_TOKENS=512 the estimates reach 5.2 h (llama-3.1-8b, ctx
+# 32768), so 27 of the 135 CPU runs would have died for a reason unrelated to
+# the science. The timeout is therefore derived from each run's own estimate —
+# generous enough not to interfere, tight enough to still catch a hang.
+MAX_RUN_SECONDS = 7200          # floor, and the timeout for uncalibrated runs
+RUN_TIMEOUT_FACTOR = 3.0        # x the estimated collection time
+MAX_RUN_SECONDS_CEILING = 43200 # 12 h — beyond this something is wrong
 PROGRESS_INTERVAL = 120         # re-print progress every 2 min
 
 # Output tokens (fixed across all runs for comparability)
@@ -72,23 +84,171 @@ OUTPUT_TOKENS = 512
 
 # ── Experiment Matrix ──────────────────────────────────────────────────────────
 
-# CPU path: GGUF models via demo_perf_mem.py + perf mem
-# Each entry: (model_id, model_file, params_b, sample_period)
+# ── Sampling budget ───────────────────────────────────────────────────────────
 #
-# sample_period: perf event sampling frequency — keep perf.data < ~500 MB.
-# Llama-3.2-1B at period=4000 produced 2 GB (30M events, 11-min run) → OOM during
-# perf-script text conversion. TinyLlama at 4000 is fine (~250 MB, 3-min run).
-# params_b is NOT a reliable proxy: Llama-3.2-1B (1.0B) runs slower than TinyLlama
-# (1.1B) on this CPU, producing more events per run despite fewer parameters.
-# 7.5M–15M samples is sufficient for retention/write-once characterisation.
+# perf mem's -c is a *period*: one sample per N memory accesses.  Sample count
+# therefore scales with how long the run takes, not with how big the model is,
+# and a fixed per-model period is the wrong instrument.  Measured on the dev
+# box: 30,608,373 samples over 83.1 s of generation at -c 32000, i.e.
+#
+#     368k samples/s  ->  1.18e10 memory accesses/s
+#
+# The same period that gives a usable 1B run therefore gives ~2 billion samples
+# on an 8B run, which no amount of streaming will analyse on a 32 GB machine.
+# So the period is derived per run from a fixed sample budget instead.
+# Measured across 8 llama-3.2-1b runs at -c 128000: 40.5M samples over a
+# 414-455 s collection window => 1.221e10. Stable to ~3% across those runs.
+_ACCESS_RATE_PER_S = 1.221e10
+
+# Rows the analysis stage can hold.  A 30M-row trace was measured end to end at
+# a 15 GB peak RSS, which fits a 32 GB box alongside the OS and the model.
+# Raise it only after re-measuring; it is a memory limit, not a preference.
+SAMPLE_BUDGET = 30_000_000
+
+# Never go denser than this however short the run, so a fast model still
+# produces a trace of manageable size.
+MIN_SAMPLE_PERIOD = 10_000
+
+# Region granularity for retention analysis (workplan §5.1.2).  No value is
+# universally correct — it depends on sample density and working-set size — so
+# every run prints a sweep with a usable/undersampled/saturated verdict and a
+# recommendation.  Read it; this is a starting point, not a setting to trust.
+REGION_GRANULARITY_BYTES = 65_536
+
+# CPU path: GGUF models via demo_perf_mem.py + perf mem
+# Each entry: (model_id, model_file, params_b, tok_per_s_at_ref_ctx)
+#
+# tok_per_s is generation throughput *under perf* at CTX_REF — perf mem roughly
+# quarters throughput, so this is not the figure you get unloaded.  It only
+# seeds the run-length estimate for the sampling budget, and only until the
+# first run of each (model, ctx) measures the real duration (see the
+# calibration below).  params_b is not a usable proxy: Llama-3.2-1B (1.0B) runs
+# slower than TinyLlama (1.1B) on this CPU.
+#
+# llama-3.2-1b is measured: 8.38 tok/s over the collection window at ctx 2048,
+# mean of 8 runs.  The rest are scaled from it by parameter count and will be
+# replaced by measurement on their own first run.
+CTX_REF = 2048
+
 CPU_MODELS = [
-    #("tinyllama-1.1b",  "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",       1.1,   4_000),
-    ("llama-3.2-1b",    "Llama-3.2-1B-Instruct-Q4_K_M.gguf",          1.0,  16_000),
-    ("llama-3.2-3b",    "Llama-3.2-3B-Instruct-Q4_K_M.gguf",          3.0,  16_000),
-    ("phi-3.5-mini",    "Phi-3.5-mini-instruct-Q4_K_M.gguf",           3.8,  16_000),
-    ("mistral-7b",      "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",        7.0,  32_000),
-    ("llama-3.1-8b",    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",      8.0,  32_000),
+    #("tinyllama-1.1b",  "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",       1.1,   9.2),
+    ("llama-3.2-1b",    "Llama-3.2-1B-Instruct-Q4_K_M.gguf",          1.0,   8.38),  # measured
+    ("llama-3.2-3b",    "Llama-3.2-3B-Instruct-Q4_K_M.gguf",          3.0,   3.05),
+    ("phi-3.5-mini",    "Phi-3.5-mini-instruct-Q4_K_M.gguf",           3.8,   2.45),
+    ("mistral-7b",      "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",        7.0,   1.30),
+    ("llama-3.1-8b",    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",      8.0,   1.15),
 ]
+
+# Prompts per run, passed to demo_perf_mem.py as --num-prompts (the script
+# defaults to all 7).  Run length is linear in this, and at OUTPUT_TOKENS=512
+# the full 7 put the sweep at ~201 h of active runtime.  4 brings it to ~115 h
+# while keeping the 512-token KV growth window and all three context lengths;
+# repetition still comes from 3 batch sizes x 3 reps per configuration.
+PROMPTS_PER_RUN = 4
+
+# Decode slows as the context grows, because attention scans more of it.
+# Two measured points on llama-3.2-1b: 11.2 tok/s at ctx 512 and 8.38 at 2048,
+# which this linear-in-ctx form reproduces with k = 1/3.  It is an
+# extrapolation beyond 2048 — deliberately one that *over*-estimates run
+# length, so an uncalibrated run comes out under budget rather than over.
+# Every (model, ctx) pair stops relying on it after its first run.
+_CTX_SLOWDOWN_K = 1.0 / 3.0
+
+# Measured sample counts, written after each run, keyed "<model_id>__ctx<ctx>".
+# rep 0 of each configuration is a warmup, so its measurement calibrates the
+# reps that carry data.
+CALIBRATION_FILE = RESULTS_DIR / ".sample_calibration.json"
+
+
+def run_timeout_for(est_seconds: float) -> int:
+    """Hang-detection timeout for a run expected to take *est_seconds*."""
+    return int(min(MAX_RUN_SECONDS_CEILING,
+                   max(MAX_RUN_SECONDS, est_seconds * RUN_TIMEOUT_FACTOR)))
+
+
+def tok_per_s_at(tok_per_s_ref: float, ctx: int) -> float:
+    """Throughput at *ctx*, scaled from the CTX_REF measurement."""
+    scale = 1.0 + _CTX_SLOWDOWN_K * (ctx / CTX_REF - 1.0)
+    return tok_per_s_ref / max(scale, 0.1)
+
+
+def estimate_run_seconds(tok_per_s_ref: float, ctx: int = CTX_REF,
+                         output_tokens: int = OUTPUT_TOKENS,
+                         prompts: int = PROMPTS_PER_RUN) -> float:
+    """Collection seconds for one run.  Decode dominates at 512 output tokens."""
+    return prompts * output_tokens / max(tok_per_s_at(tok_per_s_ref, ctx), 0.1)
+
+
+def _load_calibration() -> Dict[str, dict]:
+    try:
+        return json.loads(CALIBRATION_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _calibration_key(model_id: str, ctx: int, output_tokens: int, prompts: int) -> str:
+    """
+    Identify a calibration measurement by everything that sets run length.
+
+    Context and prompt count both scale the run, so a measurement taken at 7
+    prompts must not be reused after dropping to 4 — it would coarsen the
+    period by 7/4 and halve the sample count.
+    """
+    return f"{model_id}__ctx{ctx}__t{output_tokens}__p{prompts}"
+
+
+def record_calibration(model_id: str, ctx: int, period: int, samples: int,
+                       output_tokens: int = OUTPUT_TOKENS,
+                       prompts: int = PROMPTS_PER_RUN) -> None:
+    """
+    Remember what a period actually produced, so the next run of the same
+    (model, ctx) can correct for it.
+
+    The access rate is stable to ~3%; run length is what the estimate gets
+    wrong — 8.38 tok/s measured against 11.0 assumed put the first 8 runs 35%
+    over budget.  Measuring beats estimating, so each configuration estimates
+    once and measures thereafter.
+    """
+    if samples <= 0 or period <= 0:
+        return
+    data = _load_calibration()
+    data[_calibration_key(model_id, ctx, output_tokens, prompts)] = {
+        "period": period, "samples": samples, "recorded_at": _now(),
+        "ctx": ctx, "output_tokens": output_tokens, "prompts": prompts,
+    }
+    try:
+        CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CALIBRATION_FILE.write_text(json.dumps(data, indent=2, sort_keys=True))
+    except OSError:
+        pass
+
+
+def sample_period_for(tok_per_s_ref: float, ctx: int = CTX_REF,
+                      output_tokens: int = OUTPUT_TOKENS,
+                      model_id: Optional[str] = None,
+                      calibration: Optional[Dict[str, dict]] = None) -> int:
+    """
+    Period that keeps a run inside SAMPLE_BUDGET.
+
+    A longer run gets a coarser period, which is the point: every run in the
+    matrix then yields a comparable number of samples instead of one that
+    scales with wall time.
+
+    When a previous run of this (model, ctx) was measured, the period is
+    corrected proportionally from what that run actually produced — no duration
+    model involved.  Otherwise it is estimated.
+    """
+    if model_id is not None:
+        cal = (calibration if calibration is not None else _load_calibration())
+        prev = cal.get(_calibration_key(model_id, ctx, output_tokens,
+                                        PROMPTS_PER_RUN))
+        if prev and prev.get("samples", 0) > 0 and prev.get("period", 0) > 0:
+            period = prev["period"] * prev["samples"] / SAMPLE_BUDGET
+            return max(MIN_SAMPLE_PERIOD, int(round(period, -3)))
+
+    est_s = estimate_run_seconds(tok_per_s_ref, ctx, output_tokens)
+    period = _ACCESS_RATE_PER_S * est_s / SAMPLE_BUDGET
+    return max(MIN_SAMPLE_PERIOD, int(round(period, -3)))
 
 CONTEXT_LENGTHS = [2048, 8192, 32768]
 BATCH_SIZES = [1, 4, 8]
@@ -148,7 +308,8 @@ class RunSpec:
     ctx: int
     batch: int
     rep: int
-    sample_period: int = 4_000
+    sample_period: int = MIN_SAMPLE_PERIOD
+    region_granularity: int = REGION_GRANULARITY_BYTES
     is_warmup: bool = False
     max_runtime: int = MAX_RUN_SECONDS
 
@@ -164,6 +325,7 @@ class RunResult:
     peak_temp_c: float = 0.0
     throttled: bool = False
     contaminated: bool = False
+    validity_reasons: list = field(default_factory=list)
     run_validity: str = "unknown"   # "clean" | "marginal" | "contaminated" | "unknown"
     error: Optional[str] = None
 
@@ -265,6 +427,8 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             "--machine", machine,
             "--out", str(RESULTS_DIR),
             "--sample-period", str(spec.sample_period),
+            "--region-granularity", str(spec.region_granularity),
+            "--num-prompts", str(PROMPTS_PER_RUN),
         ]
     else:  # gpu
         return [
@@ -301,6 +465,11 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # Own session, so Ctrl+C in the terminal reaches only the runner.
+            # Without this the SIGINT went to the whole foreground process
+            # group: the run died with exit -2 and was recorded as failed,
+            # despite _handle_sigint promising to finish it first.
+            start_new_session=True,
         )
 
         # Read stdout on a background thread so the main loop can poll
@@ -383,7 +552,7 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
             if len(parts) > 1:
                 run_id = parts[-1].strip()
 
-    run_validity = _resolve_run_validity(output_dir, peak_temp)
+    run_validity, validity_reasons = _resolve_run_validity(output_dir, peak_temp)
     contaminated = run_validity == "contaminated"
 
     return RunResult(
@@ -397,31 +566,137 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
         throttled=throttled,
         contaminated=contaminated,
         run_validity=run_validity,
+        validity_reasons=validity_reasons,
         error=error,
     )
 
 
-def _resolve_run_validity(output_dir: Optional[str], peak_temp: float) -> str:
+def reclassify_runs(results_dir: pathlib.Path, state: Dict, log,
+                    dry_run: bool = False) -> Dict[str, int]:
     """
-    Prefer the real thermal-throttle-based classification the child run wrote
-    into its own metadata.json (see demo_perf_mem.py build_metadata()). Falls
-    back to a peak-temperature heuristic for runs that didn't write it (GPU
-    path, failed runs, older script versions).
+    Re-derive run_validity for every exported run from its own metadata.json.
+
+    Validity is a label over numbers the run already recorded, so correcting
+    the rule never requires re-collecting a trace.  Rewrites
+    thermal.run_validity and thermal.validity_failure_reasons in each
+    metadata.json, the matching entries in the state file, and the
+    run_validity column of manifest.csv.
+
+    Returns a count of runs per new verdict.
+    """
+    metas = sorted(results_dir.glob("*/*/*/metadata.json"))
+    log(f"Reclassifying {len(metas)} exported runs"
+        f"{' (dry run)' if dry_run else ''} ...")
+
+    counts: Dict[str, int] = {}
+    changed = 0
+    verdict_by_run_id: Dict[str, str] = {}
+
+    for meta_path in metas:
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError) as exc:
+            log(f"  SKIP {meta_path.parent.name}: {exc}")
+            continue
+
+        result = classify_from_metadata(meta)
+        thermal = meta.setdefault("thermal", {})
+        before = thermal.get("run_validity")
+        counts[result.run_validity] = counts.get(result.run_validity, 0) + 1
+        verdict_by_run_id[meta.get("run_id", meta_path.parent.name)] = result.run_validity
+
+        if before == result.run_validity:
+            continue
+        changed += 1
+        log(f"  {meta_path.parent.name}")
+        log(f"    {before} -> {result.run_validity}")
+        for reason in result.failure_reasons:
+            log(f"      {reason}")
+        if dry_run:
+            continue
+        thermal["run_validity"] = result.run_validity
+        thermal["validity_failure_reasons"] = result.failure_reasons
+        meta_path.write_text(json.dumps(meta, indent=2))
+
+    if not dry_run and changed:
+        _sync_state_validity(state, verdict_by_run_id, log)
+        _sync_manifest_validity(results_dir / "manifest.csv", verdict_by_run_id, log)
+
+    log(f"Reclassified: {changed} changed, "
+        + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    return counts
+
+
+def _sync_state_validity(state: Dict, verdict_by_run_id: Dict[str, str], log) -> None:
+    """Carry the new verdicts into .experiment_state.json so --status agrees."""
+    synced = 0
+    for entry in state.get("runs", {}).values():
+        run_id = entry.get("run_id")
+        # The state file stores the run_id scraped from the child's stdout; fall
+        # back to matching on the output directory name.
+        verdict = verdict_by_run_id.get(run_id)
+        if verdict is None and entry.get("output_dir"):
+            verdict = verdict_by_run_id.get(pathlib.Path(entry["output_dir"]).name)
+        if verdict is None or entry.get("run_validity") == verdict:
+            continue
+        entry["run_validity"] = verdict
+        entry["contaminated"] = verdict == "contaminated"
+        synced += 1
+    if synced:
+        _save_state(state)
+    log(f"  state file: {synced} entries updated")
+
+
+def _sync_manifest_validity(manifest_csv: pathlib.Path,
+                            verdict_by_run_id: Dict[str, str], log) -> None:
+    """Rewrite the run_validity column of the dataset manifest in place."""
+    if not manifest_csv.exists():
+        return
+    with open(manifest_csv, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows or "run_validity" not in rows[0]:
+        return
+    updated = 0
+    for row in rows:
+        verdict = verdict_by_run_id.get(row.get("run_id"))
+        if verdict and row.get("run_validity") != verdict:
+            row["run_validity"] = verdict
+            updated += 1
+    if updated:
+        with open(manifest_csv, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+    log(f"  manifest.csv: {updated} rows updated")
+
+
+def _resolve_run_validity(output_dir: Optional[str],
+                          peak_temp: float) -> "tuple[str, list]":
+    """
+    Prefer the classification the child run wrote into its own metadata.json
+    (see demo_perf_mem.py _thermal_section()), together with the reasons that
+    produced it. Falls back to a peak-temperature heuristic for runs that
+    didn't write one (GPU path, failed runs, older script versions).
+
+    Returns (verdict, reasons).
     """
     if output_dir:
         meta_path = pathlib.Path(output_dir) / "metadata.json"
         try:
             meta = json.loads(meta_path.read_text())
-            validity = meta.get("thermal", {}).get("run_validity")
+            thermal = meta.get("thermal", {})
+            validity = thermal.get("run_validity")
             if validity:
-                return validity
+                return validity, thermal.get("validity_failure_reasons") or []
         except (OSError, ValueError):
             pass
     if peak_temp > TEMP_CONTAMINATED_FALLBACK_C:
-        return "contaminated"
+        return "contaminated", [f"peak_temp {peak_temp:.1f}°C > "
+                                f"{TEMP_CONTAMINATED_FALLBACK_C}°C (no metadata.json)"]
     if peak_temp > TEMP_WARN_C:
-        return "marginal"
-    return "unknown"
+        return "marginal", [f"peak_temp {peak_temp:.1f}°C > {TEMP_WARN_C}°C "
+                            f"(no metadata.json)"]
+    return "unknown", ["no metadata.json to classify from"]
 
 
 # ── Matrix builder ─────────────────────────────────────────────────────────────
@@ -439,10 +714,18 @@ _FAST_SPEC = RunSpec(
 )
 
 
-def _cpu_specs(models, ctx_lengths) -> List[RunSpec]:
+def _cpu_specs(models, ctx_lengths,
+               region_granularity: int = REGION_GRANULARITY_BYTES) -> List[RunSpec]:
     specs = []
-    for model_id, model_file, params_b, sample_period in models:
+    calibration = _load_calibration()
+    for model_id, model_file, params_b, tok_per_s in models:
         for ctx in ctx_lengths:
+            # Throughput falls with context length, so the period is per
+            # (model, ctx).  Batch size does not change run length — measured
+            # 395-455 s across batch 1, 4 and 8 — so it is not a factor.
+            sample_period = sample_period_for(
+                tok_per_s, ctx, model_id=model_id, calibration=calibration)
+            max_runtime = run_timeout_for(estimate_run_seconds(tok_per_s, ctx))
             for batch in BATCH_SIZES:
                 for rep in REPS:
                     specs.append(RunSpec(
@@ -455,8 +738,9 @@ def _cpu_specs(models, ctx_lengths) -> List[RunSpec]:
                         batch=batch,
                         rep=rep,
                         sample_period=sample_period,
+                        region_granularity=region_granularity,
                         is_warmup=(rep == 0),
-                        max_runtime=MAX_RUN_SECONDS,
+                        max_runtime=max_runtime,
                     ))
     return specs
 
@@ -484,11 +768,12 @@ def _gpu_specs(models, ctx_lengths) -> List[RunSpec]:
 
 
 def build_matrix(fast: bool = False, cpu_only: bool = False, gpu_only: bool = False,
-                 low_end: bool = False) -> List[RunSpec]:
+                 low_end: bool = False,
+                 region_granularity: int = REGION_GRANULARITY_BYTES) -> List[RunSpec]:
     if fast:
         return [_FAST_SPEC]
 
-    cpu_models = [(m, f, p, sp) for m, f, p, sp in CPU_MODELS
+    cpu_models = [(m, f, p, t) for m, f, p, t in CPU_MODELS
                   if not low_end or p <= LOW_END_MAX_PARAMS_B]
     ctx_lengths = [c for c in CONTEXT_LENGTHS
                    if not low_end or c <= LOW_END_MAX_CTX]
@@ -497,7 +782,7 @@ def build_matrix(fast: bool = False, cpu_only: bool = False, gpu_only: bool = Fa
 
     specs = []
     if not gpu_only:
-        specs += _cpu_specs(cpu_models, ctx_lengths)
+        specs += _cpu_specs(cpu_models, ctx_lengths, region_granularity)
     if not cpu_only:
         specs += _gpu_specs(gpu_models, gpu_ctx_lengths)
     return specs
@@ -606,6 +891,15 @@ def _parse_cli() -> "tuple":
     parser.add_argument("--fast",         action="store_true", help="Single validation run (TinyLlama 1 prompt)")
     parser.add_argument("--low-end",      action="store_true", dest="low_end",
                         help="Exclude models > 4B and 32K context (safe for i5-8300H + GTX 1060 6 GB)")
+    parser.add_argument("--reclassify", action="store_true",
+                        help="re-derive run_validity for every exported run from its "
+                             "own metadata.json and exit; no run is re-collected. "
+                             "Combine with --dry-run to preview.")
+    parser.add_argument("--region-granularity", type=int, dest="region_granularity",
+                        default=REGION_GRANULARITY_BYTES,
+                        help=f"bytes per region for retention analysis "
+                             f"(default {REGION_GRANULARITY_BYTES}); every run prints a "
+                             f"sweep saying whether the value suited its sample density")
     parser.add_argument("--cpu-only",     action="store_true", dest="cpu_only")
     parser.add_argument("--gpu-only",     action="store_true", dest="gpu_only")
     parser.add_argument("--models-dir",   default="models", dest="models_dir",
@@ -665,6 +959,39 @@ def _result_flag(result: RunResult) -> str:
     return ""
 
 
+def _trace_row_count(output_dir: Optional[str]) -> int:
+    """Rows in a run's trace.parquet, from the footer — no data is read."""
+    if not output_dir:
+        return 0
+    trace = pathlib.Path(output_dir) / "trace.parquet"
+    if not trace.exists():
+        return 0
+    try:
+        import pyarrow.parquet as pq
+        return pq.ParquetFile(trace).metadata.num_rows
+    except Exception:
+        return 0
+
+
+def _calibrate_from_run(spec: RunSpec, result: RunResult, log) -> None:
+    """
+    Feed a completed run's sample count back into the period calculation.
+
+    Reports the overshoot so a drifting estimate is visible rather than silent:
+    the first 8 runs of the sweep came in 35% over budget and nothing said so.
+    """
+    if spec.path_type != "cpu":
+        return
+    samples = _trace_row_count(result.output_dir)
+    if samples <= 0:
+        return
+    ratio = samples / SAMPLE_BUDGET
+    record_calibration(spec.model_id, spec.ctx, spec.sample_period, samples)
+    corrected = sample_period_for(0.0, spec.ctx, model_id=spec.model_id)
+    log(f"     {samples:,} samples ({ratio:.2f}x budget) at -c {spec.sample_period:,}"
+        f"  ->  next {spec.model_id} ctx{spec.ctx} run uses -c {corrected:,}")
+
+
 def _do_cooldown(spec: RunSpec, log) -> None:
     """Mandatory inter-run cooldown per workplan §9.3."""
     cool_time = MIN_COOL_SECONDS + (LARGE_MODEL_EXTRA_COOL if spec.params_b >= 7.0 else 0)
@@ -715,6 +1042,10 @@ def _run_loop(all_specs: List[RunSpec], state: Dict,
         if result.status == "done":
             log(f"   DONE in {result.duration_s:.0f}s, "
                 f"peak {result.peak_temp_c:.1f}°C{_result_flag(result)}")
+            if result.run_validity != "clean":
+                for reason in result.validity_reasons:
+                    log(f"     reason: {reason}")
+            _calibrate_from_run(spec, result, log)
         else:
             log(f"   FAILED: {result.error}")
 
@@ -739,10 +1070,30 @@ def main():
     log(f"experiment_runner.py started — pid {os.getpid()}, machine={machine}")
 
     all_specs = build_matrix(fast=args.fast, cpu_only=args.cpu_only,
-                             gpu_only=args.gpu_only, low_end=args.low_end)
+                             gpu_only=args.gpu_only, low_end=args.low_end,
+                             region_granularity=args.region_granularity)
     log(f"Matrix: {len(all_specs)} runs planned")
+    cpu_specs = [s for s in all_specs if s.path_type == "cpu"]
+    if cpu_specs:
+        log(f"Sampling budget: {SAMPLE_BUDGET:,} samples/run | "
+            f"{PROMPTS_PER_RUN} prompts x {OUTPUT_TOKENS} tokens | "
+            f"--region-granularity {args.region_granularity}")
+        log(f"  {'model':<16}{'ctx':>7}{'-c period':>12}{'timeout':>10}")
+        seen = set()
+        for s in cpu_specs:
+            if (s.model_id, s.ctx) in seen:
+                continue
+            seen.add((s.model_id, s.ctx))
+            log(f"  {s.model_id:<16}{s.ctx:>7}{s.sample_period:>12,}"
+                f"{s.max_runtime / 3600:>8.1f}h")
 
     state = _init_state(args, all_specs, log)
+
+    if args.reclassify:
+        reclassify_runs(RESULTS_DIR, state, log, dry_run=args.dry_run)
+        print_status(state, all_specs)
+        log.close()
+        return
 
     if args.status:
         print_status(state, all_specs)

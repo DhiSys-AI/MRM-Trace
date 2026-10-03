@@ -5,7 +5,9 @@ Aggregates ProcessMonitor samples from the observer (tracer) and target (model)
 processes into the observer_effect_summary dict that gets written to metadata.json.
 """
 
-from typing import List
+from typing import List, Optional
+
+import psutil
 
 from mrm_trace.collector.process_monitor import ProcessSample
 
@@ -15,6 +17,7 @@ def compute_observer_effect(
     target_samples: List[ProcessSample],
     thermal_throttle_events: int = 0,
     baseline_cpu_pct: float = 0.0,
+    system_memory_mb: Optional[float] = None,
 ) -> dict:
     """
     Compute observer overhead metrics and return an observer_effect_summary dict.
@@ -31,9 +34,15 @@ def compute_observer_effect(
     dict with keys:
       observer_cpu_overhead_pct_max, observer_cpu_overhead_pct_mean,
       observer_memory_overhead_mb_peak, observer_memory_overhead_frac,
+      observer_memory_system_frac, system_memory_mb,
       target_rss_mb_peak, thermal_throttle_events,
       baseline_cpu_pct, io_contention_detected,
       n_observer_samples, n_target_samples
+
+    observer_memory_system_frac is the gate for an out-of-process collector:
+    what matters there is whether the collector took enough of system memory to
+    pressure the target, not how it compares to the target's own footprint.
+    See mrm_trace/telemetry/validity.py.
     """
     obs_cpu = sorted(s.cpu_pct for s in observer_samples) or [0.0]
     obs_rss = [s.rss_mb for s in observer_samples] or [0.0]
@@ -43,6 +52,12 @@ def compute_observer_effect(
     observer_mem_peak = max(obs_rss)
     observer_mem_frac = (
         observer_mem_peak / target_rss_peak if target_rss_peak > 0 else 0.0
+    )
+
+    if system_memory_mb is None:
+        system_memory_mb = psutil.virtual_memory().total / 1_048_576
+    observer_mem_system_frac = (
+        observer_mem_peak / system_memory_mb if system_memory_mb > 0 else 0.0
     )
 
     # I/O contention: flag if observer write_bytes > 10 MB during run
@@ -66,6 +81,8 @@ def compute_observer_effect(
         "observer_cpu_overhead_pct_mean": sum(obs_cpu) / len(obs_cpu),
         "observer_memory_overhead_mb_peak": observer_mem_peak,
         "observer_memory_overhead_frac": observer_mem_frac,
+        "observer_memory_system_frac": observer_mem_system_frac,
+        "system_memory_mb": round(system_memory_mb, 1),
         "target_rss_mb_peak": target_rss_peak,
         "thermal_throttle_events": thermal_throttle_events,
         "baseline_cpu_pct": baseline_cpu_pct,

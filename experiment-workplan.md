@@ -2,7 +2,7 @@
 
 *This document is a standalone reproduction guide. A partner with no prior context should be able to follow it start to finish and produce the complete dataset.*
 
-*Last updated: 2026-08-01*
+*Last updated: 2026-10-03*
 
 ---
 
@@ -21,8 +21,12 @@ Both tracks collect the same raw traces. Track B adds a RAPL energy overlay on t
 
 | Machine | Role | Hardware |
 |---|---|---|
-| **Dev machine** (you) | Code development, testing, small validation runs only | i5-8300H, 31 GB RAM, bare-metal Linux |
-| **Partner machine** (experiment machine) | Full sweep - all models, all contexts, all batch sizes | i9-11980HK, 32 GB RAM, RTX 3080 16 GB, ~3.4 TB free |
+| **Dev machine** | Code development, testing, small validation runs only | i5-8300H, 31 GB RAM, bare-metal Linux |
+| **Experiment machine** | Full sweep - all models, all contexts, all batch sizes | i9-11980HK, 31 GB RAM, RTX 3080 16 GB, ~380 GB free |
+
+As of 2026-10-03 development and the pilot runs are both happening on the
+i9-11980HK box, so "dev" and "partner" are the same machine. Where the text
+below says "partner machine", read "whichever machine runs the sweep".
 
 The dev machine runs TinyLlama (GGUF) and Qwen2.5-0.5B (HuggingFace) only - enough to confirm the pipeline is working end-to-end before handing off to the partner machine.
 
@@ -41,7 +45,7 @@ The partner machine runs the full matrix described in Section 7.
 | Storage | ~3.4 TB free NVMe |
 | NUMA | Single socket - trivial (all memory node 0) |
 | Thermal risk | **HIGH** - Alienware x17 throttles under sustained load, no AC |
-| perf mem event | `cpu/mem-loads,ldlat=20/P` confirmed available on Tiger Lake |
+| perf mem event | PEBS load-latency available; the collector passes no `-e` and lets perf auto-select, since `ldlat` syntax varies across kernels. The event actually used is recorded per run in `metadata.json` as `collector.event_strings`. |
 
 **Critical note on thermals:** This machine WILL heat-soak under sustained perf collection. See Section 9 for the mandatory thermal protocol. Runs collected while throttled are scientifically invalid and must be discarded.
 
@@ -136,7 +140,9 @@ sudo perf mem record -- sleep 2
 sudo perf mem report --stdio | head -25
 ```
 
-Expected output - look for non-zero samples under `cpu/mem-loads,ldlat=...`:
+Expected output - look for non-zero samples under `cpu/mem-loads,ldlat=...`.
+The exact threshold perf picks varies by kernel; any value is fine, and the one
+used is recorded per run in `metadata.json` as `collector.event_strings`:
 ```
 # Samples: N  of event 'cpu/mem-loads,ldlat=30/P'
 # Total weight : ...
@@ -236,6 +242,18 @@ nm -C --defined-only "$L" | grep -ci kv_cache      # expect > 1000
 If step 2 prints `stripped`, the build fell back to a wheel — re-run with
 `--no-binary` and confirm compilation output scrolls past.
 
+The source build also installs a second copy of the libraries into
+`site-packages/lib/` (~445 MB) which nothing loads; the copy that matters is
+`site-packages/llama_cpp/lib/`. It is harmless, but it is why the Section 7
+check asks the module for its library directory instead of taking the first
+`find` hit — with two copies present, `find | head -1` can inspect the one that
+is never loaded. The stray copy is safe to delete if disk is tight:
+
+```bash
+"$MRM_ROOT/venv/bin/python" -c "import llama_cpp, pathlib; print(pathlib.Path(llama_cpp.__file__).parent / 'lib')"
+# anything under site-packages/lib/ that is NOT that path is unused
+```
+
 ### 5.1.1 Why `kv_cache` may be empty on the llama.cpp path
 
 The KV cache is **not separable from `/proc/self/maps` alone**. llama.cpp carves
@@ -290,6 +308,17 @@ At ≥ 1 MB every granule is touched near the start and near the end, so retenti
 converges on the ~21 s **run duration** — a property of how long you ran, not of
 the data. Only around 64 KB is there real spread.
 
+The table above is **one run at one sample density** — do not carry 64 KB
+forward as a setting. A denser 30.6M-sample run of the same model recommended
+very different granules per region type:
+
+| region type | recommended granule | 64 KB verdict |
+|---|---|---|
+| `activation` | 4 KB | saturated |
+| `kv_cache` | 64 KB | usable |
+| `runtime` | 1024 KB | undersampled |
+| `weight` | 4096 KB | undersampled |
+
 There is no universally correct value: it depends on sample density and
 working-set size, so it varies with model, context length and `--sample-period`.
 Every run therefore prints a sweep with a `usable` / `undersampled` / `saturated`
@@ -299,13 +328,91 @@ retention number**, and set `--region-granularity` accordingly:
 ```bash
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-  --ctx 512 --region-granularity 65536
+  --ctx 512 --sample-period 128000 --region-granularity 65536
 ```
+
+The granule used is recorded in `metadata.json` as
+`collector.region_granularity_bytes`, so a published retention figure can
+always be traced back to it. The experiment runner passes
+`--region-granularity` on every run (default 65536, override with the same flag
+on the runner).
 
 If the sweep reports no usable granule, that trace cannot support a per-region
 retention distribution — report aggregate figures only, or re-collect with a
 smaller `--sample-period`. Record the granule used alongside every retention
 figure in the paper; it is not a free parameter.
+
+### 5.1.3 Sampling period — the parameter that decides whether a run completes
+
+`--sample-period` is a **period**, not a frequency: one sample per N memory
+accesses. Sample count therefore scales with how long a run takes, not with how
+big the model is. Measured on the experiment machine:
+
+| | |
+|---|---|
+| Samples | 30,608,373 |
+| Generation time | 83.1 s |
+| `--sample-period` | 32,000 |
+| **Sampled-access rate** | **368k samples/s** = 1.18 x 10^10 memory accesses/s |
+
+That rate is roughly model-independent — it is bandwidth-bound, not
+parameter-bound — so one fixed period across the matrix is the wrong
+instrument. At `--sample-period 32000`:
+
+| run length | samples | labelled frame | `perf_script.txt` |
+|---|---|---|---|
+| 1.5 min (the pilot above) | 31M | 4.3 GB | 8.9 GB |
+| 20 min | 442M | 61 GB | 141 GB |
+| 40 min | 884M | 123 GB | 282 GB |
+| 90 min | 1,989M | 277 GB | 634 GB |
+
+A 31 GB machine analyses roughly **30M rows** (measured: 15 GB peak RSS, parse
+through export). Past ~90M rows a run cannot be labelled or analysed at all,
+whatever the disk situation.
+
+**The period is therefore derived from a fixed sample budget**, not chosen per
+model: `experiment_runner.py` sets `SAMPLE_BUDGET = 30_000_000` and solves for
+the period. Two things set run length, and both feed it — context length
+(decode slows as attention scans more of it: 11.2 tok/s at ctx 512 vs 8.38 at
+2048, measured) and prompts x output tokens. Batch size does not: batch 1, 4
+and 8 all ran 395-455 s, because the prompts are processed sequentially.
+
+At `PROMPTS_PER_RUN = 4` and `OUTPUT_TOKENS = 512`:
+
+| model | ctx 2048 | ctx 8192 | ctx 32768 |
+|---|---|---|---|
+| llama-3.2-1b | 99,000 (4 min) | 199,000 (8 min) | 597,000 (24 min) |
+| llama-3.2-3b | 273,000 (11 min) | 547,000 (22 min) | 1,640,000 (67 min) |
+| phi-3.5-mini | 340,000 (14 min) | 680,000 (28 min) | 2,041,000 (84 min) |
+| mistral-7b | 641,000 (26 min) | 1,282,000 (53 min) | 3,847,000 (158 min) |
+| llama-3.1-8b | 725,000 (30 min) | 1,450,000 (59 min) | 4,349,000 (178 min) |
+
+**The estimate only seeds the first run of each (model, ctx).** It is guesswork,
+and it was wrong: the first 8 runs assumed 11.0 tok/s where the truth was 8.38,
+and came in at 40.5M samples against the 30M budget — 35% over, silently. Each
+run therefore records what its period actually produced in
+`results/.sample_calibration.json`, and the next run of the same configuration
+corrects proportionally:
+
+```
+period_next = period_used x samples_observed / SAMPLE_BUDGET
+```
+
+No duration model is involved once a configuration has been measured once, and
+rep 0 is already a warmup, so its measurement calibrates the reps that carry
+data. The runner prints the correction after each run:
+
+```
+30,142,939 samples (1.00x budget) at -c 99,000  ->  next run uses -c 99,000
+```
+
+The calibration key includes context, output tokens and prompt count, so
+changing any of them discards stale measurements rather than reusing them.
+
+The runner logs the period and timeout for every configuration before starting.
+For manual runs, **always pass `--sample-period` explicitly** — the script's own
+default is 4,000, far denser than any value above, and will produce a trace too
+large to analyse.
 
 ### 5.2 PyTorch + transformers (GPU path)
 
@@ -328,7 +435,7 @@ hf auth login
 # Paste your HF token (read-only scope is fine)
 
 # To verify if you're already logged in
-hf models ls --search "gemma"
+hf auth whoami
 ```
 
 Then go to each model's HuggingFace page and click "Agree and access repository":
@@ -358,38 +465,29 @@ mkdir -p models
 | 5 | `mistral-7b` | `Mistral-7B-Instruct-v0.3-Q4_K_M.gguf` | `bartowski/Mistral-7B-Instruct-v0.3-GGUF` | 4.1 GB | Mistral |
 | 6 | `llama-3.1-8b` | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` | 4.9 GB | LLaMA-3 |
 
-**Download commands:**
+**Download commands.** All six GGUF repos below are ungated community
+conversions — no token or license click-through is needed. (The gated
+`meta-llama/*` repos in Section 5.3 matter only for the GPU path, which loads
+the original weights.)
 
 ```bash
-BASE_HF="https://huggingface.co"
-
-# 1. TinyLlama 1.1B
-wget -P models/ "$BASE_HF/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-
-# 2. Llama-3.2-1B (requires HF login)
-wget -P models/ --header="Authorization: Bearer $(cat ~/.cache/huggingface/token)" \
-  "$BASE_HF/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-
-# 3. Llama-3.2-3B (requires HF login)
-wget -P models/ --header="Authorization: Bearer $(cat ~/.cache/huggingface/token)" \
-  "$BASE_HF/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-
-# 4. Phi-3.5-mini (no gate)
-wget -P models/ "$BASE_HF/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q4_K_M.gguf"
-
-# 5. Mistral-7B (no gate)
-wget -P models/ "$BASE_HF/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
-
-# 6. Llama-3.1-8B (requires HF login + license)
-wget -P models/ --header="Authorization: Bearer $(cat ~/.cache/huggingface/token)" \
-  "$BASE_HF/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-```
-
-Or use the HuggingFace CLI (cleaner for gated models):
-```bash
+cd "$MRM_ROOT"
+hf download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
+  tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --local-dir models/
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
+  Llama-3.2-1B-Instruct-Q4_K_M.gguf --local-dir models/
 hf download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models/
+hf download bartowski/Phi-3.5-mini-instruct-GGUF \
+  Phi-3.5-mini-instruct-Q4_K_M.gguf --local-dir models/
+hf download bartowski/Mistral-7B-Instruct-v0.3-GGUF \
+  Mistral-7B-Instruct-v0.3-Q4_K_M.gguf --local-dir models/
+hf download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --local-dir models/
 ```
+
+`hf download` resumes partial transfers; `wget` restarts them, which matters on
+the 4–5 GB files.
 
 **Verify all models present:**
 ```bash
@@ -407,10 +505,11 @@ These are downloaded automatically on first use by `transformers`. They are cach
 | 2 | `meta-llama/Llama-3.2-3B-Instruct` | 6 GB | ~8 GB | Requires HF login + license |
 | 3 | `mistralai/Mistral-7B-Instruct-v0.3` | 14 GB | ~16 GB | Requires HF login; tight on 16 GB VRAM |
 
-Pre-download:
+Pre-download (optional — `transformers` fetches these on first use):
 ```bash
-
-hf 
+hf download Qwen/Qwen2.5-0.5B-Instruct
+hf download meta-llama/Llama-3.2-3B-Instruct        # needs login + license
+hf download mistralai/Mistral-7B-Instruct-v0.3      # needs login
 ```
 
 **VRAM note for Mistral-7B:** With 16 GB VRAM, bf16 weights use ~14 GB leaving ~2 GB for KV cache. Use `--ctx 4096` (not 8192 or 32768) for the GPU path Mistral runs to avoid OOM.
@@ -422,7 +521,8 @@ hf
 models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
 # Qwen2.5-0.5B - auto-downloaded by demo_qwen_hf.py on first run
-python notebooks/scripts/demo_qwen_hf.py --model Qwen/Qwen2.5-0.5B-Instruct
+"$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_qwen_hf.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
 ---
@@ -456,12 +556,31 @@ cat results/machine_validation.json | python -m json.tool | grep verdict
 "$MRM_ROOT/venv/bin/python" -c "import mrm_trace; print(mrm_trace.__version__)"
 "$MRM_ROOT/venv/bin/mrm-trace" validate --config config/default_experiment.yaml
 
-# 3. llama-cpp-python — import AND debug symbols (see 5.1; a stripped build
-#    silently disables symbol-based region labelling)
+# 3. llama-cpp-python — import AND debug symbols in the libraries actually
+#    loaded (see 5.1; a stripped build silently disables symbol-based region
+#    labelling). Ask the module where its libs are rather than using
+#    `find | head -1`: a source build can leave a second, unused copy elsewhere
+#    in site-packages, and head -1 may inspect that one instead. libggml-cpu.so
+#    is checked too — it supplies most of the symbols that appear in a trace
+#    (ggml_vec_dot_*, ggml_gemv_*), not libllama.so.
+LIBDIR=$("$MRM_ROOT/venv/bin/python" -c \
+  "import llama_cpp, pathlib; print(pathlib.Path(llama_cpp.__file__).parent / 'lib')")
 "$MRM_ROOT/venv/bin/python" -c "from llama_cpp import Llama; print('llama-cpp OK')"
-find "$MRM_ROOT/venv" -name libllama.so | head -1 | xargs file -b | grep -q 'not stripped' \
-  && echo "libllama.so: not stripped OK" \
-  || { echo "FAIL: libllama.so is stripped — redo Section 5.1 with --no-binary"; }
+echo "loaded from: $LIBDIR"
+fail=0
+for f in "$LIBDIR"/libllama.so "$LIBDIR"/libggml-cpu.so; do
+  if file -b "$f" | grep -q 'not stripped'; then
+    printf '  %-16s not stripped  %s  symbols: %s\n' \
+      "$(basename "$f")" "$(du -h "$f" | cut -f1)" \
+      "$(nm -C --defined-only "$f" 2>/dev/null | grep -cE ' [Tt] (ggml_|llama_kv_cache)')"
+  else
+    echo "  FAIL: $f is stripped — redo Section 5.1 with --no-binary"; fail=1
+  fi
+done
+[ "$fail" -eq 0 ] && echo "debug symbols OK" || exit 1
+# Expected on a correct source build (measured 2026-10-03):
+#   libllama.so      not stripped  66M   symbols: 305
+#   libggml-cpu.so   not stripped  4.4M  symbols: 791
 
 # 4. PyTorch GPU
 "$MRM_ROOT/venv/bin/python" -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
@@ -474,31 +593,41 @@ ls -lh models/*.gguf | awk '{print $5, $9}'
 sensors | grep -E "Core|Package|temp"
 
 # 7. Disk space
-df -h ~   # must have > 200 GB free for safe operation
+df -h ~   # need > 400 GB free: ~340 GB of retained artifacts for the full
+          # sweep (Section 11.2) plus headroom for one run's perf_script.txt
 
-# 8. Quick end-to-end test (TinyLlama, 1 prompt, fast)
+# 8. Quick end-to-end test (TinyLlama, 1 prompt, ~1 min)
+#    --num-prompts 1 is what makes it quick; without it the script runs all 7.
+#    --sample-period is mandatory, see Section 5.1.3. 16000 suits a run this
+#    short; the sweep's real values are much coarser.
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
-  --ctx 512 --tokens 32 --batch-size 1 --rep 0
+  --ctx 512 --tokens 32 --batch-size 1 --rep 0 \
+  --num-prompts 1 --sample-period 16000 --region-granularity 65536
 # Expected console output (two inline quality gates printed by the pipeline):
 #
-#   Expected KV cache from model geometry: 16.8 MB
+#   Expected KV cache from model geometry: 11.5 MB   ← TinyLlama @ ctx 512
+#                                                      (2 x 22 layers x 512 ctx
+#                                                       x 4 KV heads x 64 dim
+#                                                       x 2 B); other models
+#                                                      differ — the script
+#                                                      computes it from the GGUF
 #   Pre-registered N pages from /proc/maps:
-#     weight    mmap_gguf           1 mappings     799.9 MB
-#     runtime   thread_stack       26 mappings     218.1 MB
-#     runtime   anon_post_load      4 mappings    1580.4 MB
-#     ...
+#     weight    mmap_gguf         ...  ~the GGUF file size
+#     runtime   anon_post_load    ...  ggml backend arenas
+#     runtime   thread_stack      ...  one 8 MB stack per ggml worker
+#     ...      (sizes vary by model and thread count; `weight` must be present)
 #
 #   Trace quality gate [perf_mem] — PASS        ← Gate 1: latency + cache_level
-#     access_latency_ns    : [████████████████████] 100.0%
-#     cache_level          : [████████████████████] 100.0%
+#     access_latency_ns    : [████████████████████] 100.0%   ← PASS needs ≥ 95%
+#     cache_level          : [████████████████████] 100.0%   ← PASS needs ≥ 85%
 #     symbol (non-empty)   : > 0%     ← REQUIRES the 5.1 debug build; 0.0% = stripped
-#     phase labelled       : [██████████████████░░]  ~92%   ← must NOT be 0.0%
+#     phase labelled       : [████████████████████] 100.0%   ← must NOT be 0.0%
 #
 #   Trace quality gate [perf_mem_labelled] — PASS  ← Gate 2: + region classified
-#     region classified    : [███████████████████░]  ~95%
+#     region classified    : [████████████████████] 100.0%   ← PASS needs ≥ 5%
 #   region classified (load ):  ~99%
-#   region classified (store):  ~95%
+#   region classified (store): ~100%
 #
 # Two failure modes that produce a healthy-looking run with unusable data:
 #   phase labelled = 0.0%   → collector/engine clock domain mismatch; every
@@ -510,9 +639,13 @@ sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
 #
 # If either gate prints FAIL in red, the pipeline exits immediately — the run is
 # NOT exported. Fix the issue before continuing.
-RUN_DIR=$(ls -td results/tinyllama-1.1b-q4km-perf/*/ 2>/dev/null | head -1)
-cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq columns,
-                              # with rows for region_type: weight, kv_cache, unknown
+#
+# Layout is results/<machine_id>/<model_id>/<run_id>/ (ADR-7), so the glob needs
+# the machine level.
+RUN_DIR=$(ls -td results/*/tinyllama-1.1b-q4km-perf/*/ 2>/dev/null | head -1)
+cat "$RUN_DIR/metrics.csv"   # one row per region_type: weight, kv_cache,
+                             # activation, runtime, unknown — with retention,
+                             # write_once and read_freq columns
 
 # 9. Validity test suite — run before dataset release
 #    Verifies that known synthetic inputs produce known metric outputs.
@@ -530,18 +663,26 @@ cat "$RUN_DIR/metrics.csv"   # should show retention, write_once, read_freq colu
 
 | Dimension | Values | Count |
 |---|---|---|
-| Models | tinyllama-1.1b, llama-3.2-1b, llama-3.2-3b, phi-3.5-mini, mistral-7b, llama-3.1-8b | 6 |
+| Models | llama-3.2-1b, llama-3.2-3b, phi-3.5-mini, mistral-7b, llama-3.1-8b | 5 |
 | Context lengths | 2048, 8192, 32768 | 3 |
 | Batch sizes | 1, 4, 8 | 3 |
 | Reps per config | 3 (rep 0 = warmup, reps 1–2 = data) | 3 |
-| **Total CPU runs** | 6 × 3 × 3 × 3 | **162** |
+| **Total CPU runs** | 5 × 3 × 3 × 3 | **135** |
 
-Output tokens per run: **256** (default). Override per-run with `--tokens N`:
+TinyLlama is commented out in `CPU_MODELS` — it is a pipeline smoke test
+(Section 7 check 8), not a dataset model. Uncomment it for 6 models / 162 runs.
+
+Each run generates `PROMPTS_PER_RUN = 4` prompts of `OUTPUT_TOKENS = 512`
+tokens, both set in `experiment_runner.py` and fixed across the matrix for
+comparability. 4 rather than all 7 prompts: run length is linear in prompt
+count, and 7 put the sweep at ~201 h of active runtime against ~115 h at 4,
+while repetition still comes from 3 batch sizes x 3 reps per configuration.
+Note the `demo_perf_mem.py` defaults differ (128 tokens, all 7 prompts) — the
+runner passes both explicitly, so a manual run needs to as well:
 ```bash
-# Example: 512 output tokens per prompt
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
-  --tokens 512
+  --tokens 512 --sample-period 128000 --region-granularity 65536
 ```
 The configured ceiling is recorded in `metadata.json` as `generation.output_tokens` and in
 `manifest.csv` as `max_tokens_per_prompt`. The actual tokens generated (which may be lower
@@ -552,35 +693,55 @@ if the model hits EOS before the ceiling) appears as `total_output_tokens` in `m
 | Dimension | Values | Count |
 |---|---|---|
 | Models | qwen2.5-0.5b, llama-3.2-3b, mistral-7b | 3 |
-| Context lengths | 2048, 8192 (Mistral: 4096 max due to VRAM) | 2 |
+| Context lengths | 2048, 8192 — capped per model by VRAM | 1–2 |
 | Batch sizes | 1, 4 | 2 |
 | Reps | 2 (rep 0 = warmup, rep 1 = data) | 2 |
-| **Total GPU runs** | 3 × 2 × 2 × 2 | **24** |
+| **Total GPU runs** | see below | **16** |
+
+Not 24: each model's `max_ctx` in `GPU_MODELS` prunes the context dimension.
+Qwen2.5-0.5B is capped at 2048 and Mistral-7B at 4096 (VRAM), so only
+Llama-3.2-3B runs both context lengths — 4 + 8 + 4 = 16.
 
 ### 8.3 Total sweep
 
-| Path | Runs | Est. time per run | Est. total active | With cooling |
-|---|---|---|---|---|
-| CPU - small (1B) | 54 | 5–15 min | ~9 hrs | ~18 hrs |
-| CPU - mid (3B–4B) | 54 | 15–40 min | ~22 hrs | ~44 hrs |
-| CPU - large (7B–8B) | 54 | 40–90 min | ~50 hrs | ~100 hrs |
-| GPU path | 24 | 5–20 min | ~5 hrs | ~10 hrs |
-| **Total** | **186** | - | **~86 hrs** | **~172 hrs** |
+Derived from the measured 8.38 tok/s at ctx 2048 and the context scaling in
+Section 5.1.3, at 4 prompts x 512 tokens:
 
-**Expected calendar time:** 7–10 days of overnight running (8 hrs/night). Start with small models first - they validate the pipeline and produce usable data fast even if larger runs are interrupted.
+| Path | Runs | Est. time per run | Est. total active |
+|---|---|---|---|
+| CPU - llama-3.2-1b | 27 | 4–24 min | ~6 hrs |
+| CPU - llama-3.2-3b | 27 | 11–67 min | ~15 hrs |
+| CPU - phi-3.5-mini | 27 | 14–84 min | ~19 hrs |
+| CPU - mistral-7b | 27 | 26–158 min | ~36 hrs |
+| CPU - llama-3.1-8b | 27 | 30–178 min | ~40 hrs |
+| GPU path | 16 | 5–20 min | ~3 hrs |
+| **Total** | **151** | - | **~118 hrs** |
+
+**Expected calendar time:** ~15 nights at 8 hrs/night, plus cooldowns. The
+ctx-32768 figures are extrapolated from two measured points (ctx 512 and 2048)
+and are the least reliable; llama-3.2-1b at ctx 32768 runs on night 1 and
+replaces the extrapolation with a measurement.
+
+Run `experiment_runner.py --dry-run` for the authoritative count and the
+per-configuration periods and timeouts — both are computed from `CPU_MODELS`,
+and this table will drift from them.
+
+Start with small models first - they validate the pipeline and produce usable
+data fast even if larger runs are interrupted.
 
 ### 8.4 Execution order (recommended)
 
 Run in this order to get publishable data as early as possible:
 
-1. TinyLlama 1.1B - all contexts, all batches, all reps (validates full pipeline)
-2. Llama-3.2-1B - same
-3. Llama-3.2-3B - same
-4. Phi-3.5-mini - same
-5. GPU path: Qwen2.5-0.5B, Llama-3.2-3B (GPU)
-6. Mistral-7B - same
-7. Llama-3.1-8B - same
-8. GPU path: Mistral-7B (GPU, if VRAM allows)
+1. Llama-3.2-1B - all contexts, all batches, all reps (validates full pipeline)
+2. Llama-3.2-3B - same
+3. Phi-3.5-mini - same
+4. GPU path: Qwen2.5-0.5B, Llama-3.2-3B (GPU)
+5. Mistral-7B - same
+6. Llama-3.1-8B - same
+7. GPU path: Mistral-7B (GPU, if VRAM allows)
+
+TinyLlama is the Section 7 check-8 smoke test, not part of the matrix.
 
 The experiment runner handles this order automatically.
 
@@ -607,9 +768,13 @@ sudo cpupower frequency-set -g performance
 sudo nvidia-smi -pm 1
 
 # Power-limit GPU during CPU-path runs (GPU should be idle; this prevents
-# passive thermal contribution from GPU power leakage)
-sudo nvidia-smi -pl 50   # 50 W out of 150 W max during CPU runs
-# For GPU-path runs: sudo nvidia-smi -pl 130
+# passive thermal contribution from GPU power leakage).
+# Check the allowed range first — values outside it are rejected:
+nvidia-smi -q -d POWER | grep -E "Min Power Limit|Max Power Limit|Default Power Limit"
+# Measured on the RTX 3080 Laptop in this machine: min 1 W, default 115 W,
+# max 165 W (not the 150 W an earlier revision of this document assumed).
+sudo nvidia-smi -pl 50      # during CPU-path runs
+sudo nvidia-smi -pl 115     # restore the default before GPU-path runs
 ```
 
 ### 9.2 Temperature thresholds
@@ -619,8 +784,26 @@ sudo nvidia-smi -pl 50   # 50 W out of 150 W max during CPU runs
 | < 60°C | Safe to start a new run |
 | 60–75°C | Running, acceptable |
 | 75–85°C | Running warm - log but continue |
-| > 85°C | **Thermal warning** - run flagged as potentially contaminated |
-| > 90°C | **Hard throttle likely** - run flagged as contaminated, discard from primary dataset |
+| > 85°C | **Thermal warning** - run is at most `marginal` |
+| > 90°C | **Hard throttle likely** - run is `contaminated`, discard from primary dataset |
+
+Temperature is only one input to `run_validity`. Observer CPU, observer memory,
+baseline CPU, throttle events and I/O contention all feed the same verdict, so
+a `contaminated` run is **not necessarily a hot run** — check
+`thermal.validity_failure_reasons` in `metadata.json`, which names the
+criterion that failed. The runner prints the same reasons under the DONE line.
+
+Validity is a label over numbers the run already recorded, so it can always be
+re-derived without re-collecting anything:
+
+```bash
+# Preview what would change
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py \
+  --reclassify --dry-run
+
+# Apply: rewrites metadata.json, .experiment_state.json and manifest.csv
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --reclassify
+```
 
 ### 9.3 Cooling between runs
 
@@ -655,7 +838,7 @@ notebooks/scripts/experiment_runner.py
 - **Crash-safe**: state is written atomically after each run completes; a crash mid-run leaves the run as `failed` (retryable), not corrupt
 - **Resume**: re-running the script skips completed runs and picks up where it left off
 - **Thermal management**: checks CPU temperature before each run, waits until safe
-- **Timeout**: hard kill after 2 hours per run (prevents infinite hangs on large models)
+- **Timeout**: per run, 3x its estimated collection time with a 2-hour floor and a 12-hour ceiling. A flat 2 hours would have hard-killed every ctx-32768 run of phi, mistral and llama-3.1-8b — 27 of the 135 CPU runs — for a reason unrelated to the science.
 - **Progress display**: live table showing completed / pending / failed counts and estimated time remaining
 - **Logging**: full output of each run logged to `results/logs/runner.log`
 
@@ -685,7 +868,21 @@ sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --cpu
 
 # GPU path only
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --gpu-only
+
+# Re-derive run_validity for every exported run from its own metadata.json.
+# Nothing is re-collected; add --dry-run to preview. Use after changing a
+# validity threshold (Section 9.2).
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py --reclassify
+
+# Override the region granularity for every run (default 65536; see Section 5.1.2)
+sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py \
+  --region-granularity 1048576
 ```
+
+The sampling period is **not** a flag — the runner derives it per model from
+`SAMPLE_BUDGET` (Section 5.1.3) and logs its choice before the first run. To
+change the budget, edit `SAMPLE_BUDGET` in `experiment_runner.py`; it is set
+from a measured memory ceiling, so re-measure before raising it.
 
 #### Low End Machines Only
 ```bash
@@ -731,13 +928,13 @@ print(counts)
 
 | Night | Models | Runs | Cumulative |
 |---|---|---|---|
-| 1 | TinyLlama-1.1B (all) | 27 | 27 |
-| 2 | Llama-3.2-1B (all) | 27 | 54 |
-| 3 | Llama-3.2-3B (all) + GPU small | 27 + 8 | 89 |
-| 4 | Phi-3.5-mini (all) | 27 | 116 |
-| 5 | Mistral-7B (all) | 27 | 143 |
-| 6 | Llama-3.1-8B (partial) | 20 | 163 |
-| 7 | Llama-3.1-8B (remainder) + GPU large | 7 + 16 | 186 |
+| 1 | Llama-3.2-1B (all) | 27 | 27 |
+| 2 | Llama-3.2-3B (all) | 27 | 54 |
+| 3 | Phi-3.5-mini (all) + GPU small | 27 + 8 | 89 |
+| 4 | Mistral-7B (partial) | 20 | 109 |
+| 5 | Mistral-7B (remainder) + Llama-3.1-8B (partial) | 7 + 14 | 130 |
+| 6 | Llama-3.1-8B (remainder) | 13 | 143 |
+| 7 | GPU path (remainder) | 8 | 151 |
 
 ---
 
@@ -749,19 +946,41 @@ The runner saves state after every completed run. Each run's output directory (`
 
 Raw artifacts (`raw/perf.data`, `raw/perf_script.txt`) are the most expensive to re-collect. They are written by the collector before parsing begins. If the parse fails, raw files are preserved.
 
+On a **successful** run, `raw/perf_script.txt` is deleted automatically once
+export completes — it is intermediate state (`perf script` regenerates it from
+`perf.data`, and `trace.parquet` already holds the parsed result) and it is by
+far the largest artifact of a run. Pass `--keep-perf-script` to retain it.
+`raw/perf.data` is never touched: it is the primary raw artifact, cited by
+`metadata.json` and bound for the Zenodo archive (Section 12.3).
+
 ### 11.2 Disk space planning
 
-| Artifact | Size per run (approx) | 186 runs |
-|---|---|---|
-| `trace.parquet` | 50–500 MB (model/context dependent) | 10–50 GB |
-| `raw/perf.data` | 200 MB – 2 GB | 50–200 GB |
-| `raw/perf_script.txt` | 500 MB – 5 GB | 100–500 GB |
-| `metrics.csv` | < 1 MB | < 200 MB |
-| `region_map.parquet` | 1–10 MB | < 2 GB |
+Measured on a 30.6M-sample run (llama-3.2-1b, ctx 512, 83 s of generation).
+Every run now targets the same ~30M-sample budget (Section 5.1.3), so these
+figures hold across the matrix rather than growing with model size:
 
-**Conservative total: 200–700 GB** - the partner's 3.4 TB free is adequate with room to spare.
+| Artifact | Size per run (measured) | 151 runs | Retained? |
+|---|---|---|---|
+| `trace.parquet` | ~300 MB | ~45 GB | yes |
+| `raw/perf.data` | ~1.9 GB | ~290 GB | yes |
+| `raw/perf_script.txt` | **~8.9 GB** | **~8.9 GB** | **no — deleted after export** |
+| `region_map.parquet` | ~50 KB | < 100 MB | yes |
+| `kv_block_lifecycle.parquet` | < 10 KB | < 2 MB | yes |
+| `metrics.csv` + JSON | < 20 KB | < 5 MB | yes |
 
-If disk space becomes tight, `raw/perf_script.txt` can be deleted after parsing completes (it's reproducible from `raw/perf.data` via `perf script`).
+**Steady-state total: ~340 GB**, plus one run's `perf_script.txt` in flight.
+
+Two things make this work, and both matter:
+
+1. **The sampling budget.** Without it a 90-minute 8B run alone produces a
+   634 GB text dump and a 277 GB frame (Section 5.1.3). No disk plan survives
+   that; the fix is the period, not the storage.
+2. **Deleting the text dump after export.** It is the single largest artifact
+   and it is regenerable, so only one needs to exist at a time. This is
+   automatic — see Section 11.1.
+
+If `perf.data` also becomes a problem, it compresses well (`zstd -3` gets
+~3x) and only the runs selected for the Zenodo archive need the original.
 
 ### 11.3 Incremental backup (recommended)
 
@@ -792,9 +1011,11 @@ kaggle_dataset/
 ### 12.2 Data card must include
 
 - Hardware: CPU model, RAM, GPU, OS, kernel version
-- Collector: perf mem, perf version, ldlat threshold used
+- Collector: perf mem, perf version, sampling period, and the PMU event strings perf auto-selected (`collector.sample_period` and `collector.event_strings` in `metadata.json`). The period is mandatory: a sample count means nothing without it, and it varies per model (Section 5.1.3).
+- Region granularity used for retention (`collector.region_granularity_bytes`), with the per-run sweep verdict that justified it (Section 5.1.2)
 - Region classification: every `/proc/self/maps` entry is classified, snapshotted both after `Llama()` construction and after the first generation (llama.cpp creates its threadpool lazily). GGUF file mmap → `weight`; thread stacks (identified by the adjacent PROT_NONE guard page), malloc arenas, heap, and shared libraries → `runtime`; a new anonymous mapping matching the KV size implied by GGUF geometry → `kv_cache`. Size alone never implies `kv_cache` (see Section 5.1.1). Addresses in no mapping remain `unknown`.
-- Quality gate: every run passed two inline gates: (1) pre-labelling — `access_latency_ns` and `cache_level` ≥ 95% populated, `phase` non-NULL; (2) post-labelling — `region_classified` ≥ 5%. Runs that failed either gate were discarded and not re-run until the fault was corrected.
+- Run validity: `clean` / `marginal` / `contaminated` per run, from observer CPU and memory overhead, baseline CPU, thermal throttle events and peak temperature. Observer memory is bounded against **total system RAM** for perf mem (out-of-process: < 10% clean, < 25% marginal) and against **target RSS** for memray (in-process: < 0.05 clean, < 0.15 marginal) — a ratio to target RSS does not describe an out-of-process collector, whose footprint is set by CPU count and ring-buffer size. Each run records the criteria it failed in `thermal.validity_failure_reasons`. Only `clean` and `marginal` runs enter aggregated metrics.
+- Quality gate: every run passed two inline gates: (1) pre-labelling — `access_latency_ns` ≥ 95% populated, `cache_level` ≥ 85%, `phase` ≥ 30% non-NULL; (2) post-labelling — the same plus `region_classified` ≥ 5%. Thresholds are defined in `mrm_trace/reporter/trace_qa.py`. Runs that failed either gate were discarded and not re-run until the fault was corrected.
 - Sample composition caveat: `perf mem` samples stores at a fixed period but samples loads only above the PEBS `ldlat` threshold, so traces are ~99.6% stores. Report load- and store-derived metrics separately; a blended figure is dominated by store samples, most of which land on thread stacks rather than model data.
 - Proxy caveat: *"Retention durations are observed lifetimes under a batch schedule on this CPU/GPU's cache hierarchy. The logical access-pattern structure (write-once ratio, read frequency ordering by region type) transfers across substrates and constitutes first-order evidence for MRM silicon design questions. Absolute timing values are machine-specific. Regions are classified per-run via /proc/maps address-range injection and symbol rules; addresses outside every known mapping appear as region_type=unknown and are excluded from region-level retention comparisons. Where the KV cache could not be isolated from the engine's backend arena, kv_cache is absent rather than approximated."*
 - Schema: column definitions for all parquet files
@@ -813,12 +1034,16 @@ Do not wait for the full 186-run sweep. After nights 1–2 (TinyLlama + Llama-3.
 ## 13. Quick Reference
 
 ```bash
-# Dev machine - test run (tinyllama, fast)
-# --tokens controls max output tokens per prompt (default 128 for perf_mem, 256 for qwen)
-# Recorded in manifest.csv as max_tokens_per_prompt for cross-run comparison
+# Smoke test (tinyllama, 1 prompt, ~1 min)
+#   --num-prompts 1      otherwise all 7 prompts run
+#   --sample-period      MANDATORY — the 4000 default is ~30x too dense (§5.1.3)
+#   --region-granularity otherwise retention is computed at 4 KB (§5.1.2)
+# --tokens is the max output tokens per prompt (script default 128; the sweep
+# uses 512). Recorded in manifest.csv as max_tokens_per_prompt.
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/demo_perf_mem.py \
   --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
-  --ctx 2048 --tokens 128 --batch-size 1 --rep 1
+  --ctx 2048 --tokens 128 --batch-size 1 --rep 1 \
+  --num-prompts 1 --sample-period 16000 --region-granularity 65536
 
 # Partner machine - start the full sweep
 sudo -E "$MRM_ROOT/venv/bin/python" notebooks/scripts/experiment_runner.py
@@ -837,4 +1062,12 @@ sensors | grep -E "Package|Core 0"
 
 # Watch disk usage
 watch -n 30 "du -sh results/ && df -h ."
+
+# Find runs that never produced a trace (crashed / killed). Dry run first —
+# a run still in progress also has no trace.parquet.
+find results -mindepth 3 -maxdepth 3 -type d \
+  '!' -exec test -e '{}/trace.parquet' ';' -print
+
+# Reclaim text dumps left behind by older runs or by --keep-perf-script
+find results -name perf_script.txt -size +1G -printf '%s %p\n' | sort -rn
 ```

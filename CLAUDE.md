@@ -172,9 +172,30 @@ compression than gzip at higher speed. Compatible with HuggingFace Datasets for 
 
 | Class | Criteria |
 |-------|----------|
-| `clean` | observer CPU < 10%, observer mem < 5% of target RSS, no throttle, baseline CPU < 15% |
-| `marginal` | observer CPU < 20%, observer mem < 15% of target RSS, ≤ 2 throttle events |
+| `clean` | observer CPU < 10%, observer memory within the clean bound, no throttle, baseline CPU < 15%, peak temp ≤ 85°C |
+| `marginal` | observer CPU < 20%, observer memory within the marginal bound, ≤ 2 throttle events, peak temp ≤ 90°C |
 | `contaminated` | anything worse than marginal |
+
+The observer memory bound depends on where the collector runs, because the two
+cases perturb the target by different mechanisms:
+
+| Collector | Bound | clean | marginal |
+|---|---|---|---|
+| memray (in-process) | observer RSS / **target** RSS | < 0.05 | < 0.15 |
+| perf mem (out-of-process) | observer RSS / **total system** RAM | < 0.10 | < 0.25 |
+
+An out-of-process collector's footprint comes from CPU count, ring-buffer size
+and flush rate — not from model size — so a ratio to target RSS measures
+nothing. Measured: perf peaked at 2512 MB against a 1478 MB target (ratio 1.70)
+on a 31 GB machine with ~27 GB free; nothing was evicted or swapped, yet the
+ratio rule marked 8 of 8 runs contaminated, and would have marked all 151.
+
+Validity is a **label over numbers each run already recorded**
+(`metadata.json → observer_effect` + `thermal`), so correcting the rule never
+requires re-collecting a trace: `experiment_runner.py --reclassify` re-derives
+every verdict in place. Both a fresh run and a reclassification go through
+`classify_from_metadata()` so they cannot disagree. Every verdict carries
+`thermal.validity_failure_reasons` stating what failed.
 
 Contaminated runs are archived but excluded from aggregated metrics and paper figures.
 

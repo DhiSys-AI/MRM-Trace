@@ -5,13 +5,12 @@ All files use zstd compression (ADR-8).  Streaming write is used so memory
 stays bounded regardless of trace size (ADR-2).
 """
 
-import math
 from pathlib import Path
 from typing import List, Union
 
 import pandas as pd
 
-from mrm_trace.parser.writer import TRACE_SCHEMA, write_parquet
+from mrm_trace.parser.writer import TRACE_SCHEMA, write_parquet, write_parquet_frame
 
 _TRACE_FILE = "trace.parquet"
 _REGION_MAP_FILE = "region_map.parquet"
@@ -25,14 +24,7 @@ def export_trace(
     """Write trace.parquet into run_dir.  Returns the file path."""
     run_dir = Path(run_dir)
     out = run_dir / _TRACE_FILE
-    # pandas stores missing values as float(nan) even in object/string columns.
-    # pyarrow string arrays reject floats — replace nan with None in each record.
-    def _clean(records):
-        for row in records:
-            yield {k: (None if isinstance(v, float) and math.isnan(v) else v)
-                   for k, v in row.items()}
-
-    write_parquet(_clean(trace.to_dict("records")), out, schema=TRACE_SCHEMA)
+    write_parquet_frame(trace, out, schema=TRACE_SCHEMA)
     return out
 
 

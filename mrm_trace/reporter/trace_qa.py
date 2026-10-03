@@ -108,9 +108,65 @@ def check_trace_quality(
         TraceQA with status and per-column coverage fractions.
     """
     n = len(trace)
+    # A phase column that is present but entirely NULL means the phase boundaries
+    # and the sample timestamps are in different clock domains — phase-aware
+    # labelling (ADR-3, spec §5) is then silently disabled for the whole run.
+    # A trace with no phase column at all is a different thing (synthetic
+    # fixtures, collectors with no phase concept) and is not gated.
+    has_phase_col = "phase" in trace.columns
+    return check_trace_quality_counts(
+        rows=n,
+        latency_non_null=int(trace["access_latency_ns"].notna().sum()) if n else 0,
+        cache_level_non_null=int(trace["cache_level"].notna().sum()) if n else 0,
+        symbol_non_empty=(
+            int((trace["symbol"] != "").sum()) if n and "symbol" in trace.columns else 0
+        ),
+        region_classified=(
+            int((trace["region_type"] != "unknown").sum())
+            if n and "region_type" in trace.columns else 0
+        ),
+        phase_non_null=int(trace["phase"].notna().sum()) if n and has_phase_col else 0,
+        has_phase_col=has_phase_col,
+        collector_type=collector_type,
+        print_report=print_report,
+        fail_fast=fail_fast,
+    )
+
+
+def check_trace_quality_counts(
+    *,
+    rows: int,
+    latency_non_null: int,
+    cache_level_non_null: int,
+    symbol_non_empty: int,
+    region_classified: int,
+    phase_non_null: int = 0,
+    has_phase_col: bool = True,
+    collector_type: str = "perf_mem",
+    print_report: bool = True,
+    fail_fast: bool = False,
+) -> TraceQA:
+    """
+    Same gate as :func:`check_trace_quality`, driven by counts not a DataFrame.
+
+    A trace large enough to need chunked parsing (ADR-2) is never held in one
+    frame, so its coverage has to be tallied while streaming.  Both entry points
+    share this evaluation so thresholds and the printed report have one
+    definition.
+
+    Args:
+        rows:                 total rows seen
+        latency_non_null:     rows with a non-null access_latency_ns
+        cache_level_non_null: rows with a non-null cache_level
+        symbol_non_empty:     rows with a non-empty symbol
+        region_classified:    rows whose region_type is not "unknown"
+        phase_non_null:       rows with a non-null phase
+        has_phase_col:        False when the trace has no phase column at all,
+                              which is not gated (see check_trace_quality)
+    """
     issues: list = []
 
-    if n == 0:
+    if rows == 0:
         qa = TraceQA("FAIL", 0, 0.0, 0.0, 0.0, 0.0, ["No rows parsed"])
         if print_report:
             _print(qa, collector_type)
@@ -120,20 +176,11 @@ def check_trace_quality(
 
     thresholds = _THRESHOLDS.get(collector_type, _THRESHOLDS["default"])
 
-    lat_cov = float(trace["access_latency_ns"].notna().sum()) / n
-    cl_cov  = float(trace["cache_level"].notna().sum()) / n
-    sym_cov = float((trace["symbol"] != "").sum()) / n if "symbol" in trace.columns else 0.0
-    reg_cov = (
-        float((trace["region_type"] != "unknown").sum()) / n
-        if "region_type" in trace.columns else 0.0
-    )
-    # A phase column that is present but entirely NULL means the phase boundaries
-    # and the sample timestamps are in different clock domains — phase-aware
-    # labelling (ADR-3, spec §5) is then silently disabled for the whole run.
-    # A trace with no phase column at all is a different thing (synthetic
-    # fixtures, collectors with no phase concept) and is not gated.
-    has_phase_col = "phase" in trace.columns
-    phase_cov = float(trace["phase"].notna().sum()) / n if has_phase_col else 0.0
+    lat_cov   = latency_non_null / rows
+    cl_cov    = cache_level_non_null / rows
+    sym_cov   = symbol_non_empty / rows
+    reg_cov   = region_classified / rows
+    phase_cov = phase_non_null / rows if has_phase_col else 0.0
 
     status = "PASS"
     status = _merge_status(status, _check_column("access_latency_ns", lat_cov, thresholds, issues))
@@ -142,7 +189,7 @@ def check_trace_quality(
     if has_phase_col:
         status = _merge_status(status, _check_column("phase", phase_cov, thresholds, issues))
 
-    qa = TraceQA(status, n, lat_cov, cl_cov, sym_cov, reg_cov, issues, phase_cov)
+    qa = TraceQA(status, rows, lat_cov, cl_cov, sym_cov, reg_cov, issues, phase_cov)
 
     if print_report:
         _print(qa, collector_type)

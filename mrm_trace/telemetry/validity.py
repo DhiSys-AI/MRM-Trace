@@ -2,10 +2,31 @@
 Run validity classification.
 
 Observer-effect thresholds (from CLAUDE.md):
-  clean       : observer CPU < 10%  AND observer mem_frac < 0.05 AND throttle == 0
-                AND baseline_cpu < 15%
-  marginal    : observer CPU < 20%  AND observer mem_frac < 0.15 AND throttle ≤ 2
+  clean       : observer CPU < 10%  AND observer memory within the clean bound
+                AND throttle == 0 AND baseline_cpu < 15%
+  marginal    : observer CPU < 20%  AND observer memory within the marginal bound
+                AND throttle ≤ 2
   contaminated: anything worse than marginal
+
+The observer memory bound depends on where the collector runs, because the two
+cases perturb the target by different mechanisms:
+
+  in-process (memray)       : the tracer allocates inside the target's address
+                              space, so its cost is naturally expressed as a
+                              fraction of target RSS — < 0.05 clean, < 0.15
+                              marginal.
+  out-of-process (perf mem) : the collector is a separate process whose
+                              footprint is set by CPU count, ring-buffer size
+                              and flush rate — not by model size.  Measured:
+                              perf peaked at 2512 MB against a 1478 MB target,
+                              i.e. a ratio of 1.70, on a 31 GB machine with
+                              ~27 GB free.  Nothing was evicted and nothing
+                              swapped, yet the ratio rule marked every run in
+                              the sweep contaminated.  What actually matters
+                              here is whether the collector consumed enough of
+                              *system* memory to pressure the target, so the
+                              bound is a fraction of total RAM — < 0.10 clean,
+                              < 0.25 marginal.
 
 Temperature thresholds (from experiment-workplan.md §9.2):
   TEMP_RUNNING_WARN_C  = 75  : running warm — log but continue
@@ -14,6 +35,7 @@ Temperature thresholds (from experiment-workplan.md §9.2):
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 _CLEAN_CPU = 10.0
 _CLEAN_MEM_FRAC = 0.05
@@ -24,6 +46,11 @@ _MARGINAL_CPU = 20.0
 _MARGINAL_MEM_FRAC = 0.15
 _MARGINAL_THROTTLE = 2
 _MARGINAL_BASELINE_CPU = 30.0
+
+# Out-of-process collectors: bound against total system memory instead (see
+# the module docstring for why the target-RSS ratio does not apply to them).
+_CLEAN_SYSTEM_MEM_FRAC = 0.10
+_MARGINAL_SYSTEM_MEM_FRAC = 0.25
 
 # Temperature thresholds — exported so experiment_runner.py can use the same values.
 TEMP_RUNNING_WARN_C: float = 75.0   # running warm; log but continue
@@ -51,6 +78,7 @@ def classify_run(
     baseline_cpu_pct: float = 0.0,
     io_contention_detected: bool = False,
     peak_temp_c: float = 0.0,
+    observer_memory_system_frac: Optional[float] = None,
 ) -> ValidityResult:
     """
     Classify a run as clean, marginal, or contaminated.
@@ -58,23 +86,36 @@ def classify_run(
     Parameters
     ----------
     observer_cpu_overhead_pct_max : peak CPU % of the observer/tracer process
-    observer_memory_frac          : peak observer RSS / peak target RSS
+    observer_memory_frac          : peak observer RSS / peak target RSS.  The
+                                    memory gate for an in-process tracer.
     thermal_throttle_events       : CPU thermal throttle events during run
     baseline_cpu_pct              : mean system CPU before the run started
     io_contention_detected        : True if observer caused significant I/O
     peak_temp_c                   : peak CPU package temperature during run (°C)
+    observer_memory_system_frac   : peak observer RSS / total system RAM.  Pass
+                                    this for an out-of-process collector such
+                                    as perf mem and it replaces the target-RSS
+                                    ratio as the memory gate; see the module
+                                    docstring.  None keeps the ratio rule.
 
     Returns
     -------
     ValidityResult
     """
     failures = []
+    by_system = observer_memory_system_frac is not None
 
     if observer_cpu_overhead_pct_max >= _CLEAN_CPU:
         failures.append(
             f"observer_cpu {observer_cpu_overhead_pct_max:.1f}% ≥ {_CLEAN_CPU}% (clean threshold)"
         )
-    if observer_memory_frac >= _CLEAN_MEM_FRAC:
+    if by_system:
+        if observer_memory_system_frac >= _CLEAN_SYSTEM_MEM_FRAC:
+            failures.append(
+                f"observer_mem {observer_memory_system_frac:.1%} of system RAM "
+                f"≥ {_CLEAN_SYSTEM_MEM_FRAC:.0%} (clean threshold)"
+            )
+    elif observer_memory_frac >= _CLEAN_MEM_FRAC:
         failures.append(
             f"observer_mem_frac {observer_memory_frac:.3f} ≥ {_CLEAN_MEM_FRAC} (clean threshold)"
         )
@@ -98,9 +139,13 @@ def classify_run(
 
     is_clean = len(failures) == 0
 
+    memory_within_marginal = (
+        observer_memory_system_frac < _MARGINAL_SYSTEM_MEM_FRAC if by_system
+        else observer_memory_frac < _MARGINAL_MEM_FRAC
+    )
     is_marginal = (
         observer_cpu_overhead_pct_max < _MARGINAL_CPU
-        and observer_memory_frac < _MARGINAL_MEM_FRAC
+        and memory_within_marginal
         and thermal_throttle_events <= _MARGINAL_THROTTLE
         and baseline_cpu_pct < _MARGINAL_BASELINE_CPU
         and not io_contention_detected
@@ -148,10 +193,55 @@ def classify_from_summary(summary: dict, target_rss_mb: float = 0.0) -> Validity
     else:
         mem_frac = summary.get("observer_memory_overhead_frac", 0.0)
 
+    # Present only for out-of-process collectors; absent for memray and for
+    # metadata written before the field existed, which keeps the ratio rule.
+    system_frac = summary.get("observer_memory_system_frac")
+    if system_frac is None:
+        total_mb = summary.get("system_memory_mb", 0.0)
+        if total_mb > 0 and mem_mb > 0:
+            system_frac = mem_mb / total_mb
+
     return classify_run(
         observer_cpu_overhead_pct_max=cpu,
         observer_memory_frac=mem_frac,
         thermal_throttle_events=throttle,
         baseline_cpu_pct=baseline,
         io_contention_detected=io_c,
+        peak_temp_c=summary.get("peak_temp_c", 0.0),
+        observer_memory_system_frac=system_frac,
+    )
+
+
+def classify_from_metadata(metadata: dict) -> ValidityResult:
+    """
+    Re-derive a run's validity from a metadata.json dict.
+
+    Validity is a label computed from numbers the run already recorded, so it
+    can always be re-derived without re-collecting anything.  A fresh run and a
+    reclassification of its metadata must reach the same verdict, which is why
+    both go through this function.
+    """
+    thermal = metadata.get("thermal") or {}
+    oe = metadata.get("observer_effect") or {}
+    hardware = metadata.get("hardware") or {}
+
+    system_frac = oe.get("observer_memory_system_frac")
+    if system_frac is None:
+        # Metadata written before the field existed: reconstruct it from the
+        # absolute peak and whichever total-RAM figure the run recorded.
+        total_mb = oe.get("system_memory_mb") or hardware.get("mem_total_mb") or 0.0
+        peak_mb = oe.get("observer_memory_overhead_mb_peak", 0.0)
+        if total_mb > 0 and peak_mb > 0:
+            system_frac = peak_mb / total_mb
+
+    baseline_cpu = oe.get("baseline_cpu_pct", hardware.get("baseline_cpu_pct", 0.0))
+
+    return classify_run(
+        observer_cpu_overhead_pct_max=oe.get("observer_cpu_overhead_pct_mean", 0.0),
+        observer_memory_frac=oe.get("observer_memory_overhead_frac", 0.0),
+        thermal_throttle_events=thermal.get("throttle_events", 0),
+        baseline_cpu_pct=baseline_cpu,
+        io_contention_detected=oe.get("io_contention_detected", False),
+        peak_temp_c=thermal.get("peak_temp_c", 0.0),
+        observer_memory_system_frac=system_frac,
     )
