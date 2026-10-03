@@ -665,18 +665,34 @@ cat "$RUN_DIR/metrics.csv"   # one row per region_type: weight, kv_cache,
 |---|---|---|
 | Models | llama-3.2-1b, llama-3.2-3b, phi-3.5-mini, mistral-7b, llama-3.1-8b | 5 |
 | Context lengths | 2048, 8192, 32768 | 3 |
-| Batch sizes | 1, 4, 8 | 3 |
 | Reps per config | 3 (rep 0 = warmup, reps 1–2 = data) | 3 |
-| **Total CPU runs** | 5 × 3 × 3 × 3 | **135** |
+| **Total CPU runs** | 5 × 3 × 3 | **45** |
+
+**There is no batch-size dimension.** `batch_size` reaches `metadata.json` and
+the run id but never llama.cpp: `LlamaCppEngine` passes only `model_path`,
+`n_ctx` and `verbose` to `Llama()`, and `demo_perf_mem.py` generates prompts in
+a sequential Python loop. Measured on one configuration at batch 1, 4 and 8:
+23.1 / 22.7 / 22.7 / 22.5 / 22.6 min and ~40.5M samples each — nine repetitions
+of one experiment, not a 3×3 design. Sweeping it tripled the matrix to 135 runs
+and would have published a dimension that was never varied. Restoring it
+requires making the engine actually batch (`n_batch`, or a batched decode
+loop).
 
 TinyLlama is commented out in `CPU_MODELS` — it is a pipeline smoke test
 (Section 7 check 8), not a dataset model. Uncomment it for 6 models / 162 runs.
 
-Each run generates `PROMPTS_PER_RUN = 4` prompts of `OUTPUT_TOKENS = 512`
+Each run generates `PROMPTS_PER_RUN = 1` prompt of `OUTPUT_TOKENS = 512`
 tokens, both set in `experiment_runner.py` and fixed across the matrix for
-comparability. 4 rather than all 7 prompts: run length is linear in prompt
-count, and 7 put the sweep at ~201 h of active runtime against ~115 h at 4,
-while repetition still comes from 3 batch sizes x 3 reps per configuration.
+comparability. One prompt, for two reasons:
+
+- `LlamaCppEngine.generate()` calls `llm.reset()` before every prompt, so each
+  prompt is an **independent KV lifecycle**. Several per run concatenates
+  lifecycles in one trace, and a KV granule's `last − first access` can then
+  straddle two of them — inflating retention, the primary metric.
+- Run length is linear in prompt count: 15.5 h for the CPU sweep at one prompt
+  against 44 h at four.
+
+Repetition comes from the 3 reps per configuration, which is where it belongs.
 Note the `demo_perf_mem.py` defaults differ (128 tokens, all 7 prompts) — the
 runner passes both explicitly, so a manual run needs to as well:
 ```bash
@@ -704,20 +720,26 @@ Llama-3.2-3B runs both context lengths — 4 + 8 + 4 = 16.
 
 ### 8.3 Total sweep
 
-Derived from the measured 8.38 tok/s at ctx 2048 and the context scaling in
-Section 5.1.3, at 4 prompts x 512 tokens:
+**Post-processing, not inference, dominates.** Measured on the validation run:
+418 s to parse, label, analyse and export 10.98M samples — 38.1 s per million,
+so ~6 min per run at the 10M budget, against 1–45 min of inference. For the 1B
+at ctx 2048 that is 1 min of inference carrying 6 min of parsing.
+
+Per-run totals below are inference + post-processing + cooldown, from the
+measured 8.38 tok/s at ctx 2048 and the context scaling in Section 5.1.3, at 1
+prompt x 512 tokens and a 10M sample budget:
 
 | Path | Runs | Est. time per run | Est. total active |
 |---|---|---|---|
-| CPU - llama-3.2-1b | 27 | 4–24 min | ~6 hrs |
-| CPU - llama-3.2-3b | 27 | 11–67 min | ~15 hrs |
-| CPU - phi-3.5-mini | 27 | 14–84 min | ~19 hrs |
-| CPU - mistral-7b | 27 | 26–158 min | ~36 hrs |
-| CPU - llama-3.1-8b | 27 | 30–178 min | ~40 hrs |
+| CPU - llama-3.2-1b | 9 | 9–14 min | ~1.6 hrs |
+| CPU - llama-3.2-3b | 9 | 11–25 min | ~2.4 hrs |
+| CPU - phi-3.5-mini | 9 | 11–29 min | ~2.8 hrs |
+| CPU - mistral-7b | 9 | 14–47 min | ~4.1 hrs |
+| CPU - llama-3.1-8b | 9 | 15–52 min | ~4.5 hrs |
 | GPU path | 16 | 5–20 min | ~3 hrs |
-| **Total** | **151** | - | **~118 hrs** |
+| **Total** | **61** | - | **~18.5 hrs** |
 
-**Expected calendar time:** ~15 nights at 8 hrs/night, plus cooldowns. The
+**Expected calendar time:** one overnight run for the CPU path (15.5 hrs). The
 ctx-32768 figures are extrapolated from two measured points (ctx 512 and 2048)
 and are the least reliable; llama-3.2-1b at ctx 32768 runs on night 1 and
 replaces the extrapolation with a measurement.

@@ -23,6 +23,7 @@ mrm_trace/analyser/write_once.py
 mrm_trace/collector/__init__.py
 mrm_trace/collector/artifact_manager.py
 mrm_trace/collector/base.py
+mrm_trace/collector/kv_allocation.py
 mrm_trace/collector/memray_runner.py
 mrm_trace/collector/perf_runner.py
 mrm_trace/collector/process_monitor.py

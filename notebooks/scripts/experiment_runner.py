@@ -108,10 +108,19 @@ OUTPUT_TOKENS = 512
 # 28,321,245 samples were inside it. See experiment-workplan.md Section 5.1.4.
 _ACCESS_RATE_PER_S = 2.07e8
 
-# Rows the analysis stage can hold.  A 30M-row trace was measured end to end at
-# a 15 GB peak RSS, which fits a 32 GB box alongside the OS and the model.
-# Raise it only after re-measuring; it is a memory limit, not a preference.
-SAMPLE_BUDGET = 30_000_000
+# Samples per run.  Two constraints, and the lower one binds:
+#
+#   memory    — a 30M-row trace measured 15 GB peak RSS end to end.
+#   wall time — post-processing is 38.1 s per million samples (measured: 418 s
+#               for 10.98M), which is ~19 min/run at 30M against 4 min of
+#               inference for the 1B at ctx 2048.  Parsing, not inference,
+#               dominates the sweep.
+#
+# 10M is enough for the metrics: the validation run at 10.98M yielded 52,448
+# weight accesses over 5,296 regions (~10 per region) and 5,839 kv_cache over
+# 691 (~8 per region), where retention needs >= 2.  It costs 6 min/run instead
+# of 19 and brings the sweep from 44 h to 15.5 h.
+SAMPLE_BUDGET = 10_000_000
 
 # Never go denser than this however short the run, so a fast model still
 # produces a trace of manageable size.  This is a *load* period now, so the
@@ -217,11 +226,18 @@ CPU_MODELS = [
 ]
 
 # Prompts per run, passed to demo_perf_mem.py as --num-prompts (the script
-# defaults to all 7).  Run length is linear in this, and at OUTPUT_TOKENS=512
-# the full 7 put the sweep at ~201 h of active runtime.  4 brings it to ~115 h
-# while keeping the 512-token KV growth window and all three context lengths;
-# repetition still comes from 3 batch sizes x 3 reps per configuration.
-PROMPTS_PER_RUN = 4
+# defaults to all 7).  One, for two reasons:
+#
+#   LlamaCppEngine.generate() calls llm.reset() before every prompt, so each
+#   prompt is an independent KV lifecycle.  Several per run concatenates
+#   lifecycles in one trace, and a KV granule's last-minus-first access can
+#   then straddle two of them — which inflates retention, the primary metric.
+#
+#   Run length is linear in prompt count.  With all three context lengths, one
+#   prompt per run is 15.5 h against 44 h at four.
+#
+# Repetition comes from REPS (3 per configuration), which is where it belongs.
+PROMPTS_PER_RUN = 1
 
 # Decode slows as the context grows, because attention scans more of it.
 # Two measured points on llama-3.2-1b: 11.2 tok/s at ctx 512 and 8.38 at 2048,
@@ -345,7 +361,18 @@ def sample_period_for(tok_per_s_ref: float, ctx: int = CTX_REF,
     return max(MIN_SAMPLE_PERIOD, _round_up_period(period))
 
 CONTEXT_LENGTHS = [2048, 8192, 32768]
-BATCH_SIZES = [1, 4, 8]
+
+# Batch size is NOT a dimension of this experiment.  demo_perf_mem.py generates
+# prompts in a sequential Python loop, and LlamaCppEngine passes only
+# model_path, n_ctx and verbose to Llama() — batch_size reaches metadata and the
+# run_id, never llama.cpp.  Measured: batch 1, 4 and 8 of one configuration ran
+# 23.1 / 22.7 / 22.7 and 22.5 / 22.6 min and produced 40.5M samples each.  They
+# were nine repetitions of one experiment, not a 3x3 design, and publishing them
+# as a batch sweep would claim a dimension that was never varied.
+#
+# Restoring it requires making the engine actually batch (n_batch, or a batched
+# decode loop) — until then it triples the sweep for nothing.
+BATCH_SIZES = [1]
 REPS = [0, 1, 2]  # rep 0 = warmup; reps 1 and 2 = data
 
 # GPU path: HuggingFace models via demo_qwen_hf.py + PyTorch

@@ -358,8 +358,11 @@ def test_measurement_overrides_the_estimate(runner):
                                   runner.PROMPTS_PER_RUN)
     cal = {key: {"period": 128_000, "samples": 40_500_000}}
     corrected = runner.sample_period_for(11.0, 2048, model_id="m", calibration=cal)
-    # 128000 * 40.5/30 = 172,800, rounded up to 3 significant figures.
-    assert corrected == 173_000
+
+    # Derived from SAMPLE_BUDGET rather than hardcoded, so changing the budget
+    # does not require editing this test.
+    want = runner._round_up_period(128_000 * 40_500_000 / runner.SAMPLE_BUDGET)
+    assert corrected == want
     projected = 40_500_000 * 128_000 / corrected
     assert abs(projected - runner.SAMPLE_BUDGET) / runner.SAMPLE_BUDGET < 0.01
 
@@ -393,7 +396,8 @@ def test_record_calibration_round_trips(runner, tmp_path, monkeypatch):
     key = runner._calibration_key("m", 2048, runner.OUTPUT_TOKENS,
                                   runner.PROMPTS_PER_RUN)
     assert runner._load_calibration()[key]["samples"] == 40_500_000
-    assert runner.sample_period_for(11.0, 2048, model_id="m") == 173_000
+    want = runner._round_up_period(128_000 * 40_500_000 / runner.SAMPLE_BUDGET)
+    assert runner.sample_period_for(11.0, 2048, model_id="m") == want
 
 
 def test_record_calibration_ignores_empty_measurements(runner, tmp_path, monkeypatch):
@@ -456,3 +460,51 @@ def test_the_run_command_fixes_the_prompt_count(runner):
     cmd = runner._build_command(spec, _p.Path("models"), "m")
     assert "--num-prompts" in cmd
     assert cmd[cmd.index("--num-prompts") + 1] == str(runner.PROMPTS_PER_RUN)
+
+
+# ── the matrix must not claim dimensions the engine does not vary ────────────
+
+def test_batch_size_is_not_a_dimension(runner):
+    """
+    batch_size reaches metadata and the run_id but never llama.cpp:
+    LlamaCppEngine passes only model_path, n_ctx and verbose to Llama(), and the
+    prompts run in a sequential Python loop.  Measured, one configuration at
+    batch 1 / 4 / 8: 23.1, 22.7, 22.7, 22.5, 22.6 min and ~40.5M samples each —
+    nine repetitions of one experiment, not a 3x3 design.
+
+    Sweeping it tripled the matrix and would have published a dimension that
+    was never varied.  Restore it only together with real batching.
+    """
+    assert runner.BATCH_SIZES == [1]
+    batches = {s.batch for s in runner.build_matrix(cpu_only=True)
+               if s.path_type == "cpu"}
+    assert batches == {1}
+
+
+def test_one_prompt_per_run_keeps_kv_lifecycles_separate(runner):
+    """
+    LlamaCppEngine.generate() calls llm.reset() before every prompt, so each
+    prompt is an independent KV lifecycle.  Several per run concatenates them in
+    one trace, and a KV granule's last-minus-first access can straddle two —
+    inflating retention, which is the primary metric.
+    """
+    assert runner.PROMPTS_PER_RUN == 1
+    spec = next(s for s in runner.build_matrix(cpu_only=True) if s.path_type == "cpu")
+    cmd = runner._build_command(spec, pathlib.Path("models"), "m")
+    assert cmd[cmd.index("--num-prompts") + 1] == "1"
+
+
+def test_the_cpu_sweep_fits_a_day(runner):
+    """
+    Post-processing is 38.1 s per million samples (measured: 418 s for 10.98M),
+    so it dominates: 6 min/run at the 10M budget against 1-45 min of inference.
+    The whole CPU path must stay inside a 24 h window with room for cooldowns.
+    """
+    post_s = 38.1 * (runner.SAMPLE_BUDGET / 1e6)
+    total_s = 0.0
+    for spec in runner.build_matrix(cpu_only=True):
+        if spec.path_type != "cpu":
+            continue
+        tok_per_s = next(t for m, _, _, t in runner.CPU_MODELS if m == spec.model_id)
+        total_s += runner.estimate_run_seconds(tok_per_s, spec.ctx) + post_s + 90
+    assert total_s / 3600 < 22, f"CPU sweep projects {total_s / 3600:.1f} h"
