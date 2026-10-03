@@ -358,7 +358,7 @@ def test_measurement_overrides_the_estimate(runner):
                                   runner.PROMPTS_PER_RUN)
     cal = {key: {"period": 128_000, "samples": 40_500_000}}
     corrected = runner.sample_period_for(11.0, 2048, model_id="m", calibration=cal)
-    # 128000 * 40.5/30 = 172800, rounded to the nearest thousand.
+    # 128000 * 40.5/30 = 172,800, rounded up to 3 significant figures.
     assert corrected == 173_000
     projected = 40_500_000 * 128_000 / corrected
     assert abs(projected - runner.SAMPLE_BUDGET) / runner.SAMPLE_BUDGET < 0.01

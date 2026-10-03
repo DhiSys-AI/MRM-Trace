@@ -36,6 +36,30 @@ def _raw(address, symbol, dso="lib.so", phase=None, op_type="load",
     }
 
 
+_W_BASE = 0x7F00_0000_0000
+_KV_BASE = 0xAA00_0000_0000
+
+
+def _ground_truth_labeller(**kwargs):
+    """
+    Labeller with weight and KV address ranges registered.
+
+    Neither type can be established by a symbol: a symbol identifies the code
+    that was running, not the region the sampled address belongs to.  Measured
+    on a real run, 100% of the rows a ggml_vec_dot rule called `weight` were
+    outside the mmap'd GGUF file, and the llama_kv_cache_* rule tagged four
+    granules (one in the main stack) that absorbed 279,186 unrelated accesses.
+    """
+    labeller = TraceLabeller(**kwargs)
+    labeller.register_address_ranges([
+        {"region_type": "weight", "source": "mmap_gguf",
+         "addr_start": _W_BASE, "addr_end": _W_BASE + 256 * 4096},
+        {"region_type": "kv_cache", "source": "kv_allocation",
+         "addr_start": _KV_BASE, "addr_end": _KV_BASE + 256 * 4096},
+    ])
+    return labeller
+
+
 def test_weight_pages_get_distinct_region_ids():
     """
     Each weight page must get its own region_id.
@@ -45,7 +69,7 @@ def test_weight_pages_get_distinct_region_ids():
     retention sample, so all percentiles coincide and the reported "distribution"
     is a point — which is what the pre-2026-08 output showed for weight.
     """
-    labeller = TraceLabeller()
+    labeller = _ground_truth_labeller()
     n = 20
     weight_rows = [
         _raw(0x7F00_0000_0000 + i * 4096, "ggml_init",
@@ -85,7 +109,7 @@ def test_kv_cache_blocks_have_unique_region_ids():
     Shared region_ids would merge KV block lifecycles and corrupt per-block
     retention statistics.
     """
-    labeller = TraceLabeller()
+    labeller = _ground_truth_labeller()
     n = 50
     kv_rows = [
         _raw(0xAA00_0000_0000 + i * 4096, "llama_kv_cache_update",
@@ -108,10 +132,10 @@ def test_address_propagation_never_contradicts_symbol_classification():
     Inconsistent classification would split one physical region across multiple
     region_ids and corrupt working-set size calculations.
     """
-    page = 0x7F00_0000_0000
-    labeller = TraceLabeller()
+    page = _W_BASE
+    labeller = _ground_truth_labeller()
     rows = [
-        # First access: symbol rule fires → weight
+        # First access: inside the registered weight range → weight
         _raw(page, "ggml_init", phase="weight_load", op_type="store",
              timestamp_ns=0, sample_id=0),
         # Second access: same page, no symbol → propagation
@@ -197,7 +221,15 @@ def test_labelling_synthetic_trace_fixture(synthetic_trace_factory):
                              timestamp_ns=2000 + i * 10 + 5, sample_id=sid))
         sid += 1
 
+    # Ground truth as the real pipeline establishes it: the weight range from
+    # the mmap'd GGUF file, the KV range from the engine's own allocation.
     labeller = TraceLabeller()
+    labeller.register_address_ranges([
+        {"region_type": "weight", "source": "mmap_gguf",
+         "addr_start": 0x7F00_0000_0000, "addr_end": 0x7F00_0000_0000 + n_weight * 64},
+        {"region_type": "kv_cache", "source": "kv_allocation",
+         "addr_start": 0x7F10_0000_0000, "addr_end": 0x7F10_0000_0000 + n_kv * 256},
+    ])
     labelled = list(labeller.label(raw_rows))
 
     weight_rows = [r for r in labelled if r["sample_id"] <= n_weight]
@@ -224,6 +256,12 @@ def test_labelling_synthetic_trace_fixture(synthetic_trace_factory):
     # Finer granularity resolves the individual 256 B blocks — the parameter is
     # what makes this an auditable choice rather than a hidden assumption.
     fine = TraceLabeller(region_granularity_bytes=256)
+    fine.register_address_ranges([
+        {"region_type": "weight", "source": "mmap_gguf",
+         "addr_start": 0x7F00_0000_0000, "addr_end": 0x7F00_0000_0000 + n_weight * 64},
+        {"region_type": "kv_cache", "source": "kv_allocation",
+         "addr_start": 0x7F10_0000_0000, "addr_end": 0x7F10_0000_0000 + n_kv * 256},
+    ])
     fine_labelled = list(fine.label(raw_rows))
     fine_kv = {
         r["region_id"] for r in fine_labelled

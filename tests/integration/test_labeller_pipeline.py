@@ -44,13 +44,38 @@ def _raw_row(
     }
 
 
+_W_BASE = 0x7F00_0000_0000
+_KV_BASE = 0xAA00_0000_0000
+
+
+def _labeller(**kwargs):
+    """
+    TraceLabeller with the fixture's weight and KV address ranges registered.
+
+    weight and kv_cache are established by address range only.  A symbol says
+    which code was running, not which region the sampled address belongs to —
+    measured on a real run, 100% of the rows a ggml_vec_dot rule labelled
+    `weight` were outside the mmap'd GGUF file.  The real pipeline takes the
+    weight range from that mapping and the KV range from the engine's own
+    allocation; here they are the fixture's known bases.
+    """
+    labeller = TraceLabeller(**kwargs)
+    labeller.register_address_ranges([
+        {"region_type": "weight", "addr_start": _W_BASE,
+         "addr_end": _W_BASE + 64 * 4096, "source": "mmap_gguf"},
+        {"region_type": "kv_cache", "addr_start": _KV_BASE,
+         "addr_end": _KV_BASE + 64 * 4096, "source": "kv_allocation"},
+    ])
+    return labeller
+
+
 # ── weight classification ─────────────────────────────────────────────────────
 
 class TestWeightLabelling:
 
     def test_weight_load_phase_classified_as_weight(self):
         row = _raw_row(0x7F00_0000_0000, "ggml_init", phase="weight_load", op_type="store")
-        rows = list(TraceLabeller().label([row]))
+        rows = list(_labeller().label([row]))
         assert rows[0]["region_type"] == "weight"
 
     def test_weight_pages_get_one_region_each(self):
@@ -61,29 +86,55 @@ class TestWeightLabelling:
                      timestamp_ns=i, sample_id=i)
             for i in range(10)
         ]
-        rows = list(TraceLabeller().label(raw))
+        rows = list(_labeller().label(raw))
         assert all(r["region_type"] == "weight" for r in rows)
         assert len({r["region_id"] for r in rows}) == 10
 
-    def test_weight_compute_kernel_classified_as_weight(self):
-        row = _raw_row(0x7F00_0000_0000, "ggml_vec_dot_q4_K",
+    def test_weight_comes_from_the_range_not_the_kernel_symbol(self):
+        """Inside the weight range the label is weight — because of the range."""
+        row = _raw_row(_W_BASE, "ggml_vec_dot_q4_K",
                        phase="generation", op_type="load")
-        rows = list(TraceLabeller().label([row]))
+        rows = list(_labeller().label([row]))
         assert rows[0]["region_type"] == "weight"
+
+    def test_a_compute_kernel_cannot_claim_weight_outside_the_range(self):
+        """
+        The defect this replaces: ggml_vec_dot reads weights but writes
+        activations, so its store address is an output buffer.  On a real run
+        that rule labelled 26,617,751 rows `weight`, of which 114 were actually
+        inside the weight mapping.
+        """
+        row = _raw_row(0xBBBB_0000_0000, "ggml_vec_dot_q4_K",
+                       phase="generation", op_type="store")
+        rows = list(_labeller().label([row]))
+        assert rows[0]["region_type"] != "weight"
+        assert rows[0]["region_type"] == "activation"
 
 
 # ── KV cache classification ───────────────────────────────────────────────────
 
 class TestKVCacheLabelling:
 
-    def test_kv_symbol_classified_as_kv_cache(self):
-        row = _raw_row(0xAA00_0000_0000, "llama_kv_cache_update",
+    def test_kv_comes_from_the_allocation_range(self):
+        row = _raw_row(_KV_BASE, "llama_kv_cache_update",
                        phase="generation", op_type="store")
-        rows = list(TraceLabeller().label([row]))
+        rows = list(_labeller().label([row]))
         assert rows[0]["region_type"] == "kv_cache"
 
+    def test_a_kv_symbol_cannot_claim_kv_cache_outside_the_range(self):
+        """
+        llama_kv_cache_* manages slot metadata, not the K/V tensors, so a
+        sample taken inside it is not a KV address.  On a real run that rule
+        tagged four granules — one of them in the main stack — which then
+        absorbed 279,186 accesses from nearest_int, memmove and softmax.
+        """
+        row = _raw_row(0xCCCC_0000_0000, "llama_kv_cache_update",
+                       phase="generation", op_type="store")
+        rows = list(_labeller().label([row]))
+        assert rows[0]["region_type"] != "kv_cache"
+
     def test_kv_blocks_get_distinct_region_ids(self):
-        labeller = TraceLabeller()
+        labeller = _labeller()
         kv_rows = [
             _raw_row(0xAA00_0000_0000 + i * 4096, "llama_kv_cache_update",
                      phase="generation", op_type="store",
@@ -95,7 +146,7 @@ class TestKVCacheLabelling:
         assert len(set(ids)) == 5  # all distinct
 
     def test_kv_region_ids_start_at_2_after_weight(self):
-        labeller = TraceLabeller()
+        labeller = _labeller()
         rows = [
             _raw_row(0x7F00_0000_0000, "ggml_init", phase="weight_load",
                      op_type="store", sample_id=0, timestamp_ns=0),
@@ -113,7 +164,7 @@ class TestAddressPropagation:
 
     def test_unknown_access_to_known_weight_page_inherits_weight(self):
         page = 0x7F00_0000_0000
-        labeller = TraceLabeller()
+        labeller = _labeller()
         rows = list(labeller.label([
             _raw_row(page, "ggml_init", phase="weight_load", op_type="store",
                      timestamp_ns=0, sample_id=0),
@@ -125,7 +176,7 @@ class TestAddressPropagation:
 
     def test_unknown_access_to_known_kv_page_inherits_kv_cache(self):
         page = 0xAA00_0000_0000
-        labeller = TraceLabeller()
+        labeller = _labeller()
         rows = list(labeller.label([
             _raw_row(page, "llama_kv_cache_update", phase="generation",
                      op_type="store", timestamp_ns=0, sample_id=0),
@@ -140,7 +191,7 @@ class TestAddressPropagation:
 class TestRegionMapAndLifecycle:
 
     def test_region_map_has_weight_and_kv_entries(self):
-        labeller = TraceLabeller()
+        labeller = _labeller()
         rows = [
             _raw_row(0x7F00_0000_0000, "ggml_init", phase="weight_load",
                      op_type="store", sample_id=0, timestamp_ns=0),
@@ -154,7 +205,7 @@ class TestRegionMapAndLifecycle:
         assert "kv_cache" in types
 
     def test_kv_lifecycle_captures_write_and_reads(self):
-        labeller = TraceLabeller()
+        labeller = _labeller()
         page = 0xAA00_0000_0000
         rows = [
             _raw_row(page, "llama_kv_cache_update", phase="generation",
@@ -172,7 +223,7 @@ class TestRegionMapAndLifecycle:
         assert lc[0]["lifetime_ns"] == 200
 
     def test_region_map_written_to_parquet(self, tmp_path):
-        labeller = TraceLabeller()
+        labeller = _labeller()
         rows = [
             _raw_row(0x7F00_0000_0000, "ggml_init", phase="weight_load",
                      op_type="store", sample_id=0, timestamp_ns=0),
@@ -185,7 +236,7 @@ class TestRegionMapAndLifecycle:
         assert len(df) >= 1
 
     def test_kv_lifecycle_written_to_parquet(self, tmp_path):
-        labeller = TraceLabeller()
+        labeller = _labeller()
         rows = [
             _raw_row(0xAA00_0000_0000, "llama_kv_cache_update", phase="generation",
                      op_type="store", timestamp_ns=0, sample_id=0),

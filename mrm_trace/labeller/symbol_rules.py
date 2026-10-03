@@ -50,39 +50,32 @@ class SymbolRule:
 _ENGINE_DSO_RE = r"libggml|libllama|libmtmd|ggml|llama"
 
 DEFAULT_RULES: List[SymbolRule] = [
-    # Phase weight_load + store, inside engine code → weight write.
+    # A symbol identifies the code that was running, NOT the region the sampled
+    # address belongs to.  For a store sample the address is the kernel's
+    # *output* buffer; for a load it may be any of its inputs.  Measured on a
+    # real llama.cpp run (Llama-3.2-1B, ctx 2048, 28.3M samples):
     #
-    # The dso condition is load-bearing.  During weight_load the process is also
-    # importing Python modules, growing the heap, and spilling to thread stacks;
-    # an unconditional "any access during weight_load is weight" rule sweeps all
-    # of that into the weight region and inflates the one metric this project
-    # most needs to be right.  These two rules were inert while the phase column
-    # was NULL — they only became reachable once phase labelling was fixed.
-    SymbolRule(region_type="weight", phase="weight_load", op_type="store",
-               dso_re=_ENGINE_DSO_RE),
-    # Any engine-code access during weight_load → weight
-    SymbolRule(region_type="weight", phase="weight_load", dso_re=_ENGINE_DSO_RE),
-    # KV cache symbols (before generic weight kernels to avoid false positives)
-    SymbolRule(
-        region_type="kv_cache",
-        symbol_re=r"kv_cache|kv_update|kv_read|kv_write|attn_cache|llama_kv",
-    ),
-    # Weight compute kernels (dot-product, quantised matmul)
-    SymbolRule(
-        region_type="weight",
-        symbol_re=r"ggml_vec_dot|ggml_mul_mat|ggml_q[48]_k|ggml_q[48]\b",
-    ),
-    # GGML allocator / tensor init → weight
-    SymbolRule(
-        region_type="weight",
-        symbol_re=r"ggml_init|ggml_new_tensor|ggml_set_|model_load|load_model|load_weight",
-    ),
-    # Activation compute (forward pass intermediates)
-    SymbolRule(
-        region_type="activation",
-        symbol_re=r"ggml_compute|ggml_add|ggml_silu|ggml_norm|ggml_rms_norm|ggml_rope",
-    ),
-    # Runtime memory management
+    #   rows labelled weight by ggml_vec_dot/ggml_mul_mat : 26,617,751
+    #   of those actually inside the mmap'd GGUF file     :        114
+    #
+    # i.e. 100% of the weight label was wrong.  ggml_vec_dot_q6_K_q8_K reads
+    # weights and writes activations, so its store samples are activation
+    # addresses.  The GGUF mapping is r--s (read-only), so a store can never
+    # land in the weight region at all.
+    #
+    # Symbol rules therefore no longer claim `weight` or `kv_cache`.  Those two
+    # come only from address ranges, which are ground truth:
+    #   weight   — the mmap'd GGUF file (llamacpp_regions: mmap_gguf)
+    #   kv_cache — the engine's own KV allocation (kv_allocation), captured by
+    #              the allocation interposer; absent if it cannot be captured.
+    #
+    # What a compute kernel's store *does* soundly imply is an activation
+    # buffer: that is where a forward-pass kernel writes.
+    SymbolRule(region_type="activation", op_type="store",
+               symbol_re=r"ggml_vec_dot|ggml_mul_mat|ggml_gemm|ggml_gemv|"
+                         r"ggml_compute|ggml_add|ggml_silu|ggml_norm|"
+                         r"ggml_rms_norm|ggml_rope|ggml_soft_max|ggml_swiglu"),
+    # Runtime memory management — the address is the allocator's own bookkeeping.
     SymbolRule(
         region_type="runtime",
         symbol_re=r"^(malloc|calloc|realloc|free|mmap|munmap|brk)$",

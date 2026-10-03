@@ -150,8 +150,14 @@ class TestBackwardCompatibility:
 
 
 class TestSymbolEvidenceReachesLabeller:
-    def test_resolved_engine_symbol_classifies_region(self):
-        """The point of the whole change: symbols must drive region_type."""
+    def test_resolved_engine_symbol_reaches_the_labeller(self):
+        """
+        The point of the ip change: a resolved symbol must survive parsing and
+        arrive at the labeller.  It must NOT by itself establish kv_cache —
+        llama_kv_cache_* manages slot metadata, not the K/V tensors, and on a
+        real run that rule tagged four granules (one in the main stack) which
+        absorbed 279,186 accesses from nearest_int, memmove and softmax.
+        """
         from mrm_trace.labeller import TraceLabeller
 
         line = _RESOLVED.replace("__strlen_evex", "llama_kv_cache_find_slot").replace(
@@ -161,4 +167,17 @@ class TestSymbolEvidenceReachesLabeller:
         assert rows[0]["symbol"] == "llama_kv_cache_find_slot"
 
         labelled = list(TraceLabeller().label(rows))
-        assert labelled[0]["region_type"] == "kv_cache"
+        assert labelled[0]["region_type"] != "kv_cache"
+
+    def test_a_compute_kernel_store_reaches_the_labeller_as_activation(self):
+        """A forward-pass kernel's store destination is an activation buffer."""
+        from mrm_trace.labeller import TraceLabeller
+
+        line = _RESOLVED.replace("__strlen_evex", "ggml_vec_dot_q6_K_q8_K").replace(
+            "/usr/lib/x86_64-linux-gnu/libc.so.6", "/venv/lib/libggml-cpu.so"
+        )
+        rows = _parse(line)
+        for r in rows:
+            r["op_type"] = "store"
+        labelled = list(TraceLabeller().label(rows))
+        assert labelled[0]["region_type"] == "activation"

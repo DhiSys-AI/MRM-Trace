@@ -7,6 +7,115 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased] — v1.5 (current development)
 
+### Fixed — region attribution was invalid (breaks compatibility with earlier traces)
+
+**Problem:** both region-attribution mechanisms were unsound, and each produced a
+complete, internally consistent dataset that was wrong. Measured on one real run
+(Llama-3.2-1B, ctx 2048, 28,321,245 samples):
+
+| | |
+|---|---|
+| Rows labelled `weight` by the `ggml_vec_dot\|ggml_mul_mat` rule | 26,617,751 |
+| Of those, inside the mmap'd GGUF file | **114** (0.0004%) |
+| Rows labelled `kv_cache` | 279,186, spread over **4** granules — one in the main stack |
+| `kv_cache` share across 5 repetitions of one configuration | 13.18%, 0.0010%, 0.28%, 0.28%, 0.0011% |
+
+A PMU sample carries an instruction pointer *and* a data address. The symbol resolved
+from the instruction pointer identifies the running code, not the region the data
+address belongs to — `ggml_vec_dot_q6_K_q8_K` reads weights and writes activations, so
+its store samples carry activation addresses. The GGUF mapping is `r--s`, so a store can
+never be a weight address at all. And `llama_kv_cache_*` manages slot metadata, not the
+K/V tensors, so such a sample is evidence *against* a KV address.
+
+Because attribution is per granule, one mis-attributed sample captured the whole granule
+and everything that later touched it.
+
+**Fixes:**
+- `symbol_rules.DEFAULT_RULES` no longer claims `weight` or `kv_cache`. Compute-kernel
+  *stores* claim `activation` — the one inference a symbol supports soundly.
+- `labeller.EV_SYMBOL_KV` removed. It ranked above `EV_MAPS_KV`, letting one symbol
+  sample override the address map. Symbol evidence is now uniformly the weakest.
+- `weight` comes only from the GGUF mapping; `kv_cache` only from the engine's own
+  allocation (below). Where KV cannot be isolated it is **absent by design**.
+
+Verified on a real run: 100% of `weight` and `kv_cache` rows inside their true ranges,
+and 100% of samples in those ranges labelled correctly (was 0.0004% for weight).
+
+### Added — KV cache address capture (`collector/kvtrap.c`, `collector/kv_allocation.py`)
+
+**Problem:** the KV cache is not separable from `/proc/self/maps`. llama.cpp carves it
+out of a larger ggml backend arena, so no mapping has its size — at ctx 2048 the implied
+64 MiB is nowhere among the new 768 MiB / 512 MiB / 250 MiB mappings.
+
+**Fix:** an `LD_PRELOAD` interposer records allocations, and the KV buffer is allocated in
+one call of exactly the size the GGUF geometry implies:
+
+| n_ctx | implied | captured |
+|---|---|---|
+| 512 | 16,777,216 | `posix_memalign` |
+| 1,024 | 33,554,432 | `mmap` |
+| 2,048 | 67,108,864 | `posix_memalign` |
+| 4,096 | 134,217,728 | `posix_memalign` |
+
+Both `posix_memalign` and `mmap` are intercepted (glibc routes by size). Matches must be
+exact and unique; an ambiguous size yields no region rather than a guess. Built on demand
+to `~/.cache/mrm-trace/`, and absent cleanly when no compiler is available.
+
+### Fixed — load-dense sampling (weights were unobservable)
+
+**Problem:** `perf mem record -c N` applies one period to both events, and perf samples
+stores on a plain period while gating loads behind a PEBS latency threshold. The trace was
+99.77% stores, and since weights are read-only the weight region was unobservable **by
+construction**: 114 of 28,321,245 samples.
+
+**Fix:** independent per-event periods and a lower threshold —
+`perf record -d --weight -e cpu/mem-loads,ldlat=3,period=P/P -e cpu/mem-stores,period=500P/P`.
+
+| | before | after |
+|---|---|---|
+| loads | 0.23% | **90%** |
+| samples in the weight mapping | 114 | **6,992** |
+
+`-d` is mandatory: it requests `PERF_SAMPLE_ADDR`, and without it `perf script` reports
+"do not have ADDR attribute set" and emits nothing at all. `ldlat=3` rather than perf's
+default 30 accounts for a 25x difference, because weight reads that hit in L1/L2 do not
+clear a 30-cycle threshold. New flags `--ldlat` and `--store-multiplier`; a kernel that
+rejects the syntax falls back to `perf mem record` with a loud warning.
+
+### Fixed — kernel sampling cap is self-lowering and was unrecorded
+
+**Problem:** `kernel.perf_event_max_sample_rate` caps samples/s/CPU, and the kernel reduces
+it itself under dense sampling (`perf: interrupt took too long ... lowering ... to 1000`).
+The reduction persists for the boot. Observed: 100,000 → 1,000, after which a run requesting
+~103,500 samples/s delivered 13,790 — 7.5x short, with no error anywhere. Over a 135-run
+sweep that silently splits the dataset into incomparable halves.
+
+**Fixes:**
+- `demo_perf_mem.py` reads the cap before and after every collection, records both in
+  `metadata.json` as `collector.perf_event_max_sample_rate_before` / `_after`, and warns
+  below 50,000 at start-up.
+- `validity.classify_run` treats a mid-run reduction as a failure reason — such a run is at
+  most `marginal`, because density higher at the start than the end biases retention.
+- `experiment_runner.py` pins the cap at startup, **aborts** the sweep if it cannot be
+  raised above the floor, and restores it between runs if the kernel drops it.
+
+### Fixed — observer-memory criterion mis-normalised for an out-of-process collector
+
+**Problem:** `observer_memory_frac` was observer RSS / target RSS, a ratio written for
+memray (in-process). perf mem is a separate process whose footprint comes from CPU count and
+ring-buffer size, not model size. Measured: perf peaked at 2,512 MB against a 1,478 MB
+target — a ratio of 1.70 on a 31 GB machine with ~27 GB free. Nothing was evicted or
+swapped, yet the rule marked **8 of 8** runs `contaminated`, and would have marked all 151.
+
+**Fixes:**
+- Out-of-process collectors are bounded against total system RAM (< 10% clean, < 25%
+  marginal); memray keeps the target-RSS ratio.
+- `thermal.validity_failure_reasons` is now persisted — the verdict previously discarded the
+  reasons `classify_run` had already computed, so "contaminated" came with no stated cause.
+- `experiment_runner.py --reclassify` re-derives every verdict from stored metadata. Validity
+  is a label over numbers each run already recorded, so correcting a rule never requires
+  re-collecting a trace.
+
 ### Fixed — perf mem collection overhaul
 
 **Problem:** `perf mem record -p PID` (attach mode) failed on Ubuntu 24.04 / kernel 6.8 with

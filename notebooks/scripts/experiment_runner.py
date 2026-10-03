@@ -23,6 +23,7 @@ Usage:
 import argparse
 import csv
 import json
+import math
 import os
 import pathlib
 import queue
@@ -96,9 +97,16 @@ OUTPUT_TOKENS = 512
 # The same period that gives a usable 1B run therefore gives ~2 billion samples
 # on an 8B run, which no amount of streaming will analyse on a 32 GB machine.
 # So the period is derived per run from a fixed sample budget instead.
-# Measured across 8 llama-3.2-1b runs at -c 128000: 40.5M samples over a
-# 414-455 s collection window => 1.221e10. Stable to ~3% across those runs.
-_ACCESS_RATE_PER_S = 1.221e10
+# Sampled-event rate, for the load-dense event configuration the collector now
+# uses (--sample-period is the *load* period; stores are 500x coarser).
+# Measured: 1,444,347 samples over a ~14 s collection at load period 2003
+# (1,300,290 loads + 144,057 stores) => 2.07e8 events/s.
+#
+# The previous value, 1.221e10, was the store rate under `perf mem record -c N`.
+# That configuration made the trace 99.8% stores, and since the GGUF file is
+# mapped read-only no store can land in the weight region at all — 114 of
+# 28,321,245 samples were inside it. See experiment-workplan.md Section 5.1.4.
+_ACCESS_RATE_PER_S = 2.07e8
 
 # Rows the analysis stage can hold.  A 30M-row trace was measured end to end at
 # a 15 GB peak RSS, which fits a 32 GB box alongside the OS and the model.
@@ -106,8 +114,77 @@ _ACCESS_RATE_PER_S = 1.221e10
 SAMPLE_BUDGET = 30_000_000
 
 # Never go denser than this however short the run, so a fast model still
-# produces a trace of manageable size.
-MIN_SAMPLE_PERIOD = 10_000
+# produces a trace of manageable size.  This is a *load* period now, so the
+# floor is three orders of magnitude lower than it was for store sampling.
+MIN_SAMPLE_PERIOD = 1_009
+
+# ── Sampling cap ──────────────────────────────────────────────────────────────
+#
+# kernel.perf_event_max_sample_rate caps samples/s/CPU, and the kernel lowers
+# that cap itself when sampling overhead exceeds perf_cpu_time_max_percent:
+#
+#   perf: interrupt took too long (155256 > 154436), lowering
+#   kernel.perf_event_max_sample_rate to 1000
+#
+# The reduction persists for the boot.  Observed: the default 100,000 fell to
+# 1,000, after which a run requesting ~103,500 samples/s delivered 13,790 —
+# 7.5x short, silently.  Over a 135-run sweep that would split the dataset into
+# incomparable halves with nothing in the output to show it, so the runner pins
+# the value at startup and restores it whenever the kernel drops it.
+PERF_SAMPLE_RATE_TARGET = 100_000
+PERF_SAMPLE_RATE_FLOOR = 50_000      # refuse to start the sweep below this
+_SAMPLE_RATE_PATH = pathlib.Path("/proc/sys/kernel/perf_event_max_sample_rate")
+
+
+def read_sample_rate() -> Optional[int]:
+    """Current kernel.perf_event_max_sample_rate, or None if unreadable."""
+    try:
+        return int(_SAMPLE_RATE_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def set_sample_rate(value: int) -> bool:
+    """Pin the cap.  Needs root; returns False if it could not be written."""
+    try:
+        _SAMPLE_RATE_PATH.write_text(f"{value}\n")
+    except OSError:
+        return False
+    return read_sample_rate() == value
+
+
+def ensure_sample_rate(log) -> bool:
+    """
+    Bring the cap up to target if possible.  False means do not start.
+
+    A warning would be the wrong response here: unlike a single demo run, a
+    sweep collected across a changing cap is not salvageable afterwards.
+    """
+    rate = read_sample_rate()
+    if rate is None:
+        log("  WARNING: cannot read perf_event_max_sample_rate — sampling "
+            "density is unverifiable for this sweep")
+        return True
+    if rate >= PERF_SAMPLE_RATE_TARGET:
+        log(f"  perf_event_max_sample_rate: {rate:,}/s/CPU")
+        return True
+    log(f"  perf_event_max_sample_rate is {rate:,}/s/CPU "
+        f"(target {PERF_SAMPLE_RATE_TARGET:,}) — raising it")
+    if set_sample_rate(PERF_SAMPLE_RATE_TARGET):
+        log(f"  perf_event_max_sample_rate: {PERF_SAMPLE_RATE_TARGET:,}/s/CPU (pinned)")
+        return True
+    rate = read_sample_rate() or 0
+    if rate >= PERF_SAMPLE_RATE_FLOOR:
+        log(f"  WARNING: could not raise the cap; continuing at {rate:,}/s/CPU")
+        return True
+    log(f"  ABORT: perf_event_max_sample_rate is {rate:,}/s/CPU and could not "
+        f"be raised (needs root).")
+    log(f"  Run: sudo sysctl -w kernel.perf_event_max_sample_rate="
+        f"{PERF_SAMPLE_RATE_TARGET}")
+    log("  Collecting the sweep below the floor would produce traces whose "
+        "sample counts are not comparable with each other.")
+    return False
+
 
 # Region granularity for retention analysis (workplan §5.1.2).  No value is
 # universally correct — it depends on sample density and working-set size — so
@@ -158,6 +235,23 @@ _CTX_SLOWDOWN_K = 1.0 / 3.0
 # rep 0 of each configuration is a warmup, so its measurement calibrates the
 # reps that carry data.
 CALIBRATION_FILE = RESULTS_DIR / ".sample_calibration.json"
+
+
+def _round_up_period(period: float, sig: int = 3) -> int:
+    """
+    Round a period *up* to `sig` significant figures.
+
+    Up, because the period is a budget ceiling: rounding to the nearest
+    thousand sent llama-3.2-1b at ctx 8192 to 3,000 instead of 3,374 and put it
+    12% over budget.  Significant figures rather than a fixed step, because
+    load periods span 1e3 to 1e5 across the matrix and a fixed step distorts
+    the small end.
+    """
+    if period <= 0:
+        return 0
+    digits = sig - 1 - math.floor(math.log10(period))
+    scale = 10.0 ** digits
+    return int(math.ceil(period * scale) / scale)
 
 
 def run_timeout_for(est_seconds: float) -> int:
@@ -244,11 +338,11 @@ def sample_period_for(tok_per_s_ref: float, ctx: int = CTX_REF,
                                         PROMPTS_PER_RUN))
         if prev and prev.get("samples", 0) > 0 and prev.get("period", 0) > 0:
             period = prev["period"] * prev["samples"] / SAMPLE_BUDGET
-            return max(MIN_SAMPLE_PERIOD, int(round(period, -3)))
+            return max(MIN_SAMPLE_PERIOD, _round_up_period(period))
 
     est_s = estimate_run_seconds(tok_per_s_ref, ctx, output_tokens)
     period = _ACCESS_RATE_PER_S * est_s / SAMPLE_BUDGET
-    return max(MIN_SAMPLE_PERIOD, int(round(period, -3)))
+    return max(MIN_SAMPLE_PERIOD, _round_up_period(period))
 
 CONTEXT_LENGTHS = [2048, 8192, 32768]
 BATCH_SIZES = [1, 4, 8]
@@ -1018,6 +1112,16 @@ def _run_loop(all_specs: List[RunSpec], state: Dict,
             print_status(state, all_specs)
             last_progress_time = time.time()
 
+        # The kernel can lower the cap during any run; restore it before the
+        # next one so a single dense run does not degrade all that follow.
+        rate_now = read_sample_rate()
+        if rate_now is not None and rate_now < PERF_SAMPLE_RATE_TARGET:
+            log(f"   kernel lowered perf_event_max_sample_rate to {rate_now:,} "
+                f"— restoring {PERF_SAMPLE_RATE_TARGET:,}")
+            if not set_sample_rate(PERF_SAMPLE_RATE_TARGET):
+                log("   WARNING: restore failed; subsequent runs will sample "
+                    "more sparsely than the ones before them")
+
         temp = _get_cpu_package_temp()
         log("")
         log(f"━━ [{run_count + 1}] {spec.key}")
@@ -1086,6 +1190,11 @@ def main():
             seen.add((s.model_id, s.ctx))
             log(f"  {s.model_id:<16}{s.ctx:>7}{s.sample_period:>12,}"
                 f"{s.max_runtime / 3600:>8.1f}h")
+
+    if not args.status and not args.dry_run and not args.reclassify:
+        if not ensure_sample_rate(log):
+            log.close()
+            sys.exit(1)
 
     state = _init_state(args, all_specs, log)
 

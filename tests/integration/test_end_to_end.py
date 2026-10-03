@@ -63,6 +63,16 @@ def e2e_run(tmp_path_factory):
     # labeller is run at that granularity — at the 4 KiB default those 50 blocks
     # share 4 pages and would correctly resolve to 4 regions.
     labeller = TraceLabeller(region_granularity_bytes=256)
+    # weight and kv_cache come from address ranges, never from symbols: a
+    # symbol says what code ran, not which region the address belongs to.
+    # The real pipeline gets these from the mmap'd GGUF file and from the
+    # engine's own KV allocation; here they are the fixture's known bases.
+    labeller.register_address_ranges([
+        {"region_type": "weight", "addr_start": base_w,
+         "addr_end": base_w + 8 * 4096, "source": "mmap_gguf"},
+        {"region_type": "kv_cache", "addr_start": base_kv,
+         "addr_end": base_kv + 50 * 256, "source": "kv_allocation"},
+    ])
     labelled = list(labeller.label(raw_rows))
     trace_df = pd.DataFrame(labelled)
     region_map = labeller.region_map()

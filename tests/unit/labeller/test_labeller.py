@@ -57,36 +57,67 @@ def test_empty_input_yields_nothing():
     assert rows == []
 
 
-# ── phase-based weight classification ────────────────────────────────────────
+# ── weight comes from the GGUF mapping, never from a symbol ──────────────────
 
-def test_weight_load_store_classified_weight():
+def _weight_labeller():
+    lab = TraceLabeller()
+    lab.register_address_ranges([{
+        "region_type": "weight", "source": "mmap_gguf",
+        "addr_start": 0x7F00_0000_0000, "addr_end": 0x7F00_0000_1000,
+    }])
+    return lab
+
+
+def test_weight_range_classifies_weight():
     row = _row(phase="weight_load", op_type="store", symbol="ggml_init",
                address=0x7F00_0000_0000, address_page=0x7F00_0000_0000 >> 12)
-    rows = list(TraceLabeller().label([row]))
+    rows = list(_weight_labeller().label([row]))
     assert rows[0]["region_type"] == "weight"
 
 
-def test_weight_load_store_gets_region_id_1():
+def test_weight_range_row_gets_region_id_1():
     row = _row(phase="weight_load", op_type="store", symbol="ggml_init",
                address=0x7F00_0000_0000, address_page=0x7F00_0000_0000 >> 12)
-    rows = list(TraceLabeller().label([row]))
+    rows = list(_weight_labeller().label([row]))
     assert rows[0]["region_id"] == 1
 
 
-# ── symbol-based KV classification ───────────────────────────────────────────
+def test_engine_symbol_alone_cannot_claim_weight():
+    """
+    Measured on a real run: of 26,617,751 rows a ggml_vec_dot rule labelled
+    `weight`, only 114 were inside the mmap'd GGUF file.  The mapping is
+    read-only, so a store can never be a weight address at all.
+    """
+    row = _row(phase="weight_load", op_type="store", symbol="ggml_init",
+               address=0xDDDD_0000_0000, address_page=0xDDDD_0000_0000 >> 12)
+    rows = list(TraceLabeller().label([row]))
+    assert rows[0]["region_type"] != "weight"
 
-def test_kv_cache_symbol_classified():
+
+# ── kv_cache comes from the engine's allocation, never from a symbol ─────────
+
+def test_kv_symbol_alone_cannot_claim_kv_cache():
+    """
+    llama_kv_cache_* manages slot metadata, not the K/V tensors.  On a real run
+    that rule tagged four granules — one in the main stack — which then
+    absorbed 279,186 accesses from nearest_int, memmove and softmax.
+    """
     row = _row(phase="generation", op_type="store", symbol="llama_kv_cache_update",
                address=0xAA00_0000_0000, address_page=0xAA00_0000_0000 >> 12)
     rows = list(TraceLabeller().label([row]))
-    assert rows[0]["region_type"] == "kv_cache"
+    assert rows[0]["region_type"] != "kv_cache"
 
 
 def test_region_ids_are_allocated_from_1():
     """Region ids are sequential per granule; no type-specific reserved ids."""
-    row = _row(phase="generation", op_type="store", symbol="llama_kv_cache_update",
+    lab = TraceLabeller()
+    lab.register_address_ranges([{
+        "region_type": "kv_cache", "source": "kv_allocation",
+        "addr_start": 0xAA00_0000_0000, "addr_end": 0xAA00_0000_1000,
+    }])
+    row = _row(phase="generation", op_type="store",
                address=0xAA00_0000_0000, address_page=0xAA00_0000_0000 >> 12)
-    rows = list(TraceLabeller().label([row]))
+    rows = list(lab.label([row]))
     assert rows[0]["region_id"] == 1
 
 
@@ -94,8 +125,8 @@ def test_region_ids_are_allocated_from_1():
 
 def test_second_access_to_classified_page_inherits_type():
     page = 0x7F00_0000_0000 >> 12
-    labeller = TraceLabeller()
-    # First row: symbol classifies as weight
+    labeller = _weight_labeller()
+    # First row: the registered weight range classifies it
     rows = list(labeller.label([
         _row(phase="weight_load", op_type="store", symbol="ggml_init",
              address=0x7F00_0000_0000, address_page=page, timestamp_ns=100),
@@ -168,7 +199,7 @@ def test_all_original_columns_present_in_output():
 # ── region_map() and kv_lifecycle() ──────────────────────────────────────────
 
 def test_region_map_available_after_consuming_label():
-    labeller = TraceLabeller()
+    labeller = _weight_labeller()
     row = _row(phase="weight_load", op_type="store", symbol="ggml_init",
                address=0x7F00_0000_0000, address_page=0x7F00_0000_0000 >> 12)
     list(labeller.label([row]))
@@ -179,6 +210,10 @@ def test_region_map_available_after_consuming_label():
 
 def test_kv_lifecycle_available_after_consuming_label():
     labeller = TraceLabeller()
+    labeller.register_address_ranges([{
+        "region_type": "kv_cache", "source": "kv_allocation",
+        "addr_start": 0xCC00_0000_0000, "addr_end": 0xCC00_0000_1000,
+    }])
     rows = [
         _row(symbol="llama_kv_cache_update", phase="generation", op_type="store",
              address=0xCC00_0000_0000, address_page=0xCC00_0000_0000 >> 12, timestamp_ns=100),
@@ -216,12 +251,15 @@ def _label_one(labeller, **overrides):
     return list(labeller.label([_row(**overrides)]))[0]
 
 
-def test_kv_symbol_beats_coarse_runtime_range():
-    """A llama_kv_cache_* symbol is better evidence than 'inside some mapping'."""
+def test_a_kv_symbol_does_not_override_the_address_map():
+    """
+    This inversion was the bug: EV_SYMBOL_KV outranked the address map, so one
+    llama_kv_cache_* sample claimed a whole granule of whatever it landed in.
+    """
     lab = TraceLabeller()
     lab.register_address_ranges(_ranges("runtime", "anon_post_load"))
     row = _label_one(lab, symbol="llama_kv_cache_update", op_type="store")
-    assert row["region_type"] == "kv_cache"
+    assert row["region_type"] == "runtime"
 
 
 def test_gguf_mmap_range_beats_symbol():
@@ -248,10 +286,11 @@ def test_geometry_kv_range_beats_generic_symbol():
 
 
 def test_generic_symbol_beats_coarse_range():
+    """A kernel's store destination is an activation buffer — that much holds."""
     lab = TraceLabeller()
     lab.register_address_ranges(_ranges("runtime", "anon"))
-    row = _label_one(lab, symbol="ggml_vec_dot_q4_K")
-    assert row["region_type"] == "weight"
+    row = _label_one(lab, symbol="ggml_vec_dot_q4_K", op_type="store")
+    assert row["region_type"] == "activation"
 
 
 def test_coarse_range_used_when_no_symbol_matches():
@@ -265,11 +304,11 @@ def test_equal_evidence_keeps_first_classification():
     """Ties must not flip, or labelling becomes order-dependent."""
     lab = TraceLabeller()
     rows = [
-        _row(symbol="ggml_vec_dot_q4_K", sample_id=0),   # EV_SYMBOL → weight
-        _row(symbol="malloc", sample_id=1),              # EV_SYMBOL → runtime
+        _row(symbol="ggml_vec_dot_q4_K", op_type="store", sample_id=0),  # → activation
+        _row(symbol="malloc", op_type="store", sample_id=1),             # → runtime
     ]
     out = list(lab.label(rows))
-    assert [r["region_type"] for r in out] == ["weight", "weight"]
+    assert [r["region_type"] for r in out] == ["activation", "activation"]
 
 
 def test_stronger_range_upgrades_weaker_range():
@@ -301,23 +340,23 @@ def test_prescan_makes_labelling_order_independent():
             lab.prescan_symbols(rows)
         return [r["region_type"] for r in lab.label(rows)]
 
-    symbol_first = [{"symbol": "llama_kv_cache_update", "sample_id": 0},
-                    {"symbol": "", "sample_id": 1}]
-    symbol_last = [{"symbol": "", "sample_id": 0},
-                   {"symbol": "llama_kv_cache_update", "sample_id": 1}]
+    symbol_first = [{"symbol": "ggml_vec_dot_q4_K", "op_type": "store", "sample_id": 0},
+                    {"symbol": "", "op_type": "store", "sample_id": 1}]
+    symbol_last = [{"symbol": "", "op_type": "store", "sample_id": 0},
+                   {"symbol": "ggml_vec_dot_q4_K", "op_type": "store", "sample_id": 1}]
 
     # Without prescan the two orderings disagree on the first row.
     assert _run(symbol_first, prescan=False)[0] != _run(symbol_last, prescan=False)[0]
 
     # With prescan both orderings classify the whole page as kv_cache.
-    assert _run(symbol_first, prescan=True) == ["kv_cache", "kv_cache"]
-    assert _run(symbol_last, prescan=True) == ["kv_cache", "kv_cache"]
+    assert _run(symbol_first, prescan=True) == ["activation", "activation"]
+    assert _run(symbol_last, prescan=True) == ["activation", "activation"]
 
 
 def test_prescan_returns_upgrade_count():
     lab = TraceLabeller()
     lab.register_address_ranges(_ranges("runtime", "anon"))
-    n = lab.prescan_symbols([_row(symbol="llama_kv_cache_update")])
+    n = lab.prescan_symbols([_row(symbol="ggml_vec_dot_q4_K", op_type="store")])
     assert n == 1
 
 

@@ -96,12 +96,20 @@ def test_page_propagation_is_stable(n, base_address):
     """
     page_addr = (base_address >> 12) << 12  # align to page
     rows = [
-        _row(page_addr, "ggml_init", "store", "weight_load"),  # classifies as weight
+        _row(page_addr, "ggml_init", "store", "weight_load"),
     ] + [
         _row(page_addr, "malloc", "load", None)  # would be runtime if unclassified
         for _ in range(n - 1)
     ]
     labeller = TraceLabeller()
+    # The page is classified by an address range, which is the only thing that
+    # establishes `weight` — a symbol says what code ran, not where the address
+    # lives.  The invariant under test is unchanged: once classified, every
+    # later row on the page keeps that type.
+    labeller.register_address_ranges([{
+        "region_type": "weight", "source": "mmap_gguf",
+        "addr_start": page_addr, "addr_end": page_addr + 4096,
+    }])
     labelled = list(labeller.label(rows))
     types = [r["region_type"] for r in labelled]
     assert len(set(types)) == 1, (

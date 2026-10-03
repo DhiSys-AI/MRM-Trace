@@ -52,14 +52,19 @@ _VALID_POLICIES = frozenset({"keep", "skip", "error"})
 # ── Evidence strength ─────────────────────────────────────────────────────────
 # Higher wins.  Ties resolve in favour of the already-recorded classification, so
 # labelling stays stable and order-independent for equally-strong evidence.
+# Evidence strength.  Address ranges outrank symbols, always: a range says
+# where an address *is*, a symbol only says what code was running when it was
+# sampled.  EV_SYMBOL_KV used to sit above EV_MAPS_KV, which let a single
+# llama_kv* sample override the address map and claim a whole granule — one
+# such granule in the main stack absorbed 279,186 unrelated accesses.
 EV_MAPS_COARSE = 1   # address is inside some mapping (runtime, heap, stack, lib)
-EV_SYMBOL = 2        # a symbol rule matched
-EV_MAPS_KV = 3       # anonymous mapping whose size matches the model's KV geometry
-EV_SYMBOL_KV = 4     # symbol is engine KV-cache code — very specific
+EV_SYMBOL = 2        # a symbol rule matched — the weakest kind of evidence
+EV_MAPS_KV = 3       # the engine's own KV allocation, captured at malloc time
 EV_MAPS_WEIGHT = 5   # address is inside the mmap'd GGUF file — unambiguous
 
 _SOURCE_EVIDENCE = {
     "mmap_gguf": EV_MAPS_WEIGHT,
+    "kv_allocation": EV_MAPS_KV,
     "anon_kv_sized": EV_MAPS_KV,
 }
 
@@ -77,7 +82,13 @@ def _range_evidence(region_type: str, source: Optional[str]) -> int:
 
 
 def _symbol_evidence(region_type: str) -> int:
-    return EV_SYMBOL_KV if region_type == _KV else EV_SYMBOL
+    """
+    Symbol rules are the weakest evidence, uniformly.
+
+    They cannot establish `weight` or `kv_cache` at all — DEFAULT_RULES no
+    longer produces either — so there is no longer a KV-specific strength.
+    """
+    return EV_SYMBOL
 
 
 @dataclass

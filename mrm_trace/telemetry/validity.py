@@ -79,6 +79,7 @@ def classify_run(
     io_contention_detected: bool = False,
     peak_temp_c: float = 0.0,
     observer_memory_system_frac: Optional[float] = None,
+    sample_rate_lowered: bool = False,
 ) -> ValidityResult:
     """
     Classify a run as clean, marginal, or contaminated.
@@ -97,6 +98,12 @@ def classify_run(
                                     as perf mem and it replaces the target-RSS
                                     ratio as the memory gate; see the module
                                     docstring.  None keeps the ratio rule.
+    sample_rate_lowered           : True if the kernel reduced
+                                    perf_event_max_sample_rate during the run.
+                                    Sampling density was then higher at the
+                                    start than at the end, which biases
+                                    retention directly — the run is at most
+                                    marginal.
 
     Returns
     -------
@@ -127,6 +134,11 @@ def classify_run(
         )
     if io_contention_detected:
         failures.append("io_contention_detected=True")
+    if sample_rate_lowered:
+        failures.append(
+            "kernel lowered perf_event_max_sample_rate during the run — "
+            "sampling density was not uniform, biasing retention"
+        )
     if peak_temp_c > TEMP_CONTAMINATED_C:
         failures.append(
             f"peak_temp {peak_temp_c:.1f}°C > {TEMP_CONTAMINATED_C}°C "
@@ -224,6 +236,15 @@ def classify_from_metadata(metadata: dict) -> ValidityResult:
     thermal = metadata.get("thermal") or {}
     oe = metadata.get("observer_effect") or {}
     hardware = metadata.get("hardware") or {}
+    collector = metadata.get("collector") or {}
+
+    # A mid-run reduction of the sampling cap makes density non-uniform over
+    # the collection; see experiment-workplan.md Section 5.1.5.
+    rate_before = collector.get("perf_event_max_sample_rate_before")
+    rate_after = collector.get("perf_event_max_sample_rate_after")
+    sample_rate_lowered = bool(
+        rate_before and rate_after and rate_after < rate_before
+    )
 
     system_frac = oe.get("observer_memory_system_frac")
     if system_frac is None:
@@ -244,4 +265,5 @@ def classify_from_metadata(metadata: dict) -> ValidityResult:
         io_contention_detected=oe.get("io_contention_detected", False),
         peak_temp_c=thermal.get("peak_temp_c", 0.0),
         observer_memory_system_frac=system_frac,
+        sample_rate_lowered=sample_rate_lowered,
     )

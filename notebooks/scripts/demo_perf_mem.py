@@ -61,6 +61,11 @@ from mrm_trace.analyser import (
     retention_granularity_sweep,
 )
 from mrm_trace.collector.base import CollectorMeta
+from mrm_trace.collector.kv_allocation import (
+    build_interposer,
+    interposer_env,
+    kv_regions_from_alloc_log,
+)
 from mrm_trace.collector.perf_runner import PerfMemRunner, clock_args
 from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.config.schema import EngineType, ModelConfig, RunConfig
@@ -144,6 +149,19 @@ def parse_args():
              "trace's sample density.",
     )
     p.add_argument(
+        "--ldlat", type=int, default=_DEFAULT_LDLAT,
+        help=f"PEBS load-latency threshold in cycles (default {_DEFAULT_LDLAT}). "
+             "perf mem's own default of 30 discards almost every weight read; "
+             "3 captures ~25x more load samples.",
+    )
+    p.add_argument(
+        "--store-multiplier", dest="store_multiplier", type=int,
+        default=_STORE_PERIOD_MULTIPLIER,
+        help=f"store period = --sample-period x this (default "
+             f"{_STORE_PERIOD_MULTIPLIER}). Stores are the uninformative "
+             "majority; loads carry the weight and KV reads.",
+    )
+    p.add_argument(
         "--keep-perf-script", dest="keep_perf_script", action="store_true",
         help="keep raw/perf_script.txt after export (default: delete it — it is "
              "regenerable from perf.data and is the largest artifact of a run)",
@@ -160,6 +178,36 @@ def parse_args():
     p.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--results-file", dest="results_file", default=None, help=argparse.SUPPRESS)
     return p.parse_args()
+
+
+# The kernel caps samples/s/CPU and *self-lowers* that cap under dense
+# sampling, logging "perf: interrupt took too long ... lowering
+# kernel.perf_event_max_sample_rate".  The reduction persists for the rest of
+# the boot, so a later run silently samples at a different density than it
+# asked for.  Observed on this machine: the default 100000 fell to 1000 during
+# a dense-sampling probe, after which a run requesting ~103,500 samples/s
+# delivered 13,790 — 7.5x short, with no error anywhere.
+#
+# This is machine context (Layer 3): it changes what a sample count means, so
+# it is read before and after every collection and recorded in metadata.json.
+_SAMPLE_RATE_FLOOR = 50_000   # below this, warn before starting
+
+
+def _perf_max_sample_rate():
+    """Current kernel.perf_event_max_sample_rate, or None if unreadable."""
+    try:
+        return int(pathlib.Path(
+            "/proc/sys/kernel/perf_event_max_sample_rate").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _perf_event_paranoid():
+    """Current kernel.perf_event_paranoid, or None if it cannot be read."""
+    try:
+        return int(pathlib.Path("/proc/sys/kernel/perf_event_paranoid").read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def check_pmu():
@@ -332,6 +380,14 @@ def build_metadata(
             "sample_period": collector_meta.sample_period,
             "event_strings": collector_meta.event_strings,
             "region_granularity_bytes": region_granularity,
+            # What the kernel actually allowed.  A sample count is
+            # uninterpretable without it: the kernel self-lowers this cap under
+            # dense sampling and the reduction persists for the boot, so two
+            # runs with identical periods can differ by an order of magnitude.
+            "perf_event_max_sample_rate_before": (
+                (machine_ctx or {}).get("perf_event_max_sample_rate_before")),
+            "perf_event_max_sample_rate_after": (
+                (machine_ctx or {}).get("perf_event_max_sample_rate_after")),
             "output_file": collector_meta.output_file,
             "output_file_size_bytes": collector_meta.output_file_size_bytes,
             "parse_success": collector_meta.parse_success,
@@ -611,9 +667,28 @@ def run_headless(args) -> None:
     address_regions = extract_llamacpp_regions(
         str(model_path), pre_load_maps, expected_kv=kv_bytes,
     )
+    # Ground truth for the KV cache, if the interposer was loaded.  It is not
+    # separable from /proc/self/maps — llama.cpp carves it out of a larger ggml
+    # arena — but its allocation is exactly the size the geometry implies, so
+    # the allocator log gives the base address to the byte.
+    kv_regions = kv_regions_from_alloc_log(
+        os.environ.get("MRM_ALLOC_LOG"), kv_bytes, pid=os.getpid(),
+    )
+    if kv_regions:
+        # An exact allocation match supersedes any size-matched mapping guess.
+        address_regions = [r for r in address_regions
+                           if r.get("source") != "anon_kv_sized"] + kv_regions
     print("Model loaded.")
     if kv_bytes:
         print(f"  Expected KV cache from model geometry: {kv_bytes / 1e6:.1f} MB")
+    if kv_regions:
+        r = kv_regions[0]
+        print(f"  KV cache located at {r['addr_start']:#x} "
+              f"({r['size_bytes'] / 1e6:.1f} MB) via allocation capture")
+    elif kv_bytes:
+        print("  WARNING: KV cache allocation not captured — kv_cache will be "
+              "absent. An absent measurement is publishable; a guessed one is "
+              "not (workplan Section 5.1.1).", file=sys.stderr)
     else:
         print("  WARNING: could not derive KV cache size from GGUF metadata — "
               "no region will be classified as kv_cache.", file=sys.stderr)
@@ -672,12 +747,24 @@ def run_headless(args) -> None:
 
 def _preflight(args) -> "tuple[pathlib.Path, list | None]":
     """Check root, model file, and PMU. Returns (model_path, events_or_None)."""
+    # Root is not the requirement — PMU access is.  With
+    # kernel.perf_event_paranoid <= 0 (workplan Section 4.1) an unprivileged
+    # user can record hardware events, and refusing to start then costs a
+    # pointless sudo.  Only block when the PMU is genuinely unreachable.
     if os.getuid() != 0:
-        print("ERROR: perf mem requires root.", file=sys.stderr)
-        print(f"  sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py --model {args.model}",
-              file=sys.stderr)
-        print("  (-E preserves the venv PATH so the correct mrm-trace is used)", file=sys.stderr)
-        sys.exit(1)
+        paranoid = _perf_event_paranoid()
+        if paranoid is None or paranoid > 0:
+            print("ERROR: perf mem needs PMU access: either run as root or set "
+                  f"kernel.perf_event_paranoid <= 0 (currently {paranoid}).",
+                  file=sys.stderr)
+            print(f"  sudo -E venv/bin/python notebooks/scripts/demo_perf_mem.py "
+                  f"--model {args.model}", file=sys.stderr)
+            print("  (-E preserves the venv PATH so the correct mrm-trace is used)",
+                  file=sys.stderr)
+            print("  or: sudo sysctl -w kernel.perf_event_paranoid=0", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Running unprivileged (perf_event_paranoid={paranoid}). Kernel "
+              "symbols will not resolve; user-space symbols are unaffected.")
 
     model_path = pathlib.Path(args.model)
     if not model_path.exists():
@@ -686,6 +773,17 @@ def _preflight(args) -> "tuple[pathlib.Path, list | None]":
               "TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
               file=sys.stderr)
         sys.exit(1)
+
+    rate = _perf_max_sample_rate()
+    if rate is not None and rate < _SAMPLE_RATE_FLOOR:
+        print(f"  WARNING: kernel.perf_event_max_sample_rate is {rate:,}/s/CPU "
+              f"(default 100,000).", file=sys.stderr)
+        print("  The kernel lowers this itself under dense sampling and the "
+              "reduction persists, so this run will sample far below the "
+              "requested period and will not be comparable with runs collected "
+              "at a different limit.", file=sys.stderr)
+        print(f"  Fix: sudo sysctl -w kernel.perf_event_max_sample_rate=100000",
+              file=sys.stderr)
 
     print("Checking PMU availability ...")
     pmu_ok, pmu_msg = check_pmu()
@@ -696,6 +794,58 @@ def _preflight(args) -> "tuple[pathlib.Path, list | None]":
     print("  Falling back to software events (no latency / cache-level data).", file=sys.stderr)
     print("  TIP: run on bare-metal Linux for full hardware PMU support.", file=sys.stderr)
     return model_path, ["mem:0:rw:p"]
+
+
+# ── Event configuration (load-dense sampling) ────────────────────────────────
+#
+# `perf mem record -c N` applies one period to both events, and perf samples
+# stores at that period while sampling loads only above the PEBS latency
+# threshold.  The result is ~99.8% stores — and the weight region is read-only
+# (the GGUF file is mapped r--s), so no store can ever land in it.  Measured on
+# a real run: 114 of 28,321,245 samples were inside the weight mapping.
+#
+# Separate per-event periods invert that.  Measured on the same workload with
+# ldlat=3 and a 500x coarser store period: 90% loads, and 6,992 samples inside
+# the weight mapping across 3,941 granules — 61x more weight data from a
+# 12-second probe.
+#
+# `-d` is mandatory: it requests PERF_SAMPLE_ADDR.  Without it `perf script`
+# reports "do not have ADDR attribute set" and emits nothing at all, which is
+# how the first attempt at this silently produced an empty trace.
+_DEFAULT_LDLAT = 3
+_STORE_PERIOD_MULTIPLIER = 500
+
+
+def build_perf_events(load_period: int, ldlat: int,
+                      store_multiplier: int = _STORE_PERIOD_MULTIPLIER) -> "list[str]":
+    """Load and store event specs with independent periods."""
+    return [
+        f"cpu/mem-loads,ldlat={ldlat},period={load_period}/P",
+        f"cpu/mem-stores,period={load_period * store_multiplier}/P",
+    ]
+
+
+def probe_perf_events(events: "list[str]") -> "tuple[bool, str]":
+    """
+    Check that this kernel accepts the event specs before a long run.
+
+    The ldlat and period term syntax varies across kernel versions, so a
+    failure here is expected on some hosts and falls back to `perf mem record`.
+    """
+    perf_bin = shutil.which("perf")
+    if not perf_bin:
+        return False, "perf binary not found"
+    cmd = [perf_bin, "record", "-d", "--weight"]
+    for ev in events:
+        cmd += ["-e", ev]
+    cmd += ["-o", "/dev/null", "--", "true"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"probe failed to run: {exc}"
+    if result.returncode != 0:
+        return False, result.stderr.decode(errors="replace").strip()[:200]
+    return True, "ok"
 
 
 _TEMP_POLL_INTERVAL_S = 2.0
@@ -753,7 +903,25 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     ]
     if args.num_prompts:
         inner_cmd += ["--num-prompts", str(args.num_prompts)]
-    perf_cmd = [perf_bin, "mem", "record", "-c", str(args.sample_period), "-o", str(perf_data)]
+    mem_events = build_perf_events(args.sample_period, args.ldlat,
+                                   args.store_multiplier)
+    probe_ok, probe_msg = probe_perf_events(mem_events)
+    if probe_ok:
+        # -d sets PERF_SAMPLE_ADDR; --weight carries the load latency.  The
+        # events themselves are appended by the shared loop below.
+        events = mem_events
+        perf_cmd = [perf_bin, "record", "-d", "--weight", "-o", str(perf_data)]
+        print(f"  Events        : {' '.join(events)}")
+    else:
+        # Keep whatever _preflight() selected and fall back to perf mem record.
+        print(f"  WARNING: per-event periods rejected by this kernel ({probe_msg})",
+              file=sys.stderr)
+        print("  Falling back to `perf mem record` with one shared period — the "
+              "trace will be store-dominated and the weight region will be "
+              "nearly unobservable (measured: 114 of 28.3M samples).",
+              file=sys.stderr)
+        perf_cmd = [perf_bin, "mem", "record", "-c", str(args.sample_period),
+                    "-o", str(perf_data)]
     # Pin sample timestamps to CLOCK_MONOTONIC so they share a clock domain with
     # the engine's phase records (PhaseRecord.mono_ns).  Without this the phase
     # column is NULL for every row.
@@ -766,6 +934,17 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
         perf_cmd += ["-e", ev]
     perf_cmd += ["--"] + inner_cmd
 
+    # Load the KV allocation interposer into the traced process.  If it cannot
+    # be built the run proceeds without it and kv_cache stays absent.
+    alloc_log = raw_dir / "alloc.log"
+    kv_lib = build_interposer()
+    spawn_env = {**os.environ, **interposer_env(kv_lib, alloc_log)}
+    if kv_lib:
+        print(f"  KV capture    : {kv_lib}")
+    else:
+        print("  WARNING: KV allocation interposer unavailable (no C compiler?) "
+              "— kv_cache will be absent.", file=sys.stderr)
+
     current_pid = os.getpid()
     print(f"Starting perf mem collector (spawn mode, launcher PID {current_pid}) ...")
 
@@ -774,13 +953,14 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
     baseline = capture_baseline(duration_s=2.0)
     cpu_freq_mon = CpuFreqMonitor()
     gpu_mon = GpuMonitor()
+    sample_rate_before = _perf_max_sample_rate()
     start_temp_c = read_package_temp_c()
     thermal_monitor = ThermalMonitor()
     thermal_monitor.begin()
     poller = _PeakTempPoller().start()
     collection_start = time.time()
     try:
-        proc = subprocess.Popen(perf_cmd)
+        proc = subprocess.Popen(perf_cmd, env=spawn_env)
         observer_mon = ProcessMonitor([proc.pid], poll_interval_ms=500)
         cpu_freq_mon.start()
         gpu_mon.start()
@@ -793,6 +973,18 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
         peak_temp_c = poller.stop()
         collection_duration_s = round(time.time() - collection_start, 3)
         throttle_events = thermal_monitor.end()
+
+    sample_rate_after = _perf_max_sample_rate()
+    machine_ctx["perf_event_max_sample_rate_before"] = sample_rate_before
+    machine_ctx["perf_event_max_sample_rate_after"] = sample_rate_after
+    if (sample_rate_before and sample_rate_after
+            and sample_rate_after < sample_rate_before):
+        print(f"  WARNING: the kernel lowered perf_event_max_sample_rate from "
+              f"{sample_rate_before:,} to {sample_rate_after:,} during this run.",
+              file=sys.stderr)
+        print("  Sampling density was not uniform over the collection, which "
+              "biases retention: early samples are denser than late ones. "
+              "Treat this run as not comparable.", file=sys.stderr)
 
     end_temp_c = read_package_temp_c()
     thermal_meta = {
