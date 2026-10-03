@@ -319,16 +319,30 @@ def _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits=None) -> dict:
     }
 
 
-def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
+def _achieved_rate_per_cpu(samples_collected, thermal_meta):
+    """Samples per second per CPU actually achieved, or None if unknown."""
+    duration = (thermal_meta or {}).get("collection_wall_duration_s")
+    cpus = os.cpu_count() or 1
+    if not samples_collected or not duration:
+        return None
+    return round(samples_collected / duration / cpus, 1)
+
+
+def _thermal_section(thermal_meta, baseline, observer_effect,
+                     collector_section=None) -> dict:
     # Classified through the same entry point --reclassify uses, so a fresh run
     # and a later reclassification of its metadata can never disagree.  perf mem
     # is out-of-process, so its memory is judged against system RAM rather than
     # against the target's own footprint — see validity.py.
     oe = dict(observer_effect or {})
     oe.setdefault("baseline_cpu_pct", baseline.cpu_pct if baseline else 0.0)
+    # collector_section carries the sampling-cap readings.  Omitting it was a
+    # live bug: the run that triggered the cap reduction was reported `clean`
+    # because the classifier never saw the fields it checks.
     validity = classify_from_metadata({
         "thermal": thermal_meta,
         "observer_effect": oe,
+        "collector": collector_section or {},
     })
     # Keep the reasons: a verdict of "contaminated" with no stated cause cannot
     # be acted on, and it is the one field the data card needs to justify an
@@ -345,7 +359,7 @@ def build_metadata(
     thermal_meta=None, total_wall_duration_s=None,
     baseline=None, cpu_freq_limits=None, cpu_freq_stats=None, gpu_stats=None, observer_effect=None,
     region_granularity=_REGION_GRANULARITY_BYTES,
-    machine_ctx=None, machine_id=None,
+    machine_ctx=None, machine_id=None, samples_collected=None,
     context_length=None, batch_size=None, output_tokens=None, rep_index=None,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
@@ -388,6 +402,16 @@ def build_metadata(
                 (machine_ctx or {}).get("perf_event_max_sample_rate_before")),
             "perf_event_max_sample_rate_after": (
                 (machine_ctx or {}).get("perf_event_max_sample_rate_after")),
+            # Achieved per-CPU sampling rate.  Without it a cap reduction
+            # cannot be told apart from a cap reduction that clipped the
+            # trace — measured, the cap fell 100,000 -> 76,000 while the run
+            # sampled at 5,049/s/CPU, 6.6% of the cap.
+            "samples_collected": samples_collected,
+            "collection_duration_s": (thermal_meta or {}).get(
+                "collection_wall_duration_s"),
+            "cpu_count": os.cpu_count(),
+            "achieved_sample_rate_per_cpu": _achieved_rate_per_cpu(
+                samples_collected, thermal_meta),
             "output_file": collector_meta.output_file,
             "output_file_size_bytes": collector_meta.output_file_size_bytes,
             "parse_success": collector_meta.parse_success,
@@ -425,7 +449,10 @@ def build_metadata(
         metadata["gpu"] = gpu_section
 
     if thermal_meta is not None:
-        metadata["thermal"] = _thermal_section(thermal_meta, baseline, observer_effect)
+        metadata["thermal"] = _thermal_section(
+            thermal_meta, baseline, observer_effect,
+            collector_section=metadata["collector"],
+        )
 
     if observer_effect is not None:
         metadata["observer_effect"] = observer_effect
@@ -1318,6 +1345,7 @@ def main():
         machine_id=mslug, context_length=args.ctx, batch_size=args.batch_size,
         output_tokens=args.tokens, rep_index=args.rep,
         region_granularity=args.region_granularity,
+        samples_collected=len(labelled),
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(

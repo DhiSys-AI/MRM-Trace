@@ -260,27 +260,71 @@ def test_an_unreadable_cap_does_not_block_the_sweep(runner, monkeypatch):
     assert runner.ensure_sample_rate(lambda *_: None) is True
 
 
-def test_a_mid_run_cap_drop_costs_the_run_its_clean_status():
+def _cap_meta(before, after, achieved):
+    return {
+        "thermal": {"peak_temp_c": 70.0, "throttle_events": 0},
+        "observer_effect": {"observer_memory_overhead_mb_peak": 2512.0,
+                            "io_contention_detected": False},
+        "hardware": {"mem_total_mb": 31742.0},
+        "collector": {"perf_event_max_sample_rate_before": before,
+                      "perf_event_max_sample_rate_after": after,
+                      "achieved_sample_rate_per_cpu": achieved},
+    }
+
+
+def test_a_cap_drop_that_clipped_the_trace_costs_the_clean_status():
     """
     Density higher at the start than at the end biases retention, which is
     last-access minus first-access of a region.
     """
     from mrm_trace.telemetry.validity import classify_from_metadata
-    meta = {
-        "thermal": {"peak_temp_c": 70.0, "throttle_events": 0},
-        "observer_effect": {"observer_memory_overhead_mb_peak": 2512.0,
-                            "io_contention_detected": False},
-        "hardware": {"mem_total_mb": 31742.0},
-        "collector": {"perf_event_max_sample_rate_before": 100_000,
-                      "perf_event_max_sample_rate_after": 1_000},
-    }
-    result = classify_from_metadata(meta)
+    result = classify_from_metadata(_cap_meta(100_000, 76_000, achieved=70_000))
     assert result.run_validity == "marginal"
     assert any("perf_event_max_sample_rate" in r for r in result.failure_reasons)
 
-    steady = {**meta, "collector": {"perf_event_max_sample_rate_before": 100_000,
-                                    "perf_event_max_sample_rate_after": 100_000}}
-    assert classify_from_metadata(steady).run_validity == "clean"
+
+def test_a_cap_drop_well_above_the_achieved_rate_is_not_held_against_the_run():
+    """
+    A cap reduction alone is not evidence of clipping.  Measured on a real run:
+    the cap fell 100,000 -> 76,000 while sampling at 5,049/s/CPU — 6.6% of the
+    cap — and the sample count differed from a steady-cap run by 2.4%.  Flagging
+    every reduction would mark nearly every run marginal for no effect, which is
+    as useless as flagging none.
+    """
+    from mrm_trace.telemetry.validity import classify_from_metadata
+    result = classify_from_metadata(_cap_meta(100_000, 76_000, achieved=5_049))
+    assert result.run_validity == "clean"
+    assert result.failure_reasons == []
+
+
+def test_a_steady_cap_is_clean():
+    from mrm_trace.telemetry.validity import classify_from_metadata
+    assert classify_from_metadata(
+        _cap_meta(100_000, 100_000, achieved=5_049)).run_validity == "clean"
+
+
+def test_without_an_achieved_rate_a_cap_drop_is_flagged_conservatively():
+    """Older metadata has no achieved rate; do not silently pass a clipped run."""
+    from mrm_trace.telemetry.validity import classify_from_metadata
+    assert classify_from_metadata(
+        _cap_meta(100_000, 1_000, achieved=None)).run_validity == "marginal"
+
+
+def test_the_live_verdict_sees_the_sampling_cap(demo):
+    """
+    Regression: _thermal_section built its classification input without the
+    collector section, so the cap fields were never read and the run that
+    triggered a cap reduction was reported `clean` by the pipeline while
+    re-deriving from the written metadata said `marginal`.
+    """
+    section = {"perf_event_max_sample_rate_before": 100_000,
+               "perf_event_max_sample_rate_after": 76_000,
+               "achieved_sample_rate_per_cpu": 70_000}
+    thermal = {"peak_temp_c": 65.0, "throttle_events": 0}
+    out = demo._thermal_section(thermal, None, {}, collector_section=section)
+    assert out["run_validity"] == "marginal"
+    assert any("perf_event_max_sample_rate" in r
+               for r in out["validity_failure_reasons"])
 
 
 # ── a read-only region must not be scored as the worst MRM candidate ─────────

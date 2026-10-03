@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from mrm_trace.telemetry.thermal import read_package_temp_c
+from mrm_trace.reporter.run_audit import audit_run
 from mrm_trace.telemetry.validity import (
     TEMP_CONTAMINATED_C,
     TEMP_WARN_C,
@@ -1080,6 +1081,37 @@ def _result_flag(result: RunResult) -> str:
     return ""
 
 
+def _audit_completed_run(result: RunResult, log) -> None:
+    """
+    Check an exported run against the invariants its metrics depend on.
+
+    Each defect these catch shipped a run with both quality gates PASS and a
+    clean verdict — attribution labelling rows outside the range they claim, a
+    verdict disagreeing with its own metadata, a non-finite published metric.
+    None showed up in any summary, so the sweep checks every run rather than
+    leaving it to someone to notice at the end.
+    """
+    if not result.output_dir:
+        return
+    try:
+        audit = audit_run(result.output_dir)
+    except Exception as exc:                    # never fail a run on the audit
+        log(f"     audit could not run: {exc}")
+        return
+    if audit.incomplete:
+        return
+    if audit.failures:
+        log(f"     AUDIT FAILED — {len(audit.failures)} invariant(s) violated:")
+        for failure in audit.failures:
+            log(f"       x {failure}")
+        log("       This run must not enter the dataset. Investigate before "
+            "trusting the runs after it.")
+    else:
+        log("     audit: all invariants hold")
+    for note in audit.notes:
+        log(f"       - {note}")
+
+
 def _trace_row_count(output_dir: Optional[str]) -> int:
     """Rows in a run's trace.parquet, from the footer — no data is read."""
     if not output_dir:
@@ -1177,6 +1209,7 @@ def _run_loop(all_specs: List[RunSpec], state: Dict,
                 for reason in result.validity_reasons:
                     log(f"     reason: {reason}")
             _calibrate_from_run(spec, result, log)
+            _audit_completed_run(result, log)
         else:
             log(f"   FAILED: {result.error}")
 

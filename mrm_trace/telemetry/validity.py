@@ -49,6 +49,10 @@ _MARGINAL_BASELINE_CPU = 30.0
 
 # Out-of-process collectors: bound against total system memory instead (see
 # the module docstring for why the target-RSS ratio does not apply to them).
+# Fraction of the sampling cap the achieved rate must reach before a mid-run
+# cap reduction is treated as having clipped the trace.
+_CAP_BINDING_FRACTION = 0.5
+
 _CLEAN_SYSTEM_MEM_FRAC = 0.10
 _MARGINAL_SYSTEM_MEM_FRAC = 0.25
 
@@ -99,11 +103,17 @@ def classify_run(
                                     ratio as the memory gate; see the module
                                     docstring.  None keeps the ratio rule.
     sample_rate_lowered           : True if the kernel reduced
-                                    perf_event_max_sample_rate during the run.
-                                    Sampling density was then higher at the
-                                    start than at the end, which biases
-                                    retention directly — the run is at most
-                                    marginal.
+                                    perf_event_max_sample_rate during the run
+                                    *and* the achieved rate was close enough to
+                                    the cap for the reduction to have clipped
+                                    it.  A cap reduction alone is not evidence:
+                                    measured on a real run, the cap fell
+                                    100,000 -> 76,000 while the achieved rate
+                                    was 5,049/s/CPU — 6.6% of the cap — and the
+                                    sample count differed from a steady-cap run
+                                    by 2.4%.  Flagging every reduction would
+                                    mark nearly every run marginal for no
+                                    effect.  See classify_from_metadata.
 
     Returns
     -------
@@ -136,8 +146,9 @@ def classify_run(
         failures.append("io_contention_detected=True")
     if sample_rate_lowered:
         failures.append(
-            "kernel lowered perf_event_max_sample_rate during the run — "
-            "sampling density was not uniform, biasing retention"
+            "kernel lowered perf_event_max_sample_rate during the run while "
+            "sampling near the cap — density was not uniform over the "
+            "collection, biasing retention"
         )
     if peak_temp_c > TEMP_CONTAMINATED_C:
         failures.append(
@@ -238,13 +249,21 @@ def classify_from_metadata(metadata: dict) -> ValidityResult:
     hardware = metadata.get("hardware") or {}
     collector = metadata.get("collector") or {}
 
-    # A mid-run reduction of the sampling cap makes density non-uniform over
-    # the collection; see experiment-workplan.md Section 5.1.5.
+    # A mid-run reduction of the sampling cap only matters if the cap was
+    # binding.  Compare the achieved per-CPU rate against the lower of the two
+    # caps: below _CAP_BINDING_FRACTION of it, clipping is implausible and the
+    # reduction changed nothing.
     rate_before = collector.get("perf_event_max_sample_rate_before")
     rate_after = collector.get("perf_event_max_sample_rate_after")
-    sample_rate_lowered = bool(
-        rate_before and rate_after and rate_after < rate_before
-    )
+    achieved = collector.get("achieved_sample_rate_per_cpu")
+    cap_fell = bool(rate_before and rate_after and rate_after < rate_before)
+    if cap_fell and achieved:
+        sample_rate_lowered = achieved >= _CAP_BINDING_FRACTION * min(
+            rate_before, rate_after)
+    else:
+        # No achieved rate recorded (older metadata): fall back to the cap
+        # change alone rather than silently passing a run that may be clipped.
+        sample_rate_lowered = cap_fell
 
     system_frac = oe.get("observer_memory_system_frac")
     if system_frac is None:
