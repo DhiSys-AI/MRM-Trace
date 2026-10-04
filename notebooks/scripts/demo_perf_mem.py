@@ -41,6 +41,8 @@ WSL2 note:
 import argparse
 import collections
 import dataclasses
+import multiprocessing
+import tempfile
 import json
 import os
 import pathlib
@@ -89,6 +91,7 @@ from mrm_trace.labeller.llamacpp_regions import (
     snapshot_proc_maps,
     summarise_regions,
 )
+from mrm_trace.parser.parallel import parse_trace_parallel
 from mrm_trace.parser.perf_script_parser import parse_perf_script
 from mrm_trace.reporter.run_exporter import RunExporter
 from mrm_trace.reporter.trace_qa import (
@@ -176,9 +179,22 @@ def parse_args():
              "majority; loads carry the weight and KV reads.",
     )
     p.add_argument(
+        "--warmup-only", dest="warmup_only", action="store_true",
+        help="load the model and generate, then exit: no perf, no parse, no "
+             "export. A warmup exists to warm the page cache, and its trace is "
+             "excluded from every aggregate (the analysis set is rep > 0), so "
+             "tracing one is work nothing reads.",
+    )
+    p.add_argument(
         "--keep-perf-script", dest="keep_perf_script", action="store_true",
         help="keep raw/perf_script.txt after export (default: delete it — it is "
              "regenerable from perf.data and is the largest artifact of a run)",
+    )
+    p.add_argument(
+        "--parse-workers", dest="parse_workers", type=int, default=0,
+        help="processes used to parse the perf script text (default 0 = half "
+             "the cores, capped). Parsing is CPU-bound and parallel; labelling "
+             "stays serial because region ids are order-dependent.",
     )
     p.add_argument(
         "--chunk-rows", dest="chunk_rows", type=int, default=0,
@@ -535,6 +551,9 @@ _FRAME_MEM_BUDGET = 0.5
 
 _PROGRESS_EVERY_ROWS = 5_000_000
 
+# Parsing is CPU-bound and embarrassingly parallel; labelling is not.
+_MAX_PARSE_WORKERS = 8
+
 
 def _auto_chunk_rows() -> int:
     """
@@ -547,7 +566,16 @@ def _auto_chunk_rows() -> int:
 
 
 def _chunks(rows, size: int):
-    """Yield lists of at most *size* rows from an iterable."""
+    """
+    Yield successive slices of at most *size* rows.
+
+    Accepts a DataFrame (yielding sub-frames) or any iterable of rows (yielding
+    lists), so the same helper serves the parsed frame and a raw row stream.
+    """
+    if isinstance(rows, pd.DataFrame):
+        for start in range(0, len(rows), size):
+            yield rows.iloc[start:start + size]
+        return
     chunk: list = []
     for row in rows:
         chunk.append(row)
@@ -556,6 +584,15 @@ def _chunks(rows, size: int):
             chunk = []
     if chunk:
         yield chunk
+
+
+def _auto_parse_workers() -> int:
+    """
+    Processes for parsing.  Half the cores, capped: parsing is CPU-bound, but
+    each worker holds a slice of the frame, so more workers cost memory for
+    diminishing returns.
+    """
+    return max(1, min(_MAX_PARSE_WORKERS, (os.cpu_count() or 2) // 2))
 
 
 def _categorical_dtypes(run_id: str, value_sets: dict) -> dict:
@@ -807,6 +844,46 @@ def run_headless(args) -> None:
     }))
     print()
     print("Headless run complete — perf mem will flush on exit.")
+
+
+def run_warmup_only(args) -> None:
+    """
+    Warm the page cache and exit.
+
+    A warmup run exists so the measured repetitions do not pay for faulting the
+    GGUF in from disk.  Collecting and parsing it costs a full run — roughly 8
+    minutes of the 10 it takes — for a trace the analysis set (rep > 0)
+    discards.  So this path loads the model, generates, and stops.
+
+    The sampling period is unaffected: _cpu_specs() fixes it once per
+    (model, ctx) before the repetition loop, so every rep of a configuration
+    shares one period and calibration only influences later sweeps.
+    """
+    model_path = pathlib.Path(args.model)
+    if not model_path.exists():
+        print(f"ERROR: model not found: {model_path}", file=sys.stderr)
+        sys.exit(1)
+
+    model_id = resolve_model_id(args, model_path)
+    model_cfg = build_model_cfg(model_path, model_id, args.params_b)
+    run_cfg = RunConfig(
+        run_id=f"{model_id}-warmup", model=model_cfg,
+        context_length=args.ctx, batch_size=args.batch_size,
+        output_tokens=args.tokens, rep_index=args.rep,
+    )
+
+    print(f"Warmup only — {model_id} ctx={args.ctx}, no tracing")
+    started = time.time()
+    engine = LlamaCppEngine(model_cfg, run_cfg)
+    engine.prepare()
+    engine.load_model()
+    prompts = PROMPTS[:args.num_prompts] if args.num_prompts else PROMPTS
+    for i, prompt in enumerate(prompts, 1):
+        result = engine.generate(prompt)
+        print(f"  [{i}/{len(prompts)}] {result.output_tokens} tokens @ "
+              f"{result.tokens_per_second:.1f} tok/s")
+    engine.shutdown()
+    print(f"Warmed in {time.time() - started:.0f}s. No artifacts written.")
 
 
 # ── Preflight + spawn (outer process) ──────────────────────────────────────────
@@ -1094,27 +1171,30 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
 def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=None,
                      granularity: int = _REGION_GRANULARITY_BYTES,
                      chunk_rows: int = 0,
-                     sample_period: int = 0) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
+                     sample_period: int = 0,
+                     parse_workers: int = 0) -> "tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]":
     """
     Parse perf script, label, print symbol summary.
 
-    Both passes stream the text file in chunks and never hold the raw row dicts
-    for the whole run (ADR-2); only the labelled frame is retained.  The file is
-    read twice because symbol evidence is per row while classification is per
-    region granule: without a prescan the first sample on a granule would be
-    labelled from address ranges alone and a later sample carrying a decisive
-    symbol would be labelled differently, making the output depend on row order.
+    The text is parsed **once**, across processes, into a raw frame that both
+    later steps read.  It used to be parsed twice — symbol evidence is per row
+    while classification is per granule, so a prescan has to see every row
+    before labelling begins — and parsing is the expensive half: 38.1 s per
+    million samples, measured, mostly regex over ~9 GB of text.
+
+    Labelling stays serial and in file order: region ids are handed out on
+    arrival and classification is first-evidence-wins, so splitting it would
+    change the result.
 
     Returns (labelled, region_map, kv_lifecycle).
     """
     chunk_rows = chunk_rows or _auto_chunk_rows()
+    parse_workers = parse_workers or _auto_parse_workers()
 
-    # Both passes re-open the source.  A file-like object would be exhausted by
-    # pass 1, leaving pass 2 to label nothing and emit an empty frame.
     if hasattr(perf_script_txt, "read"):
         raise TypeError(
-            "_parse_and_label needs a file path, not a file object: the trace is "
-            "streamed twice and a stream cannot be re-read"
+            "_parse_and_label needs a file path, not a file object: the trace "
+            "is split into byte ranges and a stream cannot be seeked"
         )
 
     labeller = TraceLabeller(region_granularity_bytes=granularity)
@@ -1128,87 +1208,72 @@ def _parse_and_label(perf_script_txt, run_id, phase_boundaries, address_regions=
             print(f"    {row['region_type']:<9} {source:<16} "
                   f"{row['count']:>4} mappings  {row['bytes'] / 1e6:>9.1f} MB")
 
-    def _stream():
-        return _chunks(
-            parse_perf_script(perf_script_txt, run_id=run_id,
-                              phase_boundaries=phase_boundaries),
-            chunk_rows,
-        )
-
-    # ── Pass 1: tally coverage and collect symbol evidence ────────────────────
-    print(f"Parsing perf script output (pass 1/2, {chunk_rows:,}-row chunks) ...")
-    n_rows = n_lat = n_cache = n_sym_granules = 0
-    op_counts: collections.Counter = collections.Counter()
-    phase_counts: collections.Counter = collections.Counter()
-    sym_counts: collections.Counter = collections.Counter()
-    # Value sets for the dictionary-encoded columns.  Collecting them here is
-    # what lets pass 2 give every chunk the same CategoricalDtype.
-    dso_values: set = set()
-    cache_values: set = set()
-    next_progress = _PROGRESS_EVERY_ROWS
-
-    for chunk in _stream():
-        for row in chunk:
-            if row["access_latency_ns"] is not None:
-                n_lat += 1
-            if row["cache_level"] is not None:
-                n_cache += 1
-            op_counts[row["op_type"]] += 1
-            phase_counts[row["phase"]] += 1
-            sym_counts[row["symbol"]] += 1
-            dso_values.add(row["dso"])
-            cache_values.add(row["cache_level"])
-        n_rows += len(chunk)
-        n_sym_granules += labeller.prescan_symbols(chunk)
-        chunk.clear()
-        if n_rows >= next_progress:
-            print(f"  {n_rows:,} rows ...", end="\r", flush=True)
-            next_progress += _PROGRESS_EVERY_ROWS
-
+    # ── Parse once, in parallel ───────────────────────────────────────────────
+    print(f"Parsing perf script output ({parse_workers} worker(s)) ...")
+    started = time.time()
+    trace = parse_trace_parallel(pathlib.Path(perf_script_txt), run_id,
+                                 phase_boundaries, parse_workers)
+    n_rows = len(trace)
     if n_rows == 0:
-        print("ERROR: no samples parsed — PMU may not have captured any events.", file=sys.stderr)
+        print("ERROR: no samples parsed — PMU may not have captured any events.",
+              file=sys.stderr)
         print(f"  Check perf_script.txt:  head -20 {perf_script_txt}", file=sys.stderr)
         sys.exit(1)
+    print(f"  {n_rows:,} samples in {time.time() - started:.0f}s")
 
-    print(f"  {n_rows:,} samples")
-    print(f"  op_type  : {dict(op_counts)}")
-    print(f"  phases   : {dict(phase_counts)}")
+    # Coverage tallies, vectorised over the frame rather than counted row by row.
+    op_counts = trace["op_type"].value_counts().to_dict()
+    phase_counts = trace["phase"].value_counts(dropna=False).to_dict()
+    sym_counts = trace["symbol"].value_counts()
+    n_lat = int(trace["access_latency_ns"].notna().sum())
+    n_cache = int(trace["cache_level"].notna().sum())
+    n_sym_rows = int((trace["symbol"] != "").sum())
+    n_phase_rows = int(trace["phase"].notna().sum())
+
+    print(f"  op_type  : {op_counts}")
+    print(f"  phases   : {phase_counts}")
     print()
     print("  Top 15 symbols (expect ggml_* and llama_* with native llama.cpp):")
-    for sym, cnt in sym_counts.most_common(15):
-        print(f"    {sym:<50}  {cnt:>6}")
+    for sym, cnt in sym_counts.head(15).items():
+        print(f"    {str(sym):<50}  {cnt:>6}")
 
     check_trace_quality_counts(
         rows=n_rows,
         latency_non_null=n_lat,
         cache_level_non_null=n_cache,
-        symbol_non_empty=n_rows - sym_counts[""],
+        symbol_non_empty=n_sym_rows,
         region_classified=0,   # nothing is labelled yet; not gated pre-labelling
-        phase_non_null=n_rows - phase_counts[None],
+        phase_non_null=n_phase_rows,
         collector_type="perf_mem",
         fail_fast=True,
     )
+
+    # ── Symbol evidence, then labelling — both from the parsed frame ──────────
+    n_sym_granules = 0
+    for chunk in _chunks(trace, chunk_rows):
+        n_sym_granules += labeller.prescan_symbols(chunk.to_dict("records"))
     print(f"  Symbol evidence upgraded {n_sym_granules:,} granules "
           f"(0 means stripped llama.cpp — see workplan §5.1)")
     _check_frame_fits(n_rows, sample_period or 1)
 
-    # ── Pass 2: label and accumulate the frame ────────────────────────────────
-    print("Labelling (pass 2/2) ...")
+    print("Labelling ...")
     dtypes = _categorical_dtypes(run_id, {
-        "symbol": set(sym_counts), "dso": dso_values, "cache_level": cache_values,
+        "symbol": set(sym_counts.index),
+        "dso": set(trace["dso"].unique()),
+        "cache_level": set(trace["cache_level"].dropna().unique()),
     })
     frames: list = []
     done = 0
     next_progress = _PROGRESS_EVERY_ROWS
-    for chunk in _stream():
-        labelled_rows = list(labeller.label(chunk))
-        chunk.clear()
+    for chunk in _chunks(trace, chunk_rows):
+        labelled_rows = list(labeller.label(chunk.to_dict("records")))
         frames.append(_frame_from_chunk(labelled_rows, dtypes))
         done += len(labelled_rows)
         labelled_rows.clear()
         if done >= next_progress:
             print(f"  {done:,} rows ...", end="\r", flush=True)
             next_progress += _PROGRESS_EVERY_ROWS
+    del trace
 
     labelled = pd.concat(frames, ignore_index=True)
     frames.clear()
@@ -1279,6 +1344,10 @@ def main():
         run_headless(args)
         return
 
+    if args.warmup_only:
+        run_warmup_only(args)
+        return
+
     model_path, events = _preflight(args)
     model_id = resolve_model_id(args, model_path)
     mslug = args.machine or machine_slug()
@@ -1320,6 +1389,7 @@ def main():
         granularity=args.region_granularity,
         chunk_rows=args.chunk_rows,
         sample_period=args.sample_period,
+        parse_workers=args.parse_workers,
     )
 
     analysis = compute_all(labelled)

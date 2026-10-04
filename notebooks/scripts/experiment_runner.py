@@ -557,7 +557,7 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             # CPU_MODELS is the authoritative parameter count; without this the
             # run infers it from the filename.
             "--params-b", str(spec.params_b),
-        ]
+        ] + (["--warmup-only"] if spec.is_warmup else [])
     else:  # gpu
         return [
             PYTHON,
@@ -1242,8 +1242,13 @@ def _run_loop(all_specs: List[RunSpec], state: Dict,
             if result.run_validity != "clean":
                 for reason in result.validity_reasons:
                     log(f"     reason: {reason}")
-            _calibrate_from_run(spec, result, log)
-            _audit_completed_run(result, log)
+            if spec.is_warmup:
+                # A warmup writes no artifacts, so there is nothing to audit or
+                # calibrate from.
+                log("     warmup: page cache warmed, no artifacts written")
+            else:
+                _calibrate_from_run(spec, result, log)
+                _audit_completed_run(result, log)
         else:
             log(f"   FAILED: {result.error}")
 

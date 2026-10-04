@@ -250,12 +250,57 @@ def _build_row(run_id: str, sample_id: int, phase_boundaries, parsed: tuple) -> 
     }
 
 
-def _iter_source(source: Union[str, Path, IO]) -> Generator[str, None, None]:
+def _iter_source(source: Union[str, Path, IO],
+                 byte_range=None) -> Generator[str, None, None]:
+    """
+    Yield lines from *source*, optionally only those within a byte range.
+
+    A byte range lets several workers parse disjoint parts of one perf script
+    file concurrently.  The caller is responsible for choosing line-aligned
+    bounds (see line_aligned_ranges); a range starting mid-line would drop or
+    duplicate that line.
+    """
     if hasattr(source, "read"):
         yield from source
-    else:
+        return
+    if byte_range is None:
         with open(source, "r", encoding="utf-8", errors="replace") as fh:
             yield from fh
+        return
+
+    start, end = byte_range
+    with open(source, "r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(start)
+        while fh.tell() < end:
+            line = fh.readline()
+            if not line:
+                break
+            yield line
+
+
+def line_aligned_ranges(path, workers: int) -> "list":
+    """
+    Split a file into *workers* byte ranges that each begin on a line boundary.
+
+    Returns [(start, end), ...] covering the whole file with no overlap, so the
+    union of the parsed ranges is exactly the set of lines in the file.
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    if workers <= 1 or size == 0:
+        return [(0, size)]
+
+    step = size // workers
+    bounds = [0]
+    with open(path, "rb") as fh:
+        for i in range(1, workers):
+            fh.seek(i * step)
+            fh.readline()          # discard the partial line
+            position = fh.tell()
+            if position > bounds[-1]:
+                bounds.append(position)
+    bounds.append(size)
+    return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -264,6 +309,7 @@ def parse_perf_script(
     source: Union[str, Path, IO],
     run_id: str,
     phase_boundaries: Optional[List[dict]] = None,
+    byte_range=None,
 ) -> Generator[dict, None, None]:
     """
     Stream-parse perf script output, yielding one canonical row dict per sample.
@@ -275,13 +321,16 @@ def parse_perf_script(
         source: file path, Path, or readable IO (supports StringIO)
         run_id: written into every yielded row
         phase_boundaries: optional [{phase, start_ns, end_ns}]
+        byte_range: optional (start, end) to parse only part of a file, for
+            parallel parsing.  sample_id restarts at 0 in each range, so the
+            caller must renumber after concatenating in file order.
     """
     sample_id = 0
     total_lines = 0
     skipped_lines = 0
     first_skipped: list = []
 
-    for line in _iter_source(source):
+    for line in _iter_source(source, byte_range):
         total_lines += 1
         parsed = _parse_line(line)
         if parsed is None:
