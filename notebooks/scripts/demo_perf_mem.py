@@ -66,6 +66,17 @@ from mrm_trace.collector.kv_allocation import (
     interposer_env,
     kv_regions_from_alloc_log,
 )
+from mrm_trace.collector.perf_events import (
+    DEFAULT_LDLAT as _DEFAULT_LDLAT,
+    DEFAULT_STORE_MULTIPLIER as _STORE_PERIOD_MULTIPLIER,
+    SAMPLE_RATE_FLOOR as _SAMPLE_RATE_FLOOR,
+    build_perf_events,
+    collector_provenance,
+    max_sample_rate as _perf_max_sample_rate,
+    perf_event_paranoid as _perf_event_paranoid,
+    probe_perf_events,
+    record_command,
+)
 from mrm_trace.collector.perf_runner import PerfMemRunner, clock_args
 from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.config.schema import EngineType, ModelConfig, RunConfig
@@ -131,6 +142,9 @@ def parse_args():
     p.add_argument("--tokens", type=int, default=128, help="Max output tokens per prompt")
     p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
     p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
+    p.add_argument("--params-b", dest="params_b", type=float, default=None,
+                   help="model size in billions of parameters, recorded in "
+                        "metadata.json (default: inferred from the filename)")
     p.add_argument("--out", default="results", help="Output base directory")
     p.add_argument(
         "--machine", default=None,
@@ -190,25 +204,6 @@ def parse_args():
 #
 # This is machine context (Layer 3): it changes what a sample count means, so
 # it is read before and after every collection and recorded in metadata.json.
-_SAMPLE_RATE_FLOOR = 50_000   # below this, warn before starting
-
-
-def _perf_max_sample_rate():
-    """Current kernel.perf_event_max_sample_rate, or None if unreadable."""
-    try:
-        return int(pathlib.Path(
-            "/proc/sys/kernel/perf_event_max_sample_rate").read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _perf_event_paranoid():
-    """Current kernel.perf_event_paranoid, or None if it cannot be read."""
-    try:
-        return int(pathlib.Path("/proc/sys/kernel/perf_event_paranoid").read_text().strip())
-    except (OSError, ValueError):
-        return None
-
 
 def check_pmu():
     """Verify the PMU events perf mem uses are available on this machine."""
@@ -233,6 +228,30 @@ def check_pmu():
     return True, "ok"
 
 
+# Parameter counts keyed by a substring of the model filename.  Hardcoding 1.1
+# here meant every run in a sweep recorded params_billions=1.1 regardless of
+# model, so model-size scaling could not be derived from the dataset at all.
+_PARAMS_BY_NAME = (
+    ("tinyllama", 1.1), ("0.5b", 0.5), ("1.5b", 1.5), ("1b", 1.0),
+    ("3.8b", 3.8), ("3b", 3.0), ("7b", 7.0), ("8b", 8.0), ("13b", 13.0),
+    ("mini", 3.8), ("small", 7.0), ("medium", 14.0),
+)
+
+
+def params_billions_from_name(model_path: pathlib.Path) -> float:
+    """
+    Parameter count in billions, inferred from the model filename.
+
+    Returns 0.0 when it cannot be determined, which is honest and visible,
+    unlike a wrong constant.
+    """
+    name = model_path.name.lower()
+    for needle, value in _PARAMS_BY_NAME:
+        if needle in name:
+            return value
+    return 0.0
+
+
 def resolve_model_id(args, model_path: pathlib.Path) -> str:
     """
     Resolve the model_id used for the results/<model_id>/ directory and metadata.json.
@@ -249,13 +268,23 @@ def resolve_model_id(args, model_path: pathlib.Path) -> str:
     return f"{slug}-perf"
 
 
-def build_model_cfg(model_path, model_id: str) -> ModelConfig:
+def build_model_cfg(model_path, model_id: str,
+                    params_billions: float = None) -> ModelConfig:
+    """
+    ModelConfig for this run.
+
+    params_billions must be supplied or inferred — it was hardcoded to 1.1,
+    which made every run in a sweep report the same model size and left
+    model-size scaling underivable from the dataset.
+    """
     return ModelConfig(
         id=model_id,
         engine=EngineType.LLAMACPP,
         path=str(model_path),
         family="llama",
-        params_billions=1.1,
+        params_billions=(params_billions
+                         if params_billions is not None
+                         else params_billions_from_name(model_path)),
         quantisation="Q4_K_M",
         dtype="float16",
     )
@@ -319,13 +348,31 @@ def _hardware_section(baseline, cpu_freq_stats, cpu_freq_limits=None) -> dict:
     }
 
 
-def _achieved_rate_per_cpu(samples_collected, thermal_meta):
-    """Samples per second per CPU actually achieved, or None if unknown."""
-    duration = (thermal_meta or {}).get("collection_wall_duration_s")
-    cpus = os.cpu_count() or 1
-    if not samples_collected or not duration:
-        return None
-    return round(samples_collected / duration / cpus, 1)
+def finalise_address_regions(regions: list, kv_regions: list) -> list:
+    """
+    Resolve the region list once, after every snapshot has been collected.
+
+    Two things have to happen *after* the last snapshot, not after the first:
+
+      - Drop the `anon_kv_sized` guess when an exact `kv_allocation` exists.
+        Applying this to the first extraction only was a live bug: the second
+        snapshot (taken after the first generation, to catch the ggml thread
+        stacks) re-appended the guess, so 9 of 45 runs in one sweep labelled a
+        262.7 MB ggml arena `kv_cache` alongside the real allocation.
+      - Deduplicate.  The snapshots overlap almost entirely, so without this
+        every mapping is registered twice.
+    """
+    exact_kv = any(r.get("source") == "kv_allocation" for r in (kv_regions or []))
+    merged, seen = [], set()
+    for region in list(regions) + list(kv_regions or []):
+        if exact_kv and region.get("source") == "anon_kv_sized":
+            continue
+        key = (region["addr_start"], region["addr_end"], region.get("source"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(region)
+    return merged
 
 
 def _thermal_section(thermal_meta, baseline, observer_effect,
@@ -391,27 +438,19 @@ def build_metadata(
             # sample_period and event_strings are the acquisition parameters:
             # a sample count means nothing without the period it was taken at,
             # and the data card (workplan §12.2) has to state both.
-            "sample_period": collector_meta.sample_period,
-            "event_strings": collector_meta.event_strings,
-            "region_granularity_bytes": region_granularity,
-            # What the kernel actually allowed.  A sample count is
-            # uninterpretable without it: the kernel self-lowers this cap under
-            # dense sampling and the reduction persists for the boot, so two
-            # runs with identical periods can differ by an order of magnitude.
-            "perf_event_max_sample_rate_before": (
-                (machine_ctx or {}).get("perf_event_max_sample_rate_before")),
-            "perf_event_max_sample_rate_after": (
-                (machine_ctx or {}).get("perf_event_max_sample_rate_after")),
-            # Achieved per-CPU sampling rate.  Without it a cap reduction
-            # cannot be told apart from a cap reduction that clipped the
-            # trace — measured, the cap fell 100,000 -> 76,000 while the run
-            # sampled at 5,049/s/CPU, 6.6% of the cap.
-            "samples_collected": samples_collected,
-            "collection_duration_s": (thermal_meta or {}).get(
-                "collection_wall_duration_s"),
-            "cpu_count": os.cpu_count(),
-            "achieved_sample_rate_per_cpu": _achieved_rate_per_cpu(
-                samples_collected, thermal_meta),
+            # Acquisition parameters, from the shared builder so this script and
+            # demo_qwen_hf.py record the same fields.
+            **collector_provenance(
+                sample_period=collector_meta.sample_period,
+                events=collector_meta.event_strings,
+                region_granularity=region_granularity,
+                samples=samples_collected,
+                duration_s=(thermal_meta or {}).get("collection_wall_duration_s"),
+                rate_before=(machine_ctx or {}).get(
+                    "perf_event_max_sample_rate_before"),
+                rate_after=(machine_ctx or {}).get(
+                    "perf_event_max_sample_rate_after"),
+            ),
             "output_file": collector_meta.output_file,
             "output_file_size_bytes": collector_meta.output_file_size_bytes,
             "parse_success": collector_meta.parse_success,
@@ -669,7 +708,7 @@ def run_headless(args) -> None:
 
     model_path = pathlib.Path(args.model)
     model_id = resolve_model_id(args, model_path)
-    model_cfg = build_model_cfg(model_path, model_id)
+    model_cfg = build_model_cfg(model_path, model_id, args.params_b)
     run_id = generate_run_id(
         model_id=model_cfg.id, context_length=args.ctx,
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
@@ -701,10 +740,8 @@ def run_headless(args) -> None:
     kv_regions = kv_regions_from_alloc_log(
         os.environ.get("MRM_ALLOC_LOG"), kv_bytes, pid=os.getpid(),
     )
-    if kv_regions:
-        # An exact allocation match supersedes any size-matched mapping guess.
-        address_regions = [r for r in address_regions
-                           if r.get("source") != "anon_kv_sized"] + kv_regions
+    # The regions are resolved once, after the second snapshot below — see
+    # finalise_address_regions().
     print("Model loaded.")
     if kv_bytes:
         print(f"  Expected KV cache from model geometry: {kv_bytes / 1e6:.1f} MB")
@@ -745,6 +782,8 @@ def run_headless(args) -> None:
             address_regions += extract_llamacpp_regions(
                 str(model_path), pre_load_maps, expected_kv=kv_bytes,
             )
+
+    address_regions = finalise_address_regions(address_regions, kv_regions)
 
     # Capture peak RSS before shutdown while model weights are still in RAM.
     # Use getrusage (historical maximum) so the value is correct regardless of
@@ -823,57 +862,9 @@ def _preflight(args) -> "tuple[pathlib.Path, list | None]":
     return model_path, ["mem:0:rw:p"]
 
 
-# ── Event configuration (load-dense sampling) ────────────────────────────────
-#
-# `perf mem record -c N` applies one period to both events, and perf samples
-# stores at that period while sampling loads only above the PEBS latency
-# threshold.  The result is ~99.8% stores — and the weight region is read-only
-# (the GGUF file is mapped r--s), so no store can ever land in it.  Measured on
-# a real run: 114 of 28,321,245 samples were inside the weight mapping.
-#
-# Separate per-event periods invert that.  Measured on the same workload with
-# ldlat=3 and a 500x coarser store period: 90% loads, and 6,992 samples inside
-# the weight mapping across 3,941 granules — 61x more weight data from a
-# 12-second probe.
-#
-# `-d` is mandatory: it requests PERF_SAMPLE_ADDR.  Without it `perf script`
-# reports "do not have ADDR attribute set" and emits nothing at all, which is
-# how the first attempt at this silently produced an empty trace.
-_DEFAULT_LDLAT = 3
-_STORE_PERIOD_MULTIPLIER = 500
-
-
-def build_perf_events(load_period: int, ldlat: int,
-                      store_multiplier: int = _STORE_PERIOD_MULTIPLIER) -> "list[str]":
-    """Load and store event specs with independent periods."""
-    return [
-        f"cpu/mem-loads,ldlat={ldlat},period={load_period}/P",
-        f"cpu/mem-stores,period={load_period * store_multiplier}/P",
-    ]
-
-
-def probe_perf_events(events: "list[str]") -> "tuple[bool, str]":
-    """
-    Check that this kernel accepts the event specs before a long run.
-
-    The ldlat and period term syntax varies across kernel versions, so a
-    failure here is expected on some hosts and falls back to `perf mem record`.
-    """
-    perf_bin = shutil.which("perf")
-    if not perf_bin:
-        return False, "perf binary not found"
-    cmd = [perf_bin, "record", "-d", "--weight"]
-    for ev in events:
-        cmd += ["-e", ev]
-    cmd += ["-o", "/dev/null", "--", "true"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"probe failed to run: {exc}"
-    if result.returncode != 0:
-        return False, result.stderr.decode(errors="replace").strip()[:200]
-    return True, "ok"
-
+# Event configuration lives in mrm_trace.collector.perf_events so this script
+# and demo_qwen_hf.py cannot drift apart again — they did, and the GPU runs
+# ended up with no sampling period, no events and no granularity recorded.
 
 _TEMP_POLL_INTERVAL_S = 2.0
 
@@ -937,7 +928,7 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
         # -d sets PERF_SAMPLE_ADDR; --weight carries the load latency.  The
         # events themselves are appended by the shared loop below.
         events = mem_events
-        perf_cmd = [perf_bin, "record", "-d", "--weight", "-o", str(perf_data)]
+        perf_cmd = record_command(perf_bin, [], str(perf_data))
         print(f"  Events        : {' '.join(events)}")
     else:
         # Keep whatever _preflight() selected and fall back to perf mem record.
@@ -1317,7 +1308,7 @@ def main():
     print()
 
     run_start_time = time.time()
-    model_cfg = build_model_cfg(model_path, model_id)
+    model_cfg = build_model_cfg(model_path, model_id, args.params_b)
     (
         runtime_metadata, gen_results, phase_boundaries, collector_meta,
         thermal_meta, address_regions, baseline, cpu_freq_limits, cpu_freq_stats, gpu_stats, observer_effect,

@@ -24,8 +24,16 @@ MIN_STACK_BYTES = 64 * 1024
 MAX_STACK_BYTES = 64 * 1024 * 1024
 
 # Refuse to page-expand absurdly large reservations (some runtimes reserve TB of
-# PROT_NONE address space).  4 GiB = 1M pages is far above any real model buffer.
-MAX_REGION_PAGES = 1 << 20
+# PROT_NONE address space).
+#
+# 1 << 20 pages (4 GiB) was too low: a Q4_K_M GGUF for a 7B model is 1,067,581
+# pages and an 8B is 1,201,352, so the weight mapping was silently skipped and
+# those runs produced no `weight` region at all — 18 of 45 runs in one sweep,
+# with nothing in the output to show it.  1 << 22 (16 GiB) covers any quantised
+# model file this instrument targets while still refusing a TB-scale
+# reservation.  The cost is the page-expansion dict: ~100 bytes per page, so
+# 120 MB for an 8B model's mapping.
+MAX_REGION_PAGES = 1 << 22
 
 KERNEL_PATHS = frozenset({"[vvar]", "[vdso]", "[vsyscall]", "[vvar_vclock]"})
 

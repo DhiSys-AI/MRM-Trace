@@ -385,7 +385,10 @@ GPU_MODELS = [
 ]
 
 GPU_CONTEXT_LENGTHS = [2048, 8192]
-GPU_BATCH_SIZES = [1, 4]
+# Not a dimension here either: demo_qwen_hf.py generates prompts in a
+# sequential loop and batch_size reaches metadata and the run_id only.  Eight of
+# sixteen GPU runs in one sweep were exact duplicates of the other eight.
+GPU_BATCH_SIZES = [1]
 GPU_REPS = [0, 1]
 
 # Fast validation matrix (--fast flag): 1 run only
@@ -551,6 +554,9 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             "--sample-period", str(spec.sample_period),
             "--region-granularity", str(spec.region_granularity),
             "--num-prompts", str(PROMPTS_PER_RUN),
+            # CPU_MODELS is the authoritative parameter count; without this the
+            # run infers it from the filename.
+            "--params-b", str(spec.params_b),
         ]
     else:  # gpu
         return [
@@ -564,6 +570,7 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             "--machine", machine,
             "--collector", "auto",
             "--out", str(RESULTS_DIR),
+            "--num-prompts", str(PROMPTS_PER_RUN),
         ]
 
 
@@ -1051,7 +1058,34 @@ def _init_state(args, all_specs: List[RunSpec], log) -> Dict:
                 log(f"  Reset failed run: {key}")
         _save_state(state)
 
+    _requeue_vanished(state, log)
     return state
+
+
+def _requeue_vanished(state: Dict, log) -> None:
+    """
+    Re-queue runs marked done whose output directory no longer exists.
+
+    `done` has to mean the artifacts are there.  Deleting a model's results to
+    re-collect it and then starting the runner silently did nothing, because
+    the state still said done and --retry-failed only resets failures — 18 runs
+    were deleted and none were re-collected, with "All runs complete!" printed.
+    """
+    gone = [
+        key for key, entry in state.get("runs", {}).items()
+        if entry.get("status") == "done" and entry.get("output_dir")
+        and not pathlib.Path(entry["output_dir"]).exists()
+    ]
+    if not gone:
+        return
+    for key in gone:
+        del state["runs"][key]
+    _save_state(state)
+    log(f"  {len(gone)} run(s) marked done have no output directory — re-queued:")
+    for key in gone[:6]:
+        log(f"    {key}")
+    if len(gone) > 6:
+        log(f"    ... and {len(gone) - 6} more")
 
 
 def _verify_model_files(all_specs: List[RunSpec], models_dir: pathlib.Path) -> None:

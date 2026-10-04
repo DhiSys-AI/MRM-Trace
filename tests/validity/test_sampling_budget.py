@@ -508,3 +508,27 @@ def test_the_cpu_sweep_fits_a_day(runner):
         tok_per_s = next(t for m, _, _, t in runner.CPU_MODELS if m == spec.model_id)
         total_s += runner.estimate_run_seconds(tok_per_s, spec.ctx) + post_s + 90
     assert total_s / 3600 < 22, f"CPU sweep projects {total_s / 3600:.1f} h"
+
+
+def test_a_done_run_with_no_output_directory_is_requeued(runner, tmp_path,
+                                                         monkeypatch):
+    """
+    `done` must mean the artifacts exist.  Deleting a model's results to
+    re-collect it and then starting the runner silently did nothing: the state
+    still said done, --retry-failed only resets failures, and the runner printed
+    "All runs complete!" after 18 runs had been deleted.
+    """
+    present = tmp_path / "present"
+    present.mkdir()
+    state = {"version": 1, "runs": {
+        "kept__cpu": {"status": "done", "output_dir": str(present)},
+        "vanished__cpu": {"status": "done", "output_dir": str(tmp_path / "gone")},
+        "failed__cpu": {"status": "failed", "output_dir": str(tmp_path / "x")},
+    }}
+    monkeypatch.setattr(runner, "_save_state", lambda s: None)
+
+    runner._requeue_vanished(state, lambda *_: None)
+
+    assert "vanished__cpu" not in state["runs"]      # re-queued
+    assert "kept__cpu" in state["runs"]              # artifacts present
+    assert "failed__cpu" in state["runs"]            # untouched here

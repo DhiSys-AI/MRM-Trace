@@ -36,6 +36,16 @@ import time
 import pandas as pd
 
 from mrm_trace.analyser import compute_all
+from mrm_trace.collector.perf_events import (
+    DEFAULT_LDLAT,
+    DEFAULT_STORE_MULTIPLIER,
+    achieved_rate_per_cpu,
+    build_perf_events,
+    collector_provenance,
+    max_sample_rate,
+    probe_perf_events,
+    record_command,
+)
 from mrm_trace.collector.process_monitor import ProcessMonitor
 from mrm_trace.labeller import TraceLabeller
 from mrm_trace.labeller.proc_maps import summarise_regions
@@ -112,7 +122,13 @@ def parse_args():
     p.add_argument("--model", default=DEFAULT_MODEL_HF)
     p.add_argument("--ctx", type=int, default=2048)
     p.add_argument("--tokens", type=int, default=256)
-    p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of prompts in batch")
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=1,
+                   help="recorded in metadata only — generation is sequential, "
+                        "so this does not batch anything (see the generation loop)")
+    p.add_argument("--num-prompts", dest="num_prompts", type=int, default=None,
+                   help="limit to the first N prompts (default: all). Run length "
+                        "is linear in this, and each prompt is an independent KV "
+                        "lifecycle because the model is re-primed per prompt.")
     p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
     p.add_argument("--out", default="results")
     p.add_argument(
@@ -123,7 +139,15 @@ def parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--collector", choices=["auto", "memray", "perf-mem"], default="auto")
     p.add_argument("--sample-every-n", dest="sample_every_n", type=int, default=25)
-    p.add_argument("--sample-period", dest="sample_period", type=int, default=4000)
+    p.add_argument("--sample-period", dest="sample_period", type=int, default=4000,
+                   help="load sampling period (mrm_trace.collector.perf_events)")
+    p.add_argument("--ldlat", type=int, default=DEFAULT_LDLAT,
+                   help=f"PEBS load-latency threshold in cycles (default {DEFAULT_LDLAT})")
+    p.add_argument("--store-multiplier", dest="store_multiplier", type=int,
+                   default=DEFAULT_STORE_MULTIPLIER,
+                   help="store period = --sample-period x this")
+    p.add_argument("--region-granularity", dest="region_granularity", type=int,
+                   default=65536, help="bytes per region for retention analysis")
     # Internal flag used when perf spawns this script as the traced workload
     p.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--results-file", dest="results_file", default=None, help=argparse.SUPPRESS)
@@ -187,11 +211,13 @@ def _mono_ns() -> int:
     return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 
-def run_generation(model, tokenizer, max_new_tokens: int) -> "tuple[list, int, int]":
+def run_generation(model, tokenizer, max_new_tokens: int,
+                   num_prompts: int = None) -> "tuple[list, int, int]":
     gen_results = []
     gen_start_ns = _mono_ns()
-    for i, prompt in enumerate(PROMPTS, 1):
-        print(f"  [{i}/{len(PROMPTS)}] {prompt[:60]}...")
+    prompts = PROMPTS[:num_prompts] if num_prompts else PROMPTS
+    for i, prompt in enumerate(prompts, 1):
+        print(f"  [{i}/{len(prompts)}] {prompt[:60]}...")
         print("          generating", end="", flush=True)
         text, prompt_tokens, output_tokens, duration = generate_one(model, tokenizer, prompt, max_new_tokens)
         gen_results.append({
@@ -244,7 +270,7 @@ def run_headless(args) -> None:
     # created by DynamicCache.update (including intermediate torch.cat results)
     # is captured with a timestamp.
     install_transformers_kv_monitor()
-    gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens)
+    gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens, args.num_prompts)
     kv_ranges = collect_kv_ranges()
     uninstall_transformers_kv_monitor()
 
@@ -308,8 +334,23 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     ]
     # -k CLOCK_MONOTONIC puts sample timestamps in the same domain as _mono_ns().
     from mrm_trace.collector.perf_runner import clock_args
-    perf_cmd = ([perf, "mem", "record", "-o", str(perf_data)]
-                + clock_args(perf) + ["--"] + inner_cmd)
+
+    # The same load-dense configuration the CPU path uses, from the shared
+    # module.  This script previously ran `perf mem record` with no period and
+    # no events, so its runs recorded no acquisition parameters at all.
+    perf_events = build_perf_events(args.sample_period, args.ldlat,
+                                    args.store_multiplier)
+    probe_ok, probe_msg = probe_perf_events(perf_events)
+    if probe_ok:
+        perf_cmd = (record_command(perf, perf_events, str(perf_data))
+                    + clock_args(perf) + ["--"] + inner_cmd)
+    else:
+        print(f"  WARNING: per-event periods rejected by this kernel "
+              f"({probe_msg}); falling back to `perf mem record`.", file=sys.stderr)
+        perf_events = []
+        perf_cmd = ([perf, "mem", "record", "-c", str(args.sample_period),
+                     "-o", str(perf_data)]
+                    + clock_args(perf) + ["--"] + inner_cmd)
 
     print("Launching perf mem record (spawn mode) ...")
     print("  perf will instrument the full process: model load → generation")
@@ -320,6 +361,8 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     baseline = capture_baseline(duration_s=2.0)
     cpu_freq_mon = CpuFreqMonitor()
     gpu_mon = GpuMonitor()
+    sample_rate_before = max_sample_rate()
+    collection_start = time.time()
     start_temp_c = read_package_temp_c()
     thermal_monitor = ThermalMonitor()
     thermal_monitor.begin()
@@ -334,6 +377,8 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     gpu_stats = gpu_mon.stop()
     peak_temp_c = read_package_temp_c()
     throttle_events = thermal_monitor.end()
+    sample_rate_after = max_sample_rate()
+    collection_duration_s = round(time.time() - collection_start, 3)
     thermal_meta = {
         "start_temp_c": round(start_temp_c, 1),
         "peak_temp_c": round(peak_temp_c, 1),
@@ -370,9 +415,23 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         print("ERROR: perf script failed.", file=sys.stderr)
         sys.exit(1)
 
+    # The acquisition parameters, not just the output file.  Omitting these was
+    # a real gap: 16 GPU runs in one sweep recorded no sampling period, no event
+    # strings and no granularity, which makes their sample counts and retention
+    # figures uninterpretable after the fact.
+    # samples_collected is filled in below, once the trace has been labelled.
     collector_info = {
         "type": "perf_mem",
         "mode": "spawn",
+        **collector_provenance(
+            sample_period=args.sample_period,
+            events=perf_events,
+            region_granularity=args.region_granularity,
+            samples=None,
+            duration_s=collection_duration_s,
+            rate_before=sample_rate_before,
+            rate_after=sample_rate_after,
+        ),
         "output_file": str(perf_data),
         "output_file_size_bytes": perf_data.stat().st_size,
         "parse_success": True,
@@ -438,6 +497,9 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     print(f"  Symbol evidence upgraded {n_sym:,} granules")
 
     labelled = pd.DataFrame(list(labeller.label(rows_list))) if rows_list else pd.DataFrame()
+    collector_info["samples_collected"] = len(labelled)
+    collector_info["achieved_sample_rate_per_cpu"] = achieved_rate_per_cpu(
+        len(labelled), collector_info.get("collection_duration_s"))
     region_map = pd.DataFrame(labeller.region_map())
     kv_lifecycle = pd.DataFrame(labeller.kv_lifecycle())
     print(f"  {len(labelled):,} labelled records")
@@ -508,7 +570,7 @@ def collect_with_memray(model, tokenizer, args, raw_dir: pathlib.Path, run_id: s
     gpu_mon.start()
     self_mon.start()
 
-    gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens)
+    gen_results, gen_start_ns, gen_end_ns = run_generation(model, tokenizer, args.tokens, args.num_prompts)
     phase_boundaries.append({"phase": "generation", "start_ns": gen_start_ns, "end_ns": gen_end_ns})
     del model, tokenizer
 

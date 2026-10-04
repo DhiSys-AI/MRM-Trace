@@ -52,15 +52,37 @@ _VALID_POLICIES = frozenset({"keep", "skip", "error"})
 # ── Evidence strength ─────────────────────────────────────────────────────────
 # Higher wins.  Ties resolve in favour of the already-recorded classification, so
 # labelling stays stable and order-independent for equally-strong evidence.
-# Evidence strength.  Address ranges outrank symbols, always: a range says
-# where an address *is*, a symbol only says what code was running when it was
-# sampled.  EV_SYMBOL_KV used to sit above EV_MAPS_KV, which let a single
-# llama_kv* sample override the address map and claim a whole granule — one
-# such granule in the main stack absorbed 279,186 unrelated accesses.
-EV_MAPS_COARSE = 1   # address is inside some mapping (runtime, heap, stack, lib)
-EV_SYMBOL = 2        # a symbol rule matched — the weakest kind of evidence
-EV_MAPS_KV = 3       # the engine's own KV allocation, captured at malloc time
+# Evidence strength.  A range says where an address *is*; a symbol only says
+# what code was running when it was sampled, so a symbol may never override a
+# mapping that identifies the memory precisely.
+#
+# EV_SYMBOL_KV once sat above EV_MAPS_KV, which let a single llama_kv* sample
+# override the address map and claim a whole granule — one such granule in the
+# main stack absorbed 279,186 unrelated accesses.
+#
+# The arena/precise split matters just as much.  A thread stack, the heap, a
+# shared library and a malloc arena are identified exactly by their mapping, so
+# a compute-kernel store landing in one does not make that granule an
+# activation buffer.  A ggml backend arena is different: it is a bag that
+# genuinely holds the activation buffers, so a symbol there is a refinement.
+# With both at the same strength, `activation` stole stack and heap granules
+# from `runtime` and the split swung 10.7x across identical repetitions, while
+# the two address-grounded regions held to 1.1-1.2x.
+EV_MAPS_ARENA = 1    # inside an engine arena — a bag; a symbol may refine it
+EV_SYMBOL = 2        # a symbol rule matched
+EV_MAPS_PRECISE = 3  # stack, heap, library, malloc arena — identified exactly
+EV_MAPS_KV = 4       # the engine's own KV allocation, captured at malloc time
 EV_MAPS_WEIGHT = 5   # address is inside the mmap'd GGUF file — unambiguous
+
+# Back-compat alias: callers passing bare region dicts get arena strength.
+EV_MAPS_COARSE = EV_MAPS_ARENA
+
+# Sources whose mapping identifies the memory precisely enough that a symbol
+# must not override it.
+_PRECISE_SOURCES = frozenset({
+    "thread_stack", "main_stack", "heap", "malloc_arena", "file_mapping",
+    "kernel_map", "special_map", "anon_noaccess", "anon_ro",
+})
 
 _SOURCE_EVIDENCE = {
     "mmap_gguf": EV_MAPS_WEIGHT,
@@ -73,6 +95,8 @@ def _range_evidence(region_type: str, source: Optional[str]) -> int:
     """Evidence strength for one pre-registered address range."""
     if source in _SOURCE_EVIDENCE:
         return _SOURCE_EVIDENCE[source]
+    if source in _PRECISE_SOURCES:
+        return EV_MAPS_PRECISE
     # Unsourced ranges (callers that pass bare region dicts) are trusted by type.
     if region_type == _WEIGHT:
         return EV_MAPS_WEIGHT
