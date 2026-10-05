@@ -141,9 +141,12 @@ and the run fails if either survives anywhere. What is included and why:
 `context-files/06 - Kaggle Dataset Selection.md`.
 
 ```bash
-venv/bin/python notebooks/scripts/prepare_kaggle_dataset.py \
-  --kaggle-id <kaggle-user>/mrm-trace-llm-inference --force
-kaggle datasets create -p datasets/mrm-trace-kaggle --dir-mode zip
+set -a; . ./.env; set +a; export KAGGLE_API_TOKEN="$KAGGLE_TOKEN"
+venv/bin/python notebooks/scripts/prepare_kaggle_dataset.py --force
+# -t keeps trace.parquet as Parquet; without it Kaggle converts it to CSV
+venv/bin/kaggle datasets version -p datasets/mrm-trace-kaggle -t -m "<notes>"
+venv/bin/kaggle datasets metadata --update -p datasets/mrm-trace-kaggle \
+  "$KAGGLE_USERNAME/mrm-trace-llm-memory-access-traces"
 ```
 
 ## Tips

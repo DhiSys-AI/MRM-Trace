@@ -524,16 +524,20 @@ def make_figures(contrast: pd.DataFrame, ctx_scaling: pd.DataFrame,
     fig.savefig(out_dir / "retention_by_region.png", dpi=150)
     plt.close(fig)
 
+    # section_context_scaling keys the table on whichever axis the sweep
+    # varied: ctx for a context sweep, output_tokens for an occupancy sweep.
+    axis = "ctx" if "ctx" in ctx_scaling.columns else "output_tokens"
+    label = "context length" if axis == "ctx" else "output tokens"
     fig, ax = plt.subplots(figsize=(7, 4))
     for region, g in ctx_scaling.groupby("region_type"):
-        ax.plot(g["ctx"], g["retention_p50_s"], marker="o", label=region)
+        ax.plot(g[axis], g["retention_p50_s"], marker="o", label=region)
     ax.set_xscale("log", base=2)
-    ax.set_xlabel("context length")
+    ax.set_xlabel(label)
     ax.set_ylabel("retention p50 (s)")
-    ax.set_title("Retention vs context length")
+    ax.set_title(f"Retention vs {label}")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "retention_vs_context.png", dpi=150)
+    fig.savefig(out_dir / f"retention_vs_{axis}.png", dpi=150)
     plt.close(fig)
     print(f"\n  figures written to {out_dir}")
 

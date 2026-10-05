@@ -414,7 +414,36 @@ to yield a gap, so the addresses that qualify are the most frequently touched
 ones and the measured gaps are biased *short* — conservative for `weight` and
 `kv_cache`, which is the safe direction.
 
-**The absolute values are not calibrated.** A measured gap is between
+### The separation is real in direction; the magnitudes for weight and KV are not
+
+An interval is only resolved if it is well below the trivial baseline of "the
+run split among however many samples landed on that address" — `D/(n+1)` for a
+region with `n` intervals over a run of duration `D`. Measured across all 30
+runs:
+
+| region | intervals (median) | gap / baseline |
+|---|---|---|
+| `runtime` | 6.5M - 8.7M | **~1,400x** — resolved |
+| `weight` | 14 - 37 | 5 - 12x |
+| `kv_cache` | 4 - 14 | **0.9 - 3x** — at the floor |
+
+So `runtime`'s gap is a measurement. `weight` and `kv_cache` gaps are **lower
+bounds**, and `kv_cache` at the lowest occupancy sits on the floor outright
+(0.2x of baseline on 2 samples). `check_iai_resolution` in
+`results_validation.py` now reports this per cell and region; 23 of 45 pairs
+fall inside 10x of their floor, and `runtime` is never among them.
+
+**What survives:** per-address access frequency differs between the heap/runtime
+region and the weight/KV regions by about three orders of magnitude, in every
+model at every occupancy level (weight/runtime 1,126-1,956x, kv/runtime
+1,035-1,385x). That is an MRM-relevant result and it is robust, because the
+sparse side is a lower bound and the dense side is well resolved — both biases
+push toward *understating* the separation.
+
+**What does not survive:** any particular number of seconds for the weight or KV
+gap.
+
+**And the absolute scale is not calibrated either.** A measured gap is between
 consecutive *samples*, not accesses, so 1-in-P sampling inflates it by roughly
 P. That cancels in a ratio between regions but not in an absolute figure:
 dividing by P gives an estimated 15 ms between weight accesses where the

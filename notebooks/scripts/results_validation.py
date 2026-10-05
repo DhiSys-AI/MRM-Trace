@@ -109,6 +109,12 @@ _MIN_SAMPLES_PER_REGION = 2.0
 # a statement about a minority, and must be labelled as one.
 _MIN_SUPPORT_FRAC = 0.5
 
+# An inter-access interval is only resolved if it is well below the trivial
+# baseline of "the run split among however many samples landed on that address".
+# Measured: runtime clears the baseline by ~1,400x, weight by 5-12x, and
+# kv_cache at the lowest occupancy by 0.9x -- i.e. not at all.
+_MIN_IAI_RESOLUTION = 10.0
+
 
 class Report:
     """Accumulates check results and prints them as one report."""
@@ -172,6 +178,7 @@ def load_runs(results_dir: pathlib.Path) -> pd.DataFrame:
             "granularity": coll.get("region_granularity_bytes"),
             "events": ",".join(coll.get("event_strings") or []),
             "samples": coll.get("samples_collected"),
+            "collection_duration_s": coll.get("collection_duration_s"),
             "achieved_rate": coll.get("achieved_sample_rate_per_cpu"),
             "cap_before": coll.get("perf_event_max_sample_rate_before"),
             "cap_after": coll.get("perf_event_max_sample_rate_after"),
@@ -638,6 +645,64 @@ def check_context_continuity(metrics: pd.DataFrame, region_maps: pd.DataFrame,
                detail[:12])
 
 
+def check_iai_resolution(runs: pd.DataFrame, metrics: pd.DataFrame,
+                         report: Report) -> None:
+    """
+    An inter-access interval must be shorter than the run divided by its samples.
+
+    IAI is the gap between consecutive *samples* of an address.  If only a
+    handful of samples land on a region's addresses, those gaps simply partition
+    the run, and the metric reports the sampling density rather than the access
+    behaviour.  The baseline for a region with n intervals over a run of duration
+    D is D/(n+1); a measured gap near that is at the resolution floor.
+
+    Measured across the occupancy sweep: `runtime` clears the baseline by
+    ~1,400x on 8.7M intervals, `weight` by 5-12x on 14-37, and `kv_cache` at the
+    lowest occupancy by 0.9x on 4 -- so the three-orders-of-magnitude separation
+    between runtime and the other two is real in *direction*, while the absolute
+    figures for weight and kv_cache are lower bounds near their own floor.
+    """
+    if metrics is None or metrics.empty or "iai_p50_s" not in metrics.columns:
+        report.add("iai resolution", "WARN",
+                   "metrics.csv carries no inter-access interval")
+        return
+
+    m = metrics.merge(runs[["run_id", "collection_duration_s"]], on="run_id",
+                      how="left") if "collection_duration_s" in runs.columns \
+        else metrics.copy()
+    if "collection_duration_s" not in m.columns:
+        report.add("iai resolution", "WARN",
+                   "collection duration not available — cannot bound IAI")
+        return
+
+    m = m[m["iai_p50_s"].notna() & m["n_intervals"].notna()
+          & m["collection_duration_s"].notna()]
+    m = m[~m["region_type"].isin(("unknown",))]
+    if m.empty:
+        report.add("iai resolution", "PASS", "no IAI rows to bound")
+        return
+
+    m = m.copy()
+    m["baseline_s"] = m["collection_duration_s"] / (m["n_intervals"] + 1)
+    m["resolution"] = m["iai_p50_s"] / m["baseline_s"].replace(0, float("nan"))
+
+    per = (m.groupby(_CELL + ["region_type"])
+           .agg(resolution=("resolution", "median"),
+                intervals=("n_intervals", "median"),
+                iai_p50_s=("iai_p50_s", "median")).reset_index())
+    thin = per[per["resolution"] < _MIN_IAI_RESOLUTION]
+    detail = [f"{_cell_label(r.model_id, r.ctx, r.output_tokens)} "
+              f"{r.region_type}: gap {r.iai_p50_s:,.1f}s is only "
+              f"{r.resolution:.1f}x the {r.intervals:,.0f}-sample baseline — "
+              f"report as a lower bound, not a value"
+              for r in thin.sort_values("resolution").itertuples()]
+    report.add("iai resolution", "WARN" if detail else "PASS",
+               f"{len(thin)} of {len(per)} (cell, region) pair(s) have an "
+               f"inter-access interval within {_MIN_IAI_RESOLUTION:.0f}x of the "
+               f"sampling floor",
+               detail[:10])
+
+
 def check_validity(runs: pd.DataFrame, report: Report) -> None:
     """Which runs may enter the aggregated metrics."""
     counts = runs["validity"].value_counts().to_dict()
@@ -710,6 +775,7 @@ def validate(results_dir: pathlib.Path) -> "tuple[Report, dict]":
     check_reproducibility(metrics, region_maps, report)
     check_retention_support(region_maps, runs, report, metrics)
     check_context_continuity(metrics, region_maps, report)
+    check_iai_resolution(runs, metrics, report)
     check_validity(runs, report)
     check_metric_sanity(metrics, report)
     return report, {"runs": len(runs), "models": int(runs["model_id"].nunique())}

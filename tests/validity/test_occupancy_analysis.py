@@ -213,3 +213,48 @@ def test_every_loader_attaches_the_whole_cell_key(module):
         source = inspect.getsource(getattr(mod, name))
         for col in mod._CELL:
             assert f'"{col}"' in source, f"{module}.{name} does not attach {col}"
+
+
+# ── an inter-access interval must clear its own sampling floor ───────────────
+
+def _iai_metrics(region, n_intervals, iai_p50_s, duration_s=300.0):
+    return pd.DataFrame([{
+        "run_id": "r1", "model_id": "m", "ctx": _CTX, "output_tokens": 1977,
+        "region_type": region, "n_intervals": n_intervals,
+        "iai_p50_s": iai_p50_s,
+    }]), pd.DataFrame([{"run_id": "r1", "collection_duration_s": duration_s}])
+
+
+def test_a_gap_at_the_sampling_floor_is_flagged(val):
+    """
+    IAI is the gap between consecutive *samples* of an address.  With 4 samples
+    over a 300 s run the gaps simply partition the run, so the metric reports
+    sampling density rather than access behaviour.  Measured: kv_cache at the
+    lowest occupancy cleared this baseline by 0.2x -- i.e. not at all.
+    """
+    metrics, runs = _iai_metrics("kv_cache", 4, 60.0)
+    report = val.Report()
+    val.check_iai_resolution(runs, metrics, report)
+    row = _row(report, "iai resolution")
+    assert row["status"] == "WARN"
+    assert any("lower bound" in str(d) for d in row["detail"]), row["detail"]
+
+
+def test_a_well_resolved_gap_passes(val):
+    """runtime clears the baseline by ~1,400x on millions of intervals."""
+    metrics, runs = _iai_metrics("runtime", 8_000_000, 0.11)
+    report = val.Report()
+    val.check_iai_resolution(runs, metrics, report)
+    assert _row(report, "iai resolution")["status"] == "PASS"
+
+
+def test_missing_iai_is_reported_not_silently_passed(val):
+    report = val.Report()
+    val.check_iai_resolution(pd.DataFrame(), pd.DataFrame(), report)
+    assert _row(report, "iai resolution")["status"] == "WARN"
+
+
+def test_the_runs_frame_carries_the_collection_duration(val):
+    """Without it the floor cannot be computed and the check goes vacuous."""
+    import inspect
+    assert '"collection_duration_s"' in inspect.getsource(val.load_runs)

@@ -7,7 +7,8 @@ tokens 512 / 1024 / 1977, 2 repetitions each, context 2048, all 30 `clean`. The
 results folder is 16 GB, 14 GB of which is `raw/perf.data`.*
 
 The packaging script is `notebooks/scripts/prepare_kaggle_dataset.py`; it writes to
-`datasets/` (git-ignored).
+`datasets/` (git-ignored). The starter notebook to publish alongside it is
+`notebooks/004 - Kaggle Starter.ipynb`.
 
 ---
 
@@ -55,6 +56,37 @@ the inverse keep probability per row so counts can be re-weighted.
 | per-run `manifest.json` | Checksums of the unmodified run directory; the release gets its own `SHA256SUMS`. |
 | `.experiment_state.json`, `logs/runner.log` | Scheduler bookkeeping, meaningless to dataset users. |
 | Other context files (spec, review, testing philosophy, YAML guide) | About building the tool, not about the data. |
+
+## Kaggle usability score
+
+Kaggle rates a dataset on completeness (subtitle, tags, description, cover image),
+credibility (sources, a public notebook, update frequency) and compatibility (licence,
+file format, file descriptions, column descriptions). The package is shaped for it:
+
+- **Flat layout.** The Kaggle API uploads a sub-directory as one archive, and a file inside
+  an archive cannot carry a description or column metadata. So every file is top level and
+  CSV or Parquet: per-run traces are stacked into one `trace.parquet`, prompts into
+  `prompt_outputs.csv`, `metadata.json` is flattened into `runs.csv` (lists as JSON
+  strings), and `.sample_calibration.json` becomes `sample_calibration.csv`.
+  `analysis/kv_lifecycle_blocks.csv` is dropped as a duplicate of the stacked
+  `kv_block_lifecycle.parquet`; the other summaries are renamed `summary_by_*.csv`.
+- **Every column described.** `dataset-metadata.json` carries a description for every file
+  and a name, type and description for every column. The script fails, naming the column,
+  if any column has no description, so a pipeline change cannot silently lower the score.
+- **Description, sources, cover.** The data card is the Kaggle description;
+  `userSpecifiedSources` states the collection method; a cover image is generated from
+  one run's trace.
+- **Consistency gates.** Packaging refuses to run while per-run `metrics.csv` files differ
+  in columns (a half-finished `--rederive-metrics`) or while `results/analysis/` is older
+  than the newest `metrics.csv`.
+
+Releases are new versions of the existing private dataset
+`patrickogbuitepu/mrm-trace-llm-memory-access-traces` (first version 2026-07-19: the July
+context/batch sweep, from before the fixes in 04 and 05; licence CC0-1.0). Upload with
+`kaggle datasets version -t` — without `-t` Kaggle converts `trace.parquet` to CSV — then
+`kaggle datasets metadata --update` to push the description and column metadata. Credentials
+are in `.env` (`KAGGLE_TOKEN` is a new-style `KGAT_` token; the CLI reads it as
+`KAGGLE_API_TOKEN`). Manual step left: publish the starter notebook against the dataset.
 
 ## Privacy
 
