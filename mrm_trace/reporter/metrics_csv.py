@@ -1,9 +1,14 @@
 """
 metrics.csv export — one-row-per-region_type summary of all analysis results.
 
-Columns: region_type, n_regions, retention_p50_s, retention_p90_s, retention_p99_s,
-         retention_mean_s, write_once_ratio_mean, reads_per_write_mean,
-         working_set_mb_total, unique_pages_total, suitability
+Columns: region_type, n_regions, n_regions_observable, retention_support_frac,
+         retention_p50_s, retention_p90_s, retention_p99_s, retention_mean_s,
+         write_once_ratio_mean, reads_per_write_mean, working_set_mb_total,
+         unique_pages_total, suitability
+
+`n_regions_observable` and `retention_support_frac` are not decoration: a
+retention percentile over 1 region and one over 10,000 are different claims, and
+without them the table cannot tell them apart.
 """
 
 from pathlib import Path
@@ -80,7 +85,8 @@ def build_metrics_table(analysis: dict) -> pd.DataFrame:
     )
 
     col_order = [
-        "region_type", "n_regions",
+        "region_type", "n_regions", "n_regions_observable",
+        "retention_support_frac",
         "retention_p50_s", "retention_p90_s", "retention_p99_s", "retention_mean_s",
         "write_once_ratio_mean", "reads_per_write_mean",
         "working_set_mb_total", "unique_pages_total",

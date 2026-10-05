@@ -38,6 +38,8 @@ from typing import Dict, List, Optional
 
 from mrm_trace.telemetry.thermal import read_package_temp_c
 from mrm_trace.reporter.run_audit import audit_run
+from mrm_trace.labeller.kv_rederive import rederive_kv_lifecycle
+from mrm_trace.analyser.rederive import rederive_metrics
 from mrm_trace.telemetry.validity import (
     TEMP_CONTAMINATED_C,
     TEMP_WARN_C,
@@ -50,6 +52,22 @@ from mrm_trace.utils.machine import machine_slug
 RESULTS_DIR = pathlib.Path("results")
 STATE_FILE = RESULTS_DIR / ".experiment_state.json"
 LOG_FILE = RESULTS_DIR / "logs" / "runner.log"
+
+
+def set_results_dir(path) -> None:
+    """
+    Point the runner at a different results tree.
+
+    State, calibration and the log live *inside* the tree, so a second sweep in
+    its own directory gets its own resume state and its own period calibration
+    rather than inheriting the first sweep's.  All four paths move together --
+    moving them one at a time is how one ends up still pointing at the old tree.
+    """
+    global RESULTS_DIR, STATE_FILE, LOG_FILE, CALIBRATION_FILE
+    RESULTS_DIR = pathlib.Path(path)
+    STATE_FILE = RESULTS_DIR / ".experiment_state.json"
+    LOG_FILE = RESULTS_DIR / "logs" / "runner.log"
+    CALIBRATION_FILE = RESULTS_DIR / ".sample_calibration.json"
 
 # Script paths (relative to repo root)
 SCRIPT_PERF_MEM = pathlib.Path("notebooks/scripts/demo_perf_mem.py")
@@ -389,7 +407,7 @@ GPU_CONTEXT_LENGTHS = [2048, 8192]
 # sequential loop and batch_size reaches metadata and the run_id only.  Eight of
 # sixteen GPU runs in one sweep were exact duplicates of the other eight.
 GPU_BATCH_SIZES = [1]
-GPU_REPS = [0, 1]
+GPU_REPS = [0, 1, 2]  # rep 0 = warmup; reps 1 and 2 = data
 
 # Fast validation matrix (--fast flag): 1 run only
 FAST_MATRIX = [
@@ -433,6 +451,8 @@ class RunSpec:
     ctx: int
     batch: int
     rep: int
+    output_tokens: int = OUTPUT_TOKENS
+    ignore_eos: bool = False
     sample_period: int = MIN_SAMPLE_PERIOD
     region_granularity: int = REGION_GRANULARITY_BYTES
     is_warmup: bool = False
@@ -546,7 +566,7 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             "--model", str(model_path),
             "--model-id", spec.model_id,
             "--ctx",   str(spec.ctx),
-            "--tokens", str(OUTPUT_TOKENS),
+            "--tokens", str(spec.output_tokens),
             "--batch-size", str(spec.batch),
             "--rep", str(spec.rep),
             "--machine", machine,
@@ -557,21 +577,27 @@ def _build_command(spec: RunSpec, models_dir: pathlib.Path, machine: str) -> Lis
             # CPU_MODELS is the authoritative parameter count; without this the
             # run infers it from the filename.
             "--params-b", str(spec.params_b),
-        ] + (["--warmup-only"] if spec.is_warmup else [])
+        ] + (["--warmup-only"] if spec.is_warmup else []) \
+          + (["--ignore-eos"] if spec.ignore_eos else [])
     else:  # gpu
         return [
             PYTHON,
             str(SCRIPT_HF_GPU),
             "--model", spec.model_file,
             "--ctx",   str(spec.ctx),
-            "--tokens", str(OUTPUT_TOKENS),
+            "--tokens", str(spec.output_tokens),
             "--batch-size", str(spec.batch),
             "--rep", str(spec.rep),
             "--machine", machine,
-            "--collector", "auto",
+            # Not "auto": auto falls back to memray when the PMU is
+            # unreachable, and a memray run passes every quality gate with 0%
+            # latency, 0% cache level and 0% region coverage, because its
+            # thresholds are all 0.0.  A sweep phase run without PMU access
+            # would have produced silently empty runs that looked fine.
+            "--collector", "perf-mem",
             "--out", str(RESULTS_DIR),
             "--num-prompts", str(PROMPTS_PER_RUN),
-        ]
+        ] + (["--warmup-only"] if spec.is_warmup else [])
 
 
 def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> RunResult:
@@ -698,6 +724,80 @@ def run_one(spec: RunSpec, models_dir: pathlib.Path, machine: str, log_fn) -> Ru
         validity_reasons=validity_reasons,
         error=error,
     )
+
+
+def rederive_kv_runs(results_dir: pathlib.Path, log,
+                     dry_run: bool = False) -> Dict[str, int]:
+    """
+    Rebuild kv_block_lifecycle.parquet for every exported run from its own
+    trace.parquet.
+
+    Block lifetime is a derivation over rows the run already holds, so a
+    correction to the derivation is applied in place rather than by
+    re-collecting.  Mirrors --reclassify.
+    """
+    runs = sorted(p.parent for p in results_dir.glob("*/*/*/trace.parquet"))
+    log(f"Re-deriving KV lifecycle for {len(runs)} exported runs"
+        f"{' (dry run)' if dry_run else ''} ...")
+
+    totals = {"runs": 0, "blocks": 0, "write_observed": 0, "lifetime_null": 0}
+    for run_dir in runs:
+        try:
+            st = rederive_kv_lifecycle(run_dir, dry_run=dry_run)
+        except (OSError, ValueError) as exc:
+            log(f"  SKIP {run_dir.name}: {exc}")
+            continue
+        totals["runs"] += 1
+        for k in ("blocks", "write_observed", "lifetime_null"):
+            totals[k] += st[k]
+        pct = 100.0 * st["write_observed"] / st["blocks"] if st["blocks"] else 0.0
+        log(f"  {run_dir.name}")
+        log(f"    {st['blocks']:,} blocks | {st['write_observed']:,} with an "
+            f"observed write ({pct:.1f}%) | {st['lifetime_null']:,} lifetime null")
+
+    if totals["blocks"]:
+        pct = 100.0 * totals["write_observed"] / totals["blocks"]
+        log(f"Re-derived {totals['runs']} runs: {totals['blocks']:,} blocks, "
+            f"{totals['write_observed']:,} with an observed write ({pct:.1f}%), "
+            f"{totals['lifetime_null']:,} with lifetime null")
+    return totals
+
+
+def rederive_metrics_runs(results_dir: pathlib.Path, log,
+                          dry_run: bool = False) -> Dict[str, int]:
+    """
+    Recompute metrics.csv for every exported run from its own trace.parquet.
+
+    Every metric in the file is a derivation over rows the run already holds,
+    so a correction is applied in place.  Mirrors --reclassify and
+    --rederive-kv, and goes through the same compute_all() the pipeline runs.
+    """
+    runs = sorted(p.parent for p in results_dir.glob("*/*/*/trace.parquet"))
+    log(f"Re-deriving metrics for {len(runs)} exported runs"
+        f"{' (dry run)' if dry_run else ''} ...")
+
+    done = 0
+    worst = []
+    for run_dir in runs:
+        try:
+            st = rederive_metrics(run_dir, dry_run=dry_run)
+        except (OSError, ValueError, KeyError) as exc:
+            log(f"  SKIP {run_dir.name}: {exc}")
+            continue
+        done += 1
+        log(f"  {run_dir.name}  ({st['rows']:,} rows)")
+        for rtype, sup in sorted(st["support"].items()):
+            p50 = "null" if sup["p50_s"] is None else f"{sup['p50_s']:.2f}s"
+            log(f"    {rtype:11s} retention over {sup['observable']:,}/"
+                f"{sup['n_regions']:,} regions ({sup['frac']:.0%})  p50={p50}")
+            if sup["frac"] < 0.5:
+                worst.append(f"{run_dir.name} {rtype} {sup['frac']:.0%}")
+
+    log(f"Re-derived metrics for {done} runs")
+    if worst:
+        log(f"  {len(worst)} (run, region) pair(s) have retention resting on "
+            f"under half their regions — state this in the data card")
+    return {"runs": done, "thin": len(worst)}
 
 
 def reclassify_runs(results_dir: pathlib.Path, state: Dict, log,
@@ -896,14 +996,152 @@ def _gpu_specs(models, ctx_lengths) -> List[RunSpec]:
     return specs
 
 
+
+# ── Occupancy sweep ───────────────────────────────────────────────────────────
+#
+# The context sweep varies how much KV cache is *allocated*.  It does not vary
+# how much is *written*: output tokens are fixed at OUTPUT_TOKENS, so every run
+# writes ~535 KV positions and occupancy falls as context grows —
+#
+#   ctx  2048 -> 26.1%     ctx  8192 -> 6.5%     ctx 32768 -> 1.6%
+#
+# At ctx 32768, 98.4% of the KV cache is never touched.  So the dataset cannot
+# answer the question MRM turns on — does a large *filled* cache retain data
+# long and write it once — because it never filled one.
+#
+# This sweep fixes the context and varies the generated tokens instead, which
+# makes occupancy the independent variable.  Context stays at 2048 because
+# filling more is not reachable on this hardware: at the measured 2.0 tok/s for
+# llama-3.1-8b, generating 32,768 tokens is >4 h per repetition.
+OCCUPANCY_CTX = 2048
+
+# The prompt occupies the cache too, so the top level cannot be the full context:
+# 23 + 2048 overruns n_ctx, and llama.cpp then shifts or evicts, which is a
+# different regime (eviction) rather than a full cache.  The prompt length is
+# also an estimate (chars/4 ~ 23 tokens) rather than a tokenised count, so the
+# top level leaves a margin wide enough to absorb a mis-estimate.
+_PROMPT_TOKENS = 23                       # ~535 positions observed at 512 output
+_OCCUPANCY_MARGIN = 48                    # headroom for prompt-length error
+OCCUPANCY_TOKENS = [512, 1024,
+                    OCCUPANCY_CTX - _PROMPT_TOKENS - _OCCUPANCY_MARGIN]
+
+assert _PROMPT_TOKENS + max(OCCUPANCY_TOKENS) < OCCUPANCY_CTX, (
+    "the largest occupancy level must still fit the allocated cache, or the "
+    "run measures eviction instead of a full cache")
+
+
+def occupancy_fraction(output_tokens: int, ctx: int = OCCUPANCY_CTX) -> float:
+    """Fraction of the allocated KV cache this run actually writes."""
+    return (_PROMPT_TOKENS + output_tokens) / ctx
+
+
+def estimate_fill_run_seconds(tok_per_s_ref: float, output_tokens: int,
+                              ctx: int = OCCUPANCY_CTX,
+                              prompts: int = PROMPTS_PER_RUN) -> float:
+    """
+    Collection seconds when the cache is being filled.
+
+    estimate_run_seconds() treats throughput as a function of *allocated*
+    context, which is right when occupancy is low and constant.  Here it is the
+    variable: attention cost grows with the number of occupied positions, so a
+    2048-token run is slower per token at the end than at the start.  Averaging
+    the marginal cost over the generated range gives ~4.7x the 512-token time
+    for 4x the tokens, against 4.0x if the slowdown is ignored — a 17% error,
+    which matters only because it feeds the timeout.
+    """
+    def scale(occupied: float) -> float:
+        return 1.0 + _CTX_SLOWDOWN_K * (occupied / CTX_REF - 1.0)
+
+    mean_occupied = _PROMPT_TOKENS + output_tokens / 2.0
+    ref_occupied = _PROMPT_TOKENS + OUTPUT_TOKENS / 2.0
+    slowdown = scale(mean_occupied) / max(scale(ref_occupied), 0.1)
+    return prompts * output_tokens / max(tok_per_s_ref, 0.1) * slowdown
+
+
+def _occupancy_specs(models,
+                     region_granularity: int = REGION_GRANULARITY_BYTES
+                     ) -> List[RunSpec]:
+    """
+    One warmup per *model*, then two data reps at every occupancy level.
+
+    A warmup exists to fault the GGUF in from disk, which is a property of the
+    model and not of the token count, and --warmup-only generates the full
+    token count.  One warmup per (model, level) would therefore have spent 1.6 h
+    generating tokens nobody reads, to save a cold model load worth 20-45 s --
+    16.5 min of warmup per 90 s saved on llama-3.1-8b.  One short warmup per
+    model costs 14 min and buys the same thing.
+    """
+    specs = []
+    calibration = _load_calibration()
+    warmup_tokens = min(OCCUPANCY_TOKENS)
+    for model_id, model_file, params_b, tok_per_s in models:
+        specs.append(RunSpec(
+            key=f"{model_id}__ctx{OCCUPANCY_CTX}__b{BATCH_SIZES[0]}"
+                f"__t{warmup_tokens}__rep0__occ",
+            path_type="cpu",
+            model_id=model_id,
+            model_file=model_file,
+            params_b=params_b,
+            ctx=OCCUPANCY_CTX,
+            batch=BATCH_SIZES[0],
+            rep=0,
+            output_tokens=warmup_tokens,
+            ignore_eos=True,
+            sample_period=sample_period_for(
+                tok_per_s, OCCUPANCY_CTX, output_tokens=warmup_tokens,
+                model_id=model_id, calibration=calibration),
+            region_granularity=region_granularity,
+            is_warmup=True,
+            max_runtime=run_timeout_for(
+                estimate_fill_run_seconds(tok_per_s, warmup_tokens)),
+        ))
+        for tokens in OCCUPANCY_TOKENS:
+            # The budget stays at SAMPLE_BUDGET.  A longer run gets a coarser
+            # period, but KV traffic grows ~quadratically in generated tokens
+            # (each token attends over the whole cache) while the run lengthens
+            # only ~linearly, so KV's share of the trace rises and per-granule
+            # support improves rather than degrades.
+            sample_period = sample_period_for(
+                tok_per_s, OCCUPANCY_CTX, output_tokens=tokens,
+                model_id=model_id, calibration=calibration)
+            est = estimate_fill_run_seconds(tok_per_s, tokens)
+            for batch in BATCH_SIZES:
+                for rep in [r for r in REPS if r != 0]:
+                    specs.append(RunSpec(
+                        key=f"{model_id}__ctx{OCCUPANCY_CTX}__b{batch}"
+                            f"__t{tokens}__rep{rep}__occ",
+                        path_type="cpu",
+                        model_id=model_id,
+                        model_file=model_file,
+                        params_b=params_b,
+                        ctx=OCCUPANCY_CTX,
+                        batch=batch,
+                        rep=rep,
+                        output_tokens=tokens,
+                        ignore_eos=True,
+                        sample_period=sample_period,
+                        region_granularity=region_granularity,
+                        is_warmup=False,
+                        max_runtime=run_timeout_for(est),
+                    ))
+    return specs
+
+
 def build_matrix(fast: bool = False, cpu_only: bool = False, gpu_only: bool = False,
                  low_end: bool = False,
-                 region_granularity: int = REGION_GRANULARITY_BYTES) -> List[RunSpec]:
+                 region_granularity: int = REGION_GRANULARITY_BYTES,
+                 occupancy: bool = False) -> List[RunSpec]:
     if fast:
         return [_FAST_SPEC]
 
     cpu_models = [(m, f, p, t) for m, f, p, t in CPU_MODELS
                   if not low_end or p <= LOW_END_MAX_PARAMS_B]
+
+    # The occupancy sweep replaces the matrix rather than extending it: its runs
+    # answer a different question and its keys are disjoint, so the two can sit
+    # in one state file without either resuming into the other.
+    if occupancy:
+        return _occupancy_specs(cpu_models, region_granularity)
     ctx_lengths = [c for c in CONTEXT_LENGTHS
                    if not low_end or c <= LOW_END_MAX_CTX]
     gpu_models = LOW_END_GPU_MODELS if low_end else GPU_MODELS
@@ -1024,6 +1262,29 @@ def _parse_cli() -> "tuple":
                         help="re-derive run_validity for every exported run from its "
                              "own metadata.json and exit; no run is re-collected. "
                              "Combine with --dry-run to preview.")
+    parser.add_argument("--results-dir", dest="results_dir", default=None,
+                        help="results tree to write to and resume from "
+                             f"(default {RESULTS_DIR}). Use a separate tree for "
+                             "a sweep that answers a different question: run "
+                             "ids encode (model, ctx, batch, tokens, rep) but "
+                             "not the sweep, so two sweeps sharing a tree "
+                             "become indistinguishable to the analysis scripts.")
+    parser.add_argument("--occupancy", action="store_true",
+                        help="run the occupancy sweep instead of the context "
+                             "sweep: context fixed at 2048, generated tokens "
+                             "swept over 512/1024/2048 so KV occupancy is the "
+                             "independent variable (~26%% / ~50%% / ~100%%). The "
+                             "context sweep varies allocated cache only, and "
+                             "never fills one.")
+    parser.add_argument("--rederive-metrics", action="store_true",
+                        dest="rederive_metrics",
+                        help="recompute metrics.csv for every exported run from "
+                             "its own trace.parquet and exit; no run is "
+                             "re-collected. Combine with --dry-run to preview.")
+    parser.add_argument("--rederive-kv", action="store_true", dest="rederive_kv",
+                        help="rebuild kv_block_lifecycle.parquet for every exported "
+                             "run from its own trace.parquet and exit; no run is "
+                             "re-collected. Combine with --dry-run to preview.")
     parser.add_argument("--region-granularity", type=int, dest="region_granularity",
                         default=REGION_GRANULARITY_BYTES,
                         help=f"bytes per region for retention analysis "
@@ -1173,10 +1434,19 @@ def _calibrate_from_run(spec: RunSpec, result: RunResult, log) -> None:
     if samples <= 0:
         return
     ratio = samples / SAMPLE_BUDGET
-    record_calibration(spec.model_id, spec.ctx, spec.sample_period, samples)
-    corrected = sample_period_for(0.0, spec.ctx, model_id=spec.model_id)
+    # output_tokens is part of the calibration key because run length is linear
+    # in it.  Omitting it let a 512-token measurement set the period for a
+    # 2048-token run, which is the same class of error as reusing a 7-prompt
+    # measurement after dropping to 1 — it would coarsen the period by 4x and
+    # deliver a quarter of the sample budget.
+    record_calibration(spec.model_id, spec.ctx, spec.sample_period, samples,
+                       output_tokens=spec.output_tokens)
+    corrected = sample_period_for(0.0, spec.ctx,
+                                  output_tokens=spec.output_tokens,
+                                  model_id=spec.model_id)
     log(f"     {samples:,} samples ({ratio:.2f}x budget) at -c {spec.sample_period:,}"
-        f"  ->  next {spec.model_id} ctx{spec.ctx} run uses -c {corrected:,}")
+        f"  ->  next {spec.model_id} ctx{spec.ctx} t{spec.output_tokens} run "
+        f"uses -c {corrected:,}")
 
 
 def _do_cooldown(spec: RunSpec, log) -> None:
@@ -1266,6 +1536,8 @@ def main():
     args, machine = _parse_cli()
 
     models_dir = pathlib.Path(args.models_dir)
+    if args.results_dir:
+        set_results_dir(args.results_dir)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     signal.signal(signal.SIGINT, _handle_sigint)
 
@@ -1274,28 +1546,69 @@ def main():
 
     all_specs = build_matrix(fast=args.fast, cpu_only=args.cpu_only,
                              gpu_only=args.gpu_only, low_end=args.low_end,
-                             region_granularity=args.region_granularity)
+                             region_granularity=args.region_granularity,
+                             occupancy=args.occupancy)
     log(f"Matrix: {len(all_specs)} runs planned")
     cpu_specs = [s for s in all_specs if s.path_type == "cpu"]
     if cpu_specs:
+        tokens_swept = sorted({s.output_tokens for s in cpu_specs})
         log(f"Sampling budget: {SAMPLE_BUDGET:,} samples/run | "
-            f"{PROMPTS_PER_RUN} prompts x {OUTPUT_TOKENS} tokens | "
+            f"{PROMPTS_PER_RUN} prompts x "
+            f"{'/'.join(str(t) for t in tokens_swept)} tokens | "
             f"--region-granularity {args.region_granularity}")
-        log(f"  {'model':<16}{'ctx':>7}{'-c period':>12}{'timeout':>10}")
-        seen = set()
-        for s in cpu_specs:
-            if (s.model_id, s.ctx) in seen:
-                continue
-            seen.add((s.model_id, s.ctx))
-            log(f"  {s.model_id:<16}{s.ctx:>7}{s.sample_period:>12,}"
-                f"{s.max_runtime / 3600:>8.1f}h")
 
-    if not args.status and not args.dry_run and not args.reclassify:
+        # The occupancy sweep varies tokens at one context, so the table has to
+        # show tokens and the occupancy they produce; without that the plan for
+        # the two sweeps looks identical.
+        if args.occupancy:
+            log(f"  {'model':<16}{'ctx':>7}{'tokens':>8}{'occupancy':>11}"
+                f"{'-c period':>12}{'est':>8}{'timeout':>9}")
+            total_est = 0.0
+            shown = set()
+            for s in cpu_specs:
+                est = estimate_fill_run_seconds(
+                    next(t for m, f, pb, t in CPU_MODELS if m == s.model_id),
+                    s.output_tokens)
+                total_est += est
+                # One line per (model, level).  Keying this on rep 0 hid every
+                # level once warmups stopped being per-level.
+                if (s.model_id, s.output_tokens) in shown or s.is_warmup:
+                    continue
+                shown.add((s.model_id, s.output_tokens))
+                log(f"  {s.model_id:<16}{s.ctx:>7}{s.output_tokens:>8}"
+                    f"{occupancy_fraction(s.output_tokens):>10.0%}"
+                    f"{s.sample_period:>12,}{est / 60:>7.0f}m"
+                    f"{s.max_runtime / 3600:>8.1f}h")
+            n_warm = len([x for x in cpu_specs if x.is_warmup])
+            n_data = len(cpu_specs) - n_warm
+            log(f"  {n_data} data runs + {n_warm} warmups; estimated generation "
+                f"{total_est / 3600:.1f} h, post-processing adds roughly "
+                f"{n_data * 9 / 60:.1f} h")
+        else:
+            log(f"  {'model':<16}{'ctx':>7}{'-c period':>12}{'timeout':>10}")
+            seen = set()
+            for s in cpu_specs:
+                if (s.model_id, s.ctx) in seen:
+                    continue
+                seen.add((s.model_id, s.ctx))
+                log(f"  {s.model_id:<16}{s.ctx:>7}{s.sample_period:>12,}"
+                    f"{s.max_runtime / 3600:>8.1f}h")
+
+    if not args.status and not args.dry_run and not args.reclassify \
+            and not args.rederive_kv and not args.rederive_metrics:
         if not ensure_sample_rate(log):
             log.close()
             sys.exit(1)
 
     state = _init_state(args, all_specs, log)
+
+    if args.rederive_kv:
+        rederive_kv_runs(RESULTS_DIR, log, dry_run=args.dry_run)
+        return
+
+    if args.rederive_metrics:
+        rederive_metrics_runs(RESULTS_DIR, log, dry_run=args.dry_run)
+        return
 
     if args.reclassify:
         reclassify_runs(RESULTS_DIR, state, log, dry_run=args.dry_run)

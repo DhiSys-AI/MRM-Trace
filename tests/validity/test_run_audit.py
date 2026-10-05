@@ -153,3 +153,47 @@ def test_a_cap_reduction_well_below_the_achieved_rate_is_only_a_note(tmp_path):
     audit = audit_run(_write_run(tmp_path, cap_after=63_000, achieved=5_242))
     assert audit.failures == []
     assert any("lowered the cap" in n for n in audit.notes)
+
+
+# ── a run that stopped early is not the run that was planned ─────────────────
+
+def test_a_short_generation_fails_when_eos_was_meant_to_be_suppressed(tmp_path):
+    """
+    Asking Llama-3.2-1B for 1977 tokens produced 653: the KV cache reached 33%
+    occupancy instead of 98%, and the run passed every gate it had.  With
+    ignore_eos set, a shortfall means a stop token nobody named, which silently
+    turns an occupancy sweep into repetitions of one experiment.
+    """
+    d = _write_run(tmp_path)
+    meta = json.loads((d / "metadata.json").read_text())
+    meta["generation"] = {"prompts": 1, "output_tokens": 1977,
+                          "tokens_requested_per_prompt": 1977,
+                          "total_output_tokens": 653, "ignore_eos": True}
+    (d / "metadata.json").write_text(json.dumps(meta))
+    audit = audit_run(d)
+    assert any("tokens" in f and "short" in f for f in audit.failures), audit.failures
+
+
+def test_a_short_generation_is_only_a_note_without_ignore_eos(tmp_path):
+    """Then the ceiling is expected behaviour, and worth recording not failing."""
+    d = _write_run(tmp_path)
+    meta = json.loads((d / "metadata.json").read_text())
+    meta["generation"] = {"prompts": 1, "output_tokens": 1977,
+                          "tokens_requested_per_prompt": 1977,
+                          "total_output_tokens": 653, "ignore_eos": False}
+    (d / "metadata.json").write_text(json.dumps(meta))
+    audit = audit_run(d)
+    assert not any("tokens" in f for f in audit.failures), audit.failures
+    assert any("ceiling" in n for n in audit.notes), audit.notes
+
+
+def test_reaching_the_limit_is_silent(tmp_path):
+    d = _write_run(tmp_path)
+    meta = json.loads((d / "metadata.json").read_text())
+    meta["generation"] = {"prompts": 1, "output_tokens": 1977,
+                          "tokens_requested_per_prompt": 1977,
+                          "total_output_tokens": 1977, "ignore_eos": True}
+    (d / "metadata.json").write_text(json.dumps(meta))
+    audit = audit_run(d)
+    assert not any("tokens" in f for f in audit.failures), audit.failures
+    assert not any("tokens:" in n for n in audit.notes), audit.notes

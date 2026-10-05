@@ -323,6 +323,11 @@ print(s)
 
 _SAMPLES_RE = re.compile(r"\(([\d,]+)\s+samples\)")
 
+# A reported power draw above the enforced limit by more than this factor is a
+# driver artifact, not a measurement.  10% allows for genuine short transients
+# above the sustained limit without admitting the mobile-Ampere garbage values.
+_POWER_DRAW_TOLERANCE = 1.10
+
 
 def check_perf_mem_smoke() -> Check:
     if platform.system() != "Linux" or not shutil.which("perf"):
@@ -540,7 +545,11 @@ def collect_machine_context(out_dir: str = ".") -> dict:
     Returns a dict with three top-level keys:
       - "software"         → OS, kernel, perf version, paranoid, memray, mrm_trace
       - "hardware_context" → CPU model/vendor/PMU, AC power, turbo, disk free
-      - "gpu_power_draw_w" → current GPU power draw in watts, or None
+      - "gpu_power_draw_w" → current GPU power draw in watts, or None when the
+                              driver gave no value or gave one above the
+                              enforced power limit (see gpu_power_draw_status)
+      - "gpu_power_limit_w" → enforced power limit in watts, or None
+      - "gpu_power_draw_status" → "ok" / "unavailable: ..." / "implausible: ..."
     """
     import importlib.util as _ilu
     import mrm_trace as _mrm
@@ -605,15 +614,51 @@ def collect_machine_context(out_dir: str = ".") -> dict:
         pass
 
     # ── GPU power draw (one-time snapshot) ───────────────────────────────────
+    # Sanity-gated against the enforced power limit.  Mobile Ampere parts under
+    # hybrid graphics report a physically impossible power.draw (observed:
+    # 752.67 W on a 115 W-limited RTX 3080 Laptop).  Publishing that as machine
+    # context would discredit the whole Layer-3 section, so a draw above the
+    # limit is recorded as unavailable with the reason kept alongside.
     gpu_power_draw_w: float | None = None
+    gpu_power_limit_w: float | None = None
+    gpu_power_draw_status: str | None = None
     if shutil.which("nvidia-smi"):
         try:
             rc, out, _ = _run(
-                ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                ["nvidia-smi",
+                 "--query-gpu=power.draw,enforced.power.limit,power.limit",
+                 "--format=csv,noheader,nounits"],
                 timeout=5,
             )
             if rc == 0 and out.strip():
-                gpu_power_draw_w = float(out.strip().splitlines()[0].strip())
+                fields = [f.strip() for f in out.strip().splitlines()[0].split(",")]
+
+                def _num(idx: int) -> float | None:
+                    if idx < len(fields):
+                        try:
+                            return float(fields[idx])
+                        except ValueError:
+                            return None       # "[N/A]" / "[Not Supported]"
+                    return None
+
+                draw = _num(0)
+                gpu_power_limit_w = _num(1)
+                if gpu_power_limit_w is None:
+                    gpu_power_limit_w = _num(2)
+
+                if draw is None:
+                    gpu_power_draw_status = "unavailable: driver reported no value"
+                elif draw <= 0:
+                    gpu_power_draw_status = f"implausible: driver reported {draw:.2f} W"
+                elif (gpu_power_limit_w is not None
+                      and draw > gpu_power_limit_w * _POWER_DRAW_TOLERANCE):
+                    gpu_power_draw_status = (
+                        f"implausible: driver reported {draw:.2f} W against a "
+                        f"{gpu_power_limit_w:.2f} W enforced limit"
+                    )
+                else:
+                    gpu_power_draw_w = draw
+                    gpu_power_draw_status = "ok"
         except Exception:
             pass
 
@@ -639,6 +684,8 @@ def collect_machine_context(out_dir: str = ".") -> dict:
             "disk_free_gb": disk_free_gb,
         },
         "gpu_power_draw_w": gpu_power_draw_w,
+        "gpu_power_limit_w": gpu_power_limit_w,
+        "gpu_power_draw_status": gpu_power_draw_status,
     }
 
 

@@ -69,12 +69,26 @@ DEFAULT_RULES: List[SymbolRule] = [
     #   kv_cache — the engine's own KV allocation (kv_allocation), captured by
     #              the allocation interposer; absent if it cannot be captured.
     #
-    # What a compute kernel's store *does* soundly imply is an activation
-    # buffer: that is where a forward-pass kernel writes.
-    SymbolRule(region_type="activation", op_type="store",
-               symbol_re=r"ggml_vec_dot|ggml_mul_mat|ggml_gemm|ggml_gemv|"
-                         r"ggml_compute|ggml_add|ggml_silu|ggml_norm|"
-                         r"ggml_rms_norm|ggml_rope|ggml_soft_max|ggml_swiglu"),
+    # A compute kernel's store was taken to imply an activation buffer, since
+    # that is where a forward-pass kernel writes.  The inference is sound in
+    # principle and useless in practice: the resulting `activation` share varied
+    # 28-77x between repetitions of the *same* configuration, and a region that
+    # varies across identical reps is mis-attributed, not noisy.  Measured
+    # across the v1.5 sweep (share of rows, two reps per cell):
+    #
+    #   llama-3.2-1b ctx8192   0.03% vs 0.93%   (28.9x)
+    #   llama-3.2-3b ctx2048   0.01% vs 0.95%   (76.7x)
+    #   phi-3.5-mini ctx8192   0.02% vs 1.18%   (52.2x)
+    #
+    # The cause is that the same kernels also write scratch, intermediate and
+    # reduction buffers, and which of those a sparse sample lands in is
+    # arbitrary.  Carrying the region type invited its accidental use in a
+    # cross-run comparison it could never support, so no rule claims
+    # `activation` either.  Those stores now fall through to the address map,
+    # which places them in the arena they actually belong to (`runtime`).
+    #
+    # To restore it, ground it the way `weight` and `kv_cache` are grounded: in
+    # a recorded address range for the activation buffer, not in a symbol.
     # Runtime memory management — the address is the allocator's own bookkeeping.
     SymbolRule(
         region_type="runtime",

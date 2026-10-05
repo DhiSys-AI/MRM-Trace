@@ -44,10 +44,49 @@ def test_retention_ns_matches_s():
     assert r["retention_s"] == pytest.approx(5.0)
 
 
-def test_write_only_region_has_zero_retention():
+def test_single_sample_region_has_no_measurable_retention():
+    """
+    One sample is one end of the interval, not both.  Reporting 0.0 here
+    fabricated a measurement, and since sampling density per region falls as
+    context grows, those zeros took over the median precisely where the context
+    trend is read off: kv_cache p50 came out 0.00 s at ctx 32768 against
+    44.91 s over the regions that were actually sampled twice.
+    """
     trace = _trace(_row(1, "weight", "store", 100))
     per_region, _ = compute_retention(trace)
-    assert per_region.iloc[0]["retention_s"] == 0.0
+    row = per_region.iloc[0]
+    assert row["n_samples"] == 1
+    assert row["retention_observable"] is False or not row["retention_observable"]
+    assert pd.isna(row["retention_s"])
+    assert pd.isna(row["retention_ns"])
+
+
+def test_two_samples_at_the_same_instant_are_a_measured_zero():
+    """Two observations *can* bound a zero-length interval; one cannot."""
+    trace = _trace(
+        _row(1, "weight", "store", 100),
+        _row(1, "weight", "load", 100),
+    )
+    per_region, _ = compute_retention(trace)
+    row = per_region.iloc[0]
+    assert bool(row["retention_observable"])
+    assert row["retention_s"] == 0.0
+
+
+def test_percentiles_exclude_unobservable_regions():
+    """
+    A region type whose regions were mostly sampled once must not have its
+    percentiles dragged to zero by them.
+    """
+    rows = [_row(1, "weight", "store", 0), _row(1, "weight", "load", 10_000_000_000)]
+    for rid in range(2, 20):                      # 18 single-sample regions
+        rows.append(_row(rid, "weight", "load", 500, address=0x1000 * rid))
+    _, summary = compute_retention(_trace(*rows))
+    r = summary.iloc[0]
+    assert r["n_regions"] == 19
+    assert r["n_regions_observable"] == 1
+    assert r["retention_p50_s"] == pytest.approx(10.0)
+    assert r["retention_support_frac"] == pytest.approx(1 / 19)
 
 
 def test_retention_uses_last_read_not_first():

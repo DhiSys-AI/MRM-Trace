@@ -108,7 +108,12 @@ class TestWeightLabelling:
                        phase="generation", op_type="store")
         rows = list(_labeller().label([row]))
         assert rows[0]["region_type"] != "weight"
-        assert rows[0]["region_type"] == "activation"
+        # Nor `activation`: that rule was removed too.  The store does land in
+        # an activation buffer, but the same kernels also write scratch,
+        # intermediate and reduction buffers, so the share varied 28-77x
+        # between repetitions of one configuration.  Outside every recorded
+        # range, the honest answer is `unknown`.
+        assert rows[0]["region_type"] == "unknown"
 
 
 # ── KV cache classification ───────────────────────────────────────────────────

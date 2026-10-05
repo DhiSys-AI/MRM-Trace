@@ -83,6 +83,12 @@ def classify_suitability(
         wo = row["write_once_ratio_mean"]
         p99 = row["retention_p99_s"]
         p50 = row["retention_p50_s"]
+        # Retention is null when no region of this type was sampled twice, so
+        # there is no interval to measure.  Every comparison against a
+        # threshold is then False, which would silently classify an
+        # unmeasured type as `low_mrm` -- the worst verdict, on no evidence.
+        if pd.isna(p50) and pd.isna(p99):
+            return "unknown"
         if row["write_observability"] == "read_only_no_writes":
             # Zero writes with reads is write-once in the limit, so retention
             # is the only discriminator left.

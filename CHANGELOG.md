@@ -7,6 +7,203 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased] — v1.5 (current development)
 
+> Three defects in this release share one cause — an unobserved event published as a
+> value — and passed 967 tests because every fixture was densely sampled while the sweep
+> was not. The post-mortem, the lessons, and the remaining work (including a
+> period-weighted `reads_per_write` that **inverts** the `kv_cache` conclusion) are in
+> [05 - Imputed Values in Sampled Measurements.md](context-files/05%20-%20Imputed%20Values%20in%20Sampled%20Measurements.md).
+
+### Fixed — a region sampled once reported retention 0.0, understating the primary metric
+
+Retention is `last access - first access` of a region, so a region sampled **once** has
+no interval: both ends are the same observation. That was published as `0.0`, and because
+samples-per-region falls as context grows, the imputed zeros took over the median exactly
+where the context trend is read off. Pooled over the CPU analysis set:
+
+| Region | ctx | regions sampled once | p50 as published | p50 over observable regions |
+|---|---|---|---|---|
+| `kv_cache` | 2048 | 42.8% | 10.04 s | **66.95 s** |
+| `kv_cache` | 8192 | 69.1% | 0.00 s | **59.73 s** |
+| `kv_cache` | 32768 | 79.3% | 0.00 s | **44.91 s** |
+| `weight` | 2048 | 27.6% | 49.46 s | **80.45 s** |
+| `weight` | 32768 | 70.4% | 0.00 s | **37.30 s** |
+| `runtime` | 32768 | 74.9% | 0.00 s | **36.74 s** |
+
+On the worst-supported single run (`llama-3.1-8b ctx32768 rep1`), `kv_cache` p50 moved
+from 0.00 s to 102.66 s and `weight` from 0.00 s to 79.66 s.
+
+Retention **does** fall with context — by roughly 1.5–2.2× over a 16× increase — but not
+to zero, and the absolute values were understated several-fold. The published decline was
+largely a sampling-density artifact: the per-run budget is fixed at 10M samples, so a
+longer high-context run spreads the same samples over more regions.
+
+This is the same defect class as the KV lifetime above: an absent measurement published
+as a number. Four changes:
+
+- `compute_retention()` adds `n_samples` and `retention_observable`; `retention_ns` and
+  `retention_s` are null below `MIN_SAMPLES_FOR_RETENTION` (2), and every percentile is
+  computed over observable regions only.
+- The summary and `metrics.csv` gain `n_regions_observable` and
+  `retention_support_frac`, because a p50 over 1 region and a p50 over 10,000 are
+  different claims and the table could not previously tell them apart.
+- `classify_suitability()` returns `unknown` when retention is unmeasurable. Previously
+  every threshold comparison against NaN was False, so an unmeasured region type was
+  classified `low_mrm` — the worst verdict, on no evidence.
+- `results_validation.py` reads the recorded `retention_support_frac` rather than
+  re-estimating it from region-map access counts, and names any cell whose percentiles
+  rest on under half its regions.
+
+A measured zero is still a measurement: two samples at one instant give
+`retention_s = 0.0` and `retention_observable = True`. One sample gives null.
+
+`metrics` schema → **1.1** (additive support columns).
+
+Metrics are a derivation over rows each run already holds, so no trace needed
+re-collecting: `experiment_runner.py --rederive-metrics` recomputes every `metrics.csv`
+from its own `trace.parquet` through the same `compute_all()` the pipeline runs.
+`test_rederived_metrics_equal_a_live_analysis` pins the two equal.
+
+### Fixed — an unsampled KV write became a 46-hour block lifetime
+
+A KV block's lifetime is `end_ns - write_ns`. Stores are sampled on their own, far
+sparser period than loads (`period=2,000,000` against `4,000`), so the common case for a
+KV block is many sampled loads and **no sampled store at all**. `lifecycle_rows()`
+coerced that absent `write_ns` to 0 — and subtracting 0 from a monotonic timestamp does
+not give a short lifetime, it gives the raw clock reading:
+
+| | measured |
+|---|---|
+| blocks with no sampled store | **42,260 of 42,670 (99.0%)** |
+| reported mean lifetime | 162,196 s (≈ 45 h) |
+| actual run length | 73 s |
+| lifetime after the fix (the 18 blocks that have one) | mean 19.8 s, max 59.2 s |
+
+The dataset-level EDA published those values as `lifetime_s`, and every other gate stayed
+green: per-run audit PASS, verdict `clean`, `metrics.csv` complete. This is the failure
+mode the project exists to prevent — an absent measurement silently becoming a wrong
+number — and it violated the project's own rule that unknowns are never coerced.
+
+Three mechanisms changed, not one:
+
+- `KVBlockTracker.lifecycle_rows()` reports `write_ns = None`, `lifetime_ns = None` and a
+  new `write_observed` column. The absence is recorded, never imputed.
+- `Audit.check_kv_lifetime_bounded()` **fails** any run whose block lifetime exceeds 10×
+  its own collection duration, and fails any disagreement between `write_observed` and
+  `lifetime_ns`. A derived duration longer than the run that produced it is arithmetically
+  a clock reading, so the bound makes this class of defect unshippable rather than
+  dependent on someone noticing.
+- `results_exploratory_data_analysis.py` aggregates lifetime only over blocks whose write
+  was sampled, states what fraction that is, and reports read counts separately over all
+  blocks.
+
+`kv_block_lifecycle` schema → **1.1** (additive `write_observed`; `lifetime_ns` nullable).
+
+Block lifetime is a *derivation* over rows each run already holds, so no trace needed
+re-collecting: `experiment_runner.py --rederive-kv` rebuilds every
+`kv_block_lifecycle.parquet` from its own `trace.parquet`, mirroring `--reclassify`.
+`test_rederivation_equals_live_tracking` pins the re-derived file to what the live
+pipeline produces from the same rows, so a re-derived dataset is not a patched one.
+
+### Known limitation — kv_cache write-once and reads-per-write are unsupported
+
+The same sampling asymmetry undermines two of the four primary metrics, for `kv_cache`
+only. Measured on one run: `kv_cache` received **18 store samples** against 2,918 loads,
+over 18 distinct addresses, each written exactly once — so `write_once_ratio = 1.000`
+with **sd 0.000 across all 30 runs**. That constancy is the signature of at-most-one
+sampled store per address, not of demonstrated write-once behaviour. `reads_per_write`
+(312 ± 200) divides a densely sampled numerator by a sparsely sampled denominator.
+
+Well-sampled region types are unaffected: `runtime` has 1,140,498 stores and a real
+distribution (45.1% write-once, max 6,692 writes per address); `weight` has 0 stores
+because the GGUF is mapped read-only and faulted in by the kernel, which is a genuine
+finding rather than missing data.
+
+Report `write_once_ratio` and `reads_per_write` as unsupported for `kv_cache`, or
+re-collect with a lower `--store-multiplier`. The EDA now emits this caveat itself,
+derived from the `write_observed` fraction rather than assumed.
+
+### Fixed — GPU warmups collected a full run, leaving every GPU cell at n=1
+
+The matrix flagged rep 0 as a warmup on both paths, but only the CPU branch passed
+`--warmup-only`, and `demo_qwen_hf.py` did not define the flag. So every GPU rep 0
+collected a complete run: each GPU cell held one cold-cache run and one warm run, the
+analysis set (`rep > 0`) kept only the warm one, and the GPU path sat at **one data rep
+per cell** — with no cross-rep reproducibility check possible on that path at all.
+
+The two reps are close in trace terms (samples within 1.00–1.04×, tok/s within 0.5), but
+wall-clock differed by up to 35% (46.7 s against 34.5 s on mistral-7b), which retention
+inherits directly, being last-minus-first access. So rep 0 stays out of the analysis set
+rather than being promoted to data.
+
+`demo_qwen_hf.py` now has `run_warmup_only()`, the runner passes `--warmup-only` on both
+branches, and `GPU_REPS` is `[0, 1, 2]` so the GPU path gets a bare warmup and two data
+reps like the CPU path. `test_every_cell_has_two_data_reps` fails on any cell that cannot
+be checked for reproducibility.
+
+### Fixed — matrix completeness reported ten lines of expected absences
+
+The check took the union of every rep seen anywhere as the expected set, so it reported
+"missing rep 0" for all 15 CPU cells (rep 0 is a bare warmup that writes nothing by
+design) and "missing rep 2" for all GPU cells (that path ran two reps). The real signal —
+a cell sitting at one data rep — was buried in the noise. Expected reps are now derived
+per path over data reps only, and a cell with fewer than two is named as uncheckable.
+
+### Fixed — GPU power draw was a driver artifact, published as machine context
+
+`nvidia-smi --query-gpu=power.draw` reports a physically impossible value on mobile
+Ampere under hybrid graphics. Measured on an RTX 3080 Laptop:
+
+| | |
+|---|---|
+| `power.draw` | **752.67 W** |
+| `enforced.power.limit` | 115.00 W |
+
+The reading was copied verbatim into `metadata.json → gpu.power_draw_w`. Layer 3 exists
+so trace values can be *independently audited*; a 752 W figure on a 115 W part
+discredits the section it appears in.
+
+`collect_machine_context()` now queries the limit alongside the draw and refuses to
+publish a draw more than `_POWER_DRAW_TOLERANCE` (10%) above it. Instead it records
+`gpu_power_limit_w` and `gpu_power_draw_status`, so a reader can tell a *missing* sensor
+from a *lying* one. The 10% headroom admits genuine transients above the sustained limit
+without admitting the artifact.
+
+The two demo scripts had duplicated this field assembly; it now lives in
+`telemetry.system_monitor.gpu_section()`, the fourth place where script-level
+duplication had drifted from the package.
+
+### Fixed — an absent GPU weight attribution could not be distinguished from a failure
+
+`extract_pytorch_regions()` correctly skips non-CPU tensors: a CUDA `data_ptr()` is a
+device address that no CPU PMU can sample. So `pytorch_regions.json` with 0 entries is
+the *right* answer for a GPU-resident model — and byte-identical to the extractor having
+silently failed. The run output said only `Weight regions recorded: 0 tensors across 0 MB`.
+
+Runs now write `parameter_devices.json`, a census of where the parameters actually lived:
+
+```json
+{"cuda:0": {"tensors": 290, "bytes": 988123136}}
+```
+
+`Audit._absence_reason()` reads it and replaces the old hedge ("by design if it could
+not be isolated") with a checkable statement. Host-resident parameters with no
+attribution now **fail** the audit rather than being noted, because that is a pipeline
+defect rather than a platform limit.
+
+### Fixed — the dataset validator's GPU branch was unreachable
+
+Routing GPU runs through `--collector perf-mem` (so they could not silently fall back to
+memray) made `collector` stop discriminating the two paths: both read `perf_mem`. In
+`check_region_coverage()` this sent every GPU model into the CPU loop — failing them for
+a missing `weight` region and offering the CPU diagnosis (*"the GGUF mapping exceeded
+MAX_REGION_PAGES"*) for a model that has no GGUF file — while the GPU branch below,
+keyed on `collector != "perf_mem"`, could never fire.
+
+Coverage now splits on `model.backend` (with a structural fallback to the presence of
+`pytorch_regions.json` for runs written before the field existed), and a GPU model whose
+census explains the absence reports **WARN**, not FAIL. The verdict is taken from the
+same `Audit._absence_reason()` the per-run audit uses, so the two reports cannot disagree.
+
 ### Fixed — region attribution was invalid (breaks compatibility with earlier traces)
 
 **Problem:** both region-attribution mechanisms were unsound, and each produced a

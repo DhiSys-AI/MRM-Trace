@@ -137,6 +137,34 @@ class LlamaCppEngine(BaseEngine):
         )
         return result
 
+    _EOS_SUPPRESSION_BIAS = -100.0
+
+    def _eos_logit_bias(self) -> dict:
+        """
+        Bias that suppresses every end-of-generation token this model has.
+
+        eos and eot are the same id on Llama 3 (128009) but need not be on other
+        families, and some models stop on an end-of-text token distinct from
+        both.  Whatever is collected here, the caller must still check that the
+        generated count reached the requested one -- a stop token we failed to
+        name would otherwise shorten the run silently, which is exactly how the
+        occupancy sweep would have produced 33% occupancy while reporting
+        success.
+        """
+        ids = set()
+        for name in ("token_eos", "token_eot"):
+            for holder in (self._llm, getattr(self._llm, "_model", None)):
+                fn = getattr(holder, name, None) if holder is not None else None
+                if not callable(fn):
+                    continue
+                try:
+                    tok = fn()
+                except Exception:
+                    continue
+                if isinstance(tok, int) and tok >= 0:
+                    ids.add(tok)
+        return {tok: self._EOS_SUPPRESSION_BIAS for tok in ids}
+
     def _generate_via_bindings(self, prompt: str) -> Tuple[str, int, int]:
         # Reset KV cache so each generate() call uses a fresh context.
         # Without this, prompt tokens accumulate across calls and the context
@@ -144,12 +172,19 @@ class LlamaCppEngine(BaseEngine):
         if hasattr(self._llm, "reset"):
             self._llm.reset()
 
-        output = self._llm(
-            prompt,
+        kwargs = dict(
             max_tokens=self._run_config.output_tokens,
             stop=None,
             echo=False,
         )
+        if getattr(self._run_config, "ignore_eos", False):
+            # -100 is the conventional "never emit" bias; logits sit in roughly
+            # [-20, 20], so this removes the token without risking the NaN that
+            # -inf can produce.  Verified on Llama-3.2-1B: 653 tokens then
+            # finish_reason="stop" becomes 900 tokens and "length".
+            kwargs["logit_bias"] = self._eos_logit_bias()
+
+        output = self._llm(prompt, **kwargs)
         choice = output["choices"][0]
         usage = output.get("usage", {})
         # completion_tokens can be 0 when llama-cpp-python omits usage; fall back
@@ -176,6 +211,10 @@ class LlamaCppEngine(BaseEngine):
             "-c", str(self._run_config.context_length),
             "--no-display-prompt",
         ]
+        if getattr(self._run_config, "ignore_eos", False):
+            # Same semantics as the bindings path, so the two backends do not
+            # disagree about how long a run is.
+            cmd.append("--ignore-eos")
         _LOG.debug("CLI invocation: %s", " ".join(cmd))
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:

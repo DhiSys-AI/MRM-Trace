@@ -19,8 +19,8 @@ from typing import Dict, FrozenSet, List
 CURRENT_VERSIONS: Dict[str, str] = {
     "trace":              "1.0",
     "region_map":         "1.0",
-    "kv_block_lifecycle": "1.0",
-    "metrics":            "1.0",
+    "kv_block_lifecycle": "1.1",
+    "metrics":            "1.1",
     "metadata":           "1.0",
     "manifest":           "1.0",
 }
@@ -41,10 +41,11 @@ REQUIRED_COLUMNS: Dict[str, FrozenSet[str]] = {
     "kv_block_lifecycle": frozenset({
         "block_id", "address", "address_page",
         "write_ns", "last_read_ns", "evict_ns",
-        "total_reads", "lifetime_ns",
+        "total_reads", "write_observed", "lifetime_ns",
     }),
     "metrics": frozenset({
-        "region_type", "n_regions",
+        "region_type", "n_regions", "n_regions_observable",
+        "retention_support_frac",
         "retention_p99_s", "write_once_ratio_mean", "suitability",
     }),
 }

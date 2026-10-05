@@ -98,3 +98,32 @@ def extract_pytorch_regions(model: "nn.Module") -> List[TensorRegion]:
 
     regions.sort(key=lambda r: r.addr_start)
     return regions
+
+
+def parameter_device_summary(model: "nn.Module") -> dict:
+    """
+    Census of where the model's parameters and buffers actually live.
+
+    ``extract_pytorch_regions`` deliberately skips non-CPU tensors, because a
+    CUDA ``data_ptr()`` is a device address that a CPU PMU can never sample.
+    That makes an empty ``pytorch_regions.json`` the correct result for a
+    GPU-resident model — but indistinguishable, after the fact, from the
+    extractor having silently failed.  Recording this census alongside turns
+    "no weight regions" into a statement a reader can check:
+
+        {"cuda:0": {"tensors": 290, "bytes": 988123136}}
+
+    says the weights were on the GPU; ``{}`` or a cpu entry with zero regions
+    extracted would say something broke.
+    """
+    summary: dict = {}
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        try:
+            dev = str(tensor.device)
+            nb = int(tensor.nbytes)
+        except Exception:
+            continue
+        entry = summary.setdefault(dev, {"tensors": 0, "bytes": 0})
+        entry["tensors"] += 1
+        entry["bytes"] += nb
+    return summary

@@ -218,3 +218,11 @@ class RunConfig(BaseModel):
     rep_index: int
     is_warmup: bool = False
     output_dir: Optional[str] = None
+    # Generation stops at the model's end-of-turn token, so output_tokens is a
+    # *ceiling*, not a count: asked for 1977, Llama-3.2-1B produced 653 and the
+    # KV cache reached 33% occupancy instead of 98%.  An occupancy experiment
+    # needs the token count to be the independent variable, which means
+    # suppressing that token.  Off by default -- it makes the model babble past
+    # its natural stopping point, which is right for a memory measurement and
+    # wrong for anything that reads the text.
+    ignore_eos: bool = False

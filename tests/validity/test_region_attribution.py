@@ -425,3 +425,100 @@ def test_reads_per_write_is_a_ratio_of_totals_not_a_mean_of_ratios():
     # (1000 + 1988 + 500) / (10 + 7) = 205.2, not the mean of 100/284/inf.
     assert row["reads_per_write_mean"] == pytest.approx(3488 / 17, rel=1e-6)
     assert np.isfinite(row["reads_per_write_mean"])
+
+
+# ── the headless child must receive everything that shapes the workload ──────
+
+# Every flag that changes what the child *generates*.  A flag left out of the
+# child's argv is ignored while the parent still records it in metadata as
+# though it applied, which makes the run look like the run that was asked for.
+# This has now happened twice:
+#
+#   --num-prompts  omitted from demo_qwen_hf.py: a run asking for one prompt
+#                  generated all seven, concatenating seven KV lifecycles into
+#                  one trace (generate() re-primes the model per prompt).
+#   --ignore-eos   omitted from demo_perf_mem.py: 653 of 1977 tokens, so 33%
+#                  KV occupancy in a run whose metadata said ignore_eos=true.
+#
+# Add to this list whenever a flag reaches the engine, not after it misfires.
+_WORKLOAD_FLAGS = {
+    "demo_perf_mem.py": ["--num-prompts", "--ignore-eos", "--tokens",
+                         "--ctx", "--batch-size", "--model"],
+    # --batch-size is deliberately absent for the GPU path: it reaches metadata
+    # and the run_id, both written by the parent, and never the generation loop,
+    # which is sequential.  Forwarding it would imply it does something.
+    "demo_qwen_hf.py": ["--num-prompts", "--tokens", "--ctx", "--model",
+                        "--device"],
+}
+
+
+@pytest.mark.parametrize("script,flag", [
+    (script, flag)
+    for script, flags in _WORKLOAD_FLAGS.items()
+    for flag in flags
+])
+def test_spawned_child_receives_every_workload_flag(script, flag):
+    """
+    Both collection scripts re-invoke themselves with --headless under perf, and
+    the child re-parses argv from scratch, so forwarding is not optional.
+    """
+    source = (pathlib.Path(__file__).resolve().parents[2]
+              / "notebooks" / "scripts" / script).read_text()
+    start = source.index("inner_cmd = [")
+    # the forwarding must appear in the block that builds the child's argv
+    window = source[start:start + 2600]
+    assert flag in window, f"{script} does not forward {flag} to its headless child"
+
+
+def test_a_workload_flag_the_child_cannot_parse_is_caught(script_dir=None):
+    """
+    Forwarding a flag the child does not define would make argparse exit 2.
+    Both halves have to agree, so the flags are checked against the parser too.
+    """
+    import subprocess
+    import sys
+    root = pathlib.Path(__file__).resolve().parents[2]
+    for script, flags in _WORKLOAD_FLAGS.items():
+        helptext = subprocess.run(
+            [sys.executable, str(root / "notebooks" / "scripts" / script), "--help"],
+            capture_output=True, text=True, timeout=120).stdout
+        for flag in flags:
+            assert flag in helptext, f"{script} forwards {flag} but cannot parse it"
+
+
+def test_both_scripts_share_one_thermal_section(demo):
+    """
+    Each collection script used to build the thermal/validity section itself,
+    and they drifted: the GPU path kept the target-RSS memory ratio that marked
+    8 of 8 runs contaminated, dropped the failure reasons, and never passed the
+    collector section so the sampling-cap check could not run there.
+    """
+    from mrm_trace.telemetry import validity as v
+    for script in ("demo_perf_mem.py", "demo_qwen_hf.py"):
+        source = (pathlib.Path(__file__).resolve().parents[2]
+                  / "notebooks" / "scripts" / script).read_text()
+        assert "thermal_section(" in source, script
+        assert "classify_run(" not in source, (
+            f"{script} classifies validity itself instead of delegating")
+    assert hasattr(v, "thermal_section")
+
+
+def test_thermal_section_always_reports_reasons():
+    """A verdict with reasons=None cannot be acted on or cited in a data card."""
+    from mrm_trace.telemetry.validity import thermal_section
+    out = thermal_section(
+        {"peak_temp_c": 95.0, "throttle_events": 3},
+        baseline_cpu_pct=0.1,
+        observer_effect={"observer_memory_overhead_mb_peak": 400.0,
+                         "observer_memory_system_frac": 0.01},
+        collector_section={"perf_event_max_sample_rate_before": 100_000,
+                           "perf_event_max_sample_rate_after": 100_000},
+    )
+    assert out["run_validity"] == "contaminated"
+    assert isinstance(out["validity_failure_reasons"], list)
+    assert out["validity_failure_reasons"]
+
+    clean = thermal_section({"peak_temp_c": 60.0, "throttle_events": 0}, 0.1,
+                            {"observer_memory_system_frac": 0.01}, {})
+    assert clean["run_validity"] == "clean"
+    assert clean["validity_failure_reasons"] == []

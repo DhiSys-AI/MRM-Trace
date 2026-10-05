@@ -532,3 +532,235 @@ def test_a_done_run_with_no_output_directory_is_requeued(runner, tmp_path,
     assert "vanished__cpu" not in state["runs"]      # re-queued
     assert "kept__cpu" in state["runs"]              # artifacts present
     assert "failed__cpu" in state["runs"]            # untouched here
+
+
+# ── a warmup must be bare on every path ──────────────────────────────────────
+
+def test_both_paths_pass_warmup_only(runner):
+    """
+    The matrix flags rep 0 as a warmup on both paths, but only the CPU branch
+    passed --warmup-only.  So every GPU rep 0 collected a full run: each GPU
+    cell held one cold-cache run and one warm run, the analysis set (rep > 0)
+    kept only the warm one, and the GPU path sat at n=1 with no cross-rep check
+    available.  Wall-clock differed by up to 35% between the two (46.7 s vs
+    34.5 s on mistral-7b), which retention inherits directly.
+    """
+    import pathlib as _p
+    specs = runner.build_matrix()
+    for path_type in ("cpu", "gpu"):
+        warm = next(s for s in specs if s.path_type == path_type and s.is_warmup)
+        data = next(s for s in specs if s.path_type == path_type and not s.is_warmup)
+        assert "--warmup-only" in runner._build_command(warm, _p.Path("models"), "m"), \
+            f"{path_type} warmup collects a full run"
+        assert "--warmup-only" not in runner._build_command(data, _p.Path("models"), "m"), \
+            f"{path_type} data run is being skipped"
+
+
+def test_the_warmup_only_flag_exists_in_both_scripts(runner):
+    """
+    The runner passing a flag the script does not define would make argparse
+    exit 2 and fail the run; passing one the script silently ignores is worse,
+    because the sweep then looks complete.
+    """
+    import pathlib as _p
+    scripts = _p.Path(__file__).resolve().parents[2] / "notebooks" / "scripts"
+    for name in ("demo_perf_mem.py", "demo_qwen_hf.py"):
+        source = (scripts / name).read_text()
+        assert '"--warmup-only"' in source, f"{name} does not define --warmup-only"
+        assert "run_warmup_only" in source, f"{name} does not act on --warmup-only"
+
+
+def test_every_cell_has_two_data_reps(runner):
+    """
+    A cell with one data rep cannot be checked for reproducibility, and a region
+    that varies across identical reps is mis-attributed rather than noisy — so
+    the check is the only thing distinguishing those two cases.
+    """
+    from collections import Counter
+    data_reps = Counter(
+        (s.model_id, s.ctx, s.path_type)
+        for s in runner.build_matrix() if not s.is_warmup
+    )
+    singles = {k: v for k, v in data_reps.items() if v < 2}
+    assert not singles, f"cells with fewer than 2 data reps: {singles}"
+
+
+# ── the occupancy sweep ───────────────────────────────────────────────────────
+#
+# The context sweep varies how much KV cache is *allocated* and not how much is
+# *written*: output tokens are fixed, so every run writes ~535 positions and
+# occupancy falls from 26% at ctx 2048 to 1.6% at ctx 32768.  At the top context
+# 98.4% of the cache is never touched, so the dataset could not speak to a
+# filled cache -- the case MRM turns on.  These tests pin the sweep that fixes
+# that, and the two mistakes it would be easy to make: overrunning the context
+# (which measures eviction, not occupancy) and reusing a 512-token calibration
+# for a 2048-token run.
+
+def test_the_occupancy_sweep_varies_tokens_not_context(runner):
+    specs = runner.build_matrix(occupancy=True)
+    assert {s.ctx for s in specs} == {runner.OCCUPANCY_CTX}
+    assert {s.output_tokens for s in specs} == set(runner.OCCUPANCY_TOKENS)
+    assert len(runner.OCCUPANCY_TOKENS) >= 3
+
+
+def test_every_occupancy_level_fits_the_allocated_cache(runner):
+    """
+    The prompt occupies the cache too.  23 + 2048 overruns n_ctx, and llama.cpp
+    then shifts or evicts -- a different regime from a full cache.
+    """
+    worst = runner._PROMPT_TOKENS + max(runner.OCCUPANCY_TOKENS)
+    assert worst < runner.OCCUPANCY_CTX, worst
+    assert runner.occupancy_fraction(max(runner.OCCUPANCY_TOKENS)) <= 1.0
+
+
+def test_occupancy_levels_actually_span_the_cache(runner):
+    """A sweep whose levels all sit at low occupancy repeats the old problem."""
+    fracs = sorted(runner.occupancy_fraction(t) for t in runner.OCCUPANCY_TOKENS)
+    assert fracs[0] < 0.35, fracs
+    assert fracs[-1] > 0.90, fracs
+
+
+def test_the_command_carries_the_spec_token_count(runner):
+    """
+    --tokens was built from the module constant, so every occupancy level would
+    have generated 512 tokens and the sweep would have been three repetitions
+    of one experiment.
+    """
+    import pathlib as _p
+    specs = runner.build_matrix(occupancy=True)
+    for tokens in runner.OCCUPANCY_TOKENS:
+        spec = next(s for s in specs if s.output_tokens == tokens)
+        cmd = runner._build_command(spec, _p.Path("models"), "m")
+        assert cmd[cmd.index("--tokens") + 1] == str(tokens)
+
+
+def test_calibration_is_keyed_by_token_count_across_the_sweep(runner):
+    """
+    A 512-token measurement must not set the period for a 1977-token run: run
+    length is linear in tokens, so reusing it would coarsen the period ~4x and
+    deliver a quarter of the sample budget.
+    """
+    keys = {runner._calibration_key("m", runner.OCCUPANCY_CTX, t,
+                                    runner.PROMPTS_PER_RUN)
+            for t in runner.OCCUPANCY_TOKENS}
+    assert len(keys) == len(runner.OCCUPANCY_TOKENS)
+
+    stale = {runner._calibration_key("m", runner.OCCUPANCY_CTX, 512,
+                                     runner.PROMPTS_PER_RUN):
+             {"period": 128_000, "samples": 40_500_000}}
+    big = max(runner.OCCUPANCY_TOKENS)
+    assert (runner.sample_period_for(8.38, runner.OCCUPANCY_CTX,
+                                     output_tokens=big, model_id="m",
+                                     calibration=stale)
+            == runner.sample_period_for(8.38, runner.OCCUPANCY_CTX,
+                                        output_tokens=big))
+
+
+def test_a_longer_run_gets_a_coarser_period(runner):
+    """Otherwise the budget is blown in proportion to the token count."""
+    periods = [runner.sample_period_for(4.1, runner.OCCUPANCY_CTX,
+                                        output_tokens=t)
+               for t in sorted(runner.OCCUPANCY_TOKENS)]
+    assert periods == sorted(periods)
+    assert periods[-1] > periods[0]
+
+
+def test_the_fill_estimate_exceeds_a_flat_rate_estimate(runner):
+    """
+    Attention cost grows with occupied positions, so a 4x longer generation
+    takes more than 4x the time.  Ignoring that under-sets the timeout.
+    """
+    flat = runner.estimate_run_seconds(2.0, runner.OCCUPANCY_CTX,
+                                       output_tokens=max(runner.OCCUPANCY_TOKENS))
+    fill = runner.estimate_fill_run_seconds(2.0, max(runner.OCCUPANCY_TOKENS))
+    assert fill > flat
+
+
+def test_occupancy_keys_do_not_collide_with_the_context_sweep(runner):
+    """Both sweeps share one state file, so neither may resume into the other."""
+    ctx_keys = {s.key for s in runner.build_matrix()}
+    occ_keys = {s.key for s in runner.build_matrix(occupancy=True)}
+    assert not ctx_keys & occ_keys
+
+
+def test_every_occupancy_level_has_two_data_reps(runner):
+    from collections import Counter
+    specs = runner.build_matrix(occupancy=True)
+    data = Counter((s.model_id, s.output_tokens)
+                   for s in specs if not s.is_warmup)
+    assert set(data.values()) == {2}, data
+    assert len(data) == len(runner.CPU_MODELS) * len(runner.OCCUPANCY_TOKENS)
+
+
+def test_one_warmup_per_model_not_per_level(runner):
+    """
+    A warmup faults the GGUF in from disk, which is a property of the model and
+    not of the token count -- and --warmup-only generates the full token count.
+    One per level would have spent 1.6 h generating tokens nobody reads to save
+    a cold model load worth 20-45 s: 16.5 min of warmup per 90 s saved on
+    llama-3.1-8b.
+    """
+    from collections import Counter
+    specs = runner.build_matrix(occupancy=True)
+    warm = [s for s in specs if s.is_warmup]
+    assert Counter(s.model_id for s in warm) == {
+        m: 1 for m, _, _, _ in runner.CPU_MODELS}
+    # and it runs at the cheapest level, since its only job is the page cache
+    assert {s.output_tokens for s in warm} == {min(runner.OCCUPANCY_TOKENS)}
+
+
+# ── output_tokens is a ceiling unless the stop token is suppressed ───────────
+
+def test_the_occupancy_sweep_suppresses_the_stop_token(runner):
+    """
+    Generation ends at the model's end-of-turn token, so --tokens is a ceiling
+    and not a count.  Measured: asking Llama-3.2-1B for 1977 tokens produced
+    653, so the KV cache reached 33% occupancy rather than 98% -- and the run
+    reported success, passed its audit and wrote a complete metrics.csv.  An
+    occupancy experiment whose independent variable is not actually controlled
+    is 30 runs of the same experiment.
+    """
+    import pathlib as _p
+    specs = runner.build_matrix(occupancy=True)
+    assert all(s.ignore_eos for s in specs), "an occupancy run must reach --tokens"
+    for s in specs[:4]:
+        cmd = runner._build_command(s, _p.Path("models"), "m")
+        assert "--ignore-eos" in cmd
+
+
+def test_the_context_sweep_does_not_suppress_it(runner):
+    """
+    The already-collected sweep ran without it, so turning it on there would
+    silently make the new runs incomparable with the old ones.
+    """
+    assert not any(s.ignore_eos for s in runner.build_matrix())
+
+
+def test_the_warmup_matches_the_workload_it_warms(runner):
+    specs = runner.build_matrix(occupancy=True)
+    warm = [s for s in specs if s.is_warmup]
+    assert warm and all(s.ignore_eos for s in warm)
+
+
+def test_the_engine_suppresses_every_stop_token_it_can_name(runner):
+    """
+    eos and eot are the same id on Llama 3 but need not be elsewhere, so the
+    bias is built from whatever the model exposes rather than one hard-coded id.
+    """
+    from mrm_trace.engines.llamacpp import LlamaCppEngine
+
+    class _FakeModel:
+        def token_eot(self):
+            return 7
+
+    class _FakeLlm:
+        _model = _FakeModel()
+
+        def token_eos(self):
+            return 2
+
+    engine = LlamaCppEngine.__new__(LlamaCppEngine)
+    engine._llm = _FakeLlm()
+    bias = engine._eos_logit_bias()
+    assert set(bias) == {2, 7}, bias
+    assert set(bias.values()) == {LlamaCppEngine._EOS_SUPPRESSION_BIAS}

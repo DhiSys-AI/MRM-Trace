@@ -215,3 +215,36 @@ class GpuMonitor:
             return parts[0], int(parts[1]), int(parts[2]), float(parts[3])
         except Exception:
             return None
+
+
+def gpu_section(gpu_stats, machine_ctx: dict | None = None) -> dict:
+    """
+    Build the metadata.json ``gpu`` section from a GpuStats and machine context.
+
+    Shared by the CPU and GPU demo scripts so the two cannot drift.  Power draw
+    is only published when ``validate_machine`` judged it plausible; when it did
+    not, the reason is published instead so a reader can tell a missing sensor
+    from a lying one.  The enforced limit is always recorded when known, because
+    it is what makes the draw auditable.
+
+    Returns {} when there is no GPU information at all.
+    """
+    section: dict = {}
+    if gpu_stats is not None:
+        section.update({
+            "name": gpu_stats.name,
+            "vram_total_mb": gpu_stats.vram_total_mb,
+            "vram_start_used_mb": gpu_stats.vram_start_used_mb,
+            "vram_peak_used_mb": gpu_stats.vram_peak_used_mb,
+            "vram_end_used_mb": gpu_stats.vram_end_used_mb,
+            "gpu_util_pct_mean": round(gpu_stats.gpu_util_pct_mean, 1),
+        })
+    if machine_ctx is not None:
+        if machine_ctx.get("gpu_power_draw_w") is not None:
+            section["power_draw_w"] = machine_ctx["gpu_power_draw_w"]
+        if machine_ctx.get("gpu_power_limit_w") is not None:
+            section["power_limit_w"] = machine_ctx["gpu_power_limit_w"]
+        status = machine_ctx.get("gpu_power_draw_status")
+        if status is not None and status != "ok":
+            section["power_draw_status"] = status
+    return section

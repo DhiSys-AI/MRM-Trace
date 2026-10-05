@@ -64,6 +64,37 @@ class Audit:
             self.fail("artifacts", f"missing {', '.join(missing)}")
         return False
 
+    def _absence_reason(self, region_type: str) -> str:
+        """
+        Explain an absent weight/kv_cache attribution from recorded evidence.
+
+        "by design if it could not be isolated" was a hedge the reader had to
+        take on trust.  parameter_devices.json records where the parameters
+        actually lived, so a GPU-resident model turns that hedge into a fact:
+        a CUDA data_ptr() is a device address no CPU PMU can sample.
+        """
+        census_file = self.dir / "parameter_devices.json"
+        if not census_file.exists():
+            return "by design if it could not be isolated (no device census recorded)"
+        try:
+            census = json.loads(census_file.read_text())
+        except Exception:
+            return "by design if it could not be isolated (device census unreadable)"
+        if not census:
+            return "by design if it could not be isolated (device census empty)"
+        non_cpu = {d: i for d, i in census.items() if not d.startswith("cpu")}
+        on_cpu = {d: i for d, i in census.items() if d.startswith("cpu")}
+        if non_cpu and not on_cpu:
+            where = ", ".join(f"{i['tensors']} tensors / {i['bytes'] / 1e6:.0f} MB on {d}"
+                              for d, i in sorted(non_cpu.items()))
+            return (f"expected: all parameters in device memory ({where}), "
+                    "which a CPU PMU cannot address")
+        if non_cpu and on_cpu:
+            return ("partially expected: parameters split across host and device "
+                    "memory; only the host share could ever be attributed")
+        return ("UNEXPECTED: parameters were in host memory, so this region "
+                "should have been isolable")
+
     def check_attribution(self, meta: dict) -> None:
         """
         weight and kv_cache come from address ranges, so every labelled row
@@ -90,8 +121,15 @@ class Audit:
                               f"{labelled.sum():,} rows labelled but no range "
                               "was registered — the label cannot be grounded")
                 else:
-                    self.note(f"attribution/{region_type}: absent (no range, "
-                              "no rows) — by design if it could not be isolated")
+                    reason = self._absence_reason(region_type)
+                    if reason.startswith("UNEXPECTED"):
+                        # Host-resident parameters with no attribution is a
+                        # pipeline failure, not a platform limit.
+                        self.fail(f"attribution/{region_type}",
+                                  f"absent (no range, no rows) — {reason}")
+                    else:
+                        self.note(f"attribution/{region_type}: absent (no range, "
+                                  f"no rows) — {reason}")
                 continue
 
             inside = np.zeros(len(addr), dtype=bool)
@@ -214,6 +252,92 @@ class Audit:
             self.fail("granularity", "region_granularity_bytes not recorded — "
                                      "retention cannot be traced to a granule")
 
+    def check_kv_lifetime_bounded(self, meta: dict) -> None:
+        """
+        No derived duration may exceed the run that produced it.
+
+        A block whose write was never sampled has no lifetime.  Subtracting an
+        imputed write time of 0 from a monotonic timestamp yielded the machine's
+        uptime instead -- 165,781 s of "lifetime" inside a 73 s run, on 99% of
+        blocks across a whole sweep, with every other gate still green.  The
+        bound is what makes that arithmetically impossible to ship again.
+        """
+        path = self.dir / "kv_block_lifecycle.parquet"
+        if not path.exists():
+            return
+        lc = pd.read_parquet(path)
+        if lc.empty or "lifetime_ns" not in lc.columns:
+            return
+
+        c = meta.get("collector") or {}
+        g = meta.get("generation") or {}
+        budget_s = c.get("collection_duration_s") or g.get("total_duration_s")
+        if not budget_s:
+            return
+        # Generous: the collector brackets the whole process, so allow an order
+        # of magnitude over it.  The defect overshot by a factor of 2,000.
+        limit_ns = float(budget_s) * 1e9 * 10
+
+        lifetimes = pd.to_numeric(lc["lifetime_ns"], errors="coerce")
+        over = lifetimes > limit_ns
+        if over.any():
+            worst = lifetimes[over].max() / 1e9
+            self.fail("kv_lifetime",
+                      f"{int(over.sum()):,} of {len(lc):,} KV blocks report a "
+                      f"lifetime longer than 10x the {float(budget_s):,.1f} s run "
+                      f"(worst {worst:,.1f} s) — a lifetime that exceeds its run "
+                      f"is a clock reading, not a duration")
+
+        if "write_observed" in lc.columns:
+            observed = lc["write_observed"].fillna(False).astype(bool)
+            # A null lifetime must mean the write was not observed, and an
+            # observed write must yield a lifetime; otherwise the two columns
+            # disagree about what was measured.
+            if (observed & lifetimes.isna()).any():
+                self.fail("kv_lifetime",
+                          "block(s) have write_observed=True but a null lifetime")
+            if ((~observed) & lifetimes.notna()).any():
+                self.fail("kv_lifetime",
+                          "block(s) have a lifetime without an observed write")
+            frac = observed.mean()
+            if frac < 0.5:
+                self.note(f"kv_lifetime: only {frac:.1%} of {len(lc):,} KV blocks "
+                          f"had a store sampled, so block lifetime and "
+                          f"kv_cache write-once rest on that minority")
+
+    def check_token_count(self, meta: dict) -> None:
+        """
+        A run that stopped early is not the run that was planned.
+
+        `output_tokens` is a *ceiling*: generation ends at the model's
+        end-of-turn token, whichever comes first.  Asking for 1977 tokens on
+        Llama-3.2-1B produced 653, so the KV cache reached 33% occupancy
+        instead of 98% -- and every other field in the run said success.  When a
+        run asked for the end-of-turn token to be suppressed, falling short
+        means a stop token nobody named, and the shortfall has to be loud.
+        """
+        g = meta.get("generation") or {}
+        requested = g.get("tokens_requested_per_prompt") or g.get("output_tokens")
+        prompts = g.get("prompts") or 0
+        achieved = g.get("total_output_tokens")
+        if not requested or not prompts or achieved is None:
+            return
+
+        expected = requested * prompts
+        if achieved >= expected:
+            return
+        shortfall = 1.0 - achieved / expected
+        detail = (f"generated {achieved:,} of {expected:,} requested tokens "
+                  f"({shortfall:.0%} short)")
+        if g.get("ignore_eos"):
+            self.fail("tokens", detail + " despite ignore_eos — a stop token "
+                                         "was not suppressed, so the token "
+                                         "count was not the variable it was "
+                                         "meant to be")
+        else:
+            self.note("tokens: " + detail + " (end-of-turn token fired; "
+                      "output_tokens is a ceiling without ignore_eos)")
+
     # ── driver ───────────────────────────────────────────────────────────────
 
     def run(self) -> bool:
@@ -226,6 +350,8 @@ class Audit:
         self.check_region_expectations()
         self.check_sampling(meta)
         self.check_granularity(meta)
+        self.check_kv_lifetime_bounded(meta)
+        self.check_token_count(meta)
         return not self.failures
 
 

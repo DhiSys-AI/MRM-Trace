@@ -40,11 +40,30 @@ SAMPLE_RATE_FLOOR = 50_000
 
 
 def build_perf_events(load_period: int, ldlat: int = DEFAULT_LDLAT,
-                      store_multiplier: int = DEFAULT_STORE_MULTIPLIER) -> List[str]:
-    """Load and store event specs with independent periods."""
+                      store_multiplier: int = DEFAULT_STORE_MULTIPLIER,
+                      store_period: Optional[int] = None) -> List[str]:
+    """
+    Load and store event specs with independent periods.
+
+    ``store_multiplier`` can only make stores *coarser* than loads, because the
+    store period is a multiple of the load period.  That is the right default --
+    stores are far more frequent than latency-filtered loads -- but it makes the
+    opposite regime inexpressible, and the opposite regime is what any
+    write-centred measurement needs.  Measured on one run: ``kv_cache`` received
+    18 store samples against 2,918 loads, which is too few to support a
+    write-once ratio or a block lifetime.
+
+    ``store_period`` overrides the product outright, so stores can be sampled
+    *denser* than loads.  Note what that costs: ``runtime`` stores outnumber
+    ``kv_cache`` stores 63,361:1 in the sampled trace, so any uniform increase
+    in store density is paid for mostly in ``runtime`` samples.
+    """
+    store = store_period if store_period else load_period * store_multiplier
+    if store < 1:
+        raise ValueError(f"store period must be >= 1, got {store}")
     return [
         f"cpu/mem-loads,ldlat={ldlat},period={load_period}/P",
-        f"cpu/mem-stores,period={load_period * store_multiplier}/P",
+        f"cpu/mem-stores,period={store}/P",
     ]
 
 

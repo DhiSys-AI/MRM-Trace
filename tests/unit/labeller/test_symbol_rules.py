@@ -113,19 +113,32 @@ def test_weight_load_outside_engine_code_is_not_weight():
                            "weight_load", "store") is None
 
 
-def test_a_compute_kernel_store_classifies_activation():
+def test_a_compute_kernel_store_claims_no_region():
     """
-    What a forward-pass kernel's store *does* soundly imply: it writes to an
-    activation buffer.  That is the one region a symbol can establish.
+    A forward-pass kernel's store writes to an activation buffer, so the symbol
+    was taken to establish `activation`.  Sound in principle, useless in
+    practice: the same kernels also write scratch, intermediate and reduction
+    buffers, and which one a sparse sample lands in is arbitrary.  The resulting
+    share varied 28-77x between repetitions of the *same* configuration
+    (llama-3.2-3b ctx2048: 0.01% vs 0.95%), and a region that varies across
+    identical reps is mis-attributed, not noisy.
+
+    No symbol rule now claims a region a symbol cannot establish.  These stores
+    fall through to the address map, which places them in the arena they
+    actually belong to.
     """
     for symbol in ("ggml_vec_dot_q4_K", "ggml_mul_mat", "ggml_gemv_q4_K_8x8_q8_K",
-                   "ggml_compute_forward_soft_max_f32", "ggml_rms_norm"):
+                   "ggml_compute_forward_soft_max_f32", "ggml_rms_norm",
+                   "ggml_silu"):
         assert classify_symbol(symbol, "libggml.so", "generation",
-                               "store") == "activation", symbol
+                               "store") is None, symbol
 
 
-def test_activation_symbol_classifies_activation():
-    assert classify_symbol("ggml_silu", "libggml.so", "generation", "store") == "activation"
+def test_no_rule_claims_an_address_grounded_region():
+    """weight, kv_cache and activation come from address ranges or not at all."""
+    from mrm_trace.labeller.symbol_rules import DEFAULT_RULES
+    claimed = {r.region_type for r in DEFAULT_RULES}
+    assert not claimed & {"weight", "kv_cache", "activation"}, claimed
 
 
 def test_runtime_malloc_classifies_runtime():

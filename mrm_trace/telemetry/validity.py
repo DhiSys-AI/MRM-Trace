@@ -286,3 +286,33 @@ def classify_from_metadata(metadata: dict) -> ValidityResult:
         observer_memory_system_frac=system_frac,
         sample_rate_lowered=sample_rate_lowered,
     )
+
+
+def thermal_section(thermal_meta: dict, baseline_cpu_pct: float,
+                    observer_effect: dict,
+                    collector_section: dict = None) -> dict:
+    """
+    The `thermal` metadata section, with the validity verdict and its reasons.
+
+    Shared by every collection script.  Each one previously built this itself
+    and they drifted: the GPU path kept the target-RSS memory ratio that marked
+    8 of 8 perf-mem runs contaminated, discarded the failure reasons that
+    explain a verdict, and never passed the collector section, so the
+    sampling-cap check could not run there at all.
+
+    collector_section carries the sampling-cap readings and the achieved rate.
+    Omitting it silently disables that check — which is how a run that triggered
+    a mid-run cap reduction was once reported `clean`.
+    """
+    oe = dict(observer_effect or {})
+    oe.setdefault("baseline_cpu_pct", baseline_cpu_pct or 0.0)
+    result = classify_from_metadata({
+        "thermal": thermal_meta or {},
+        "observer_effect": oe,
+        "collector": collector_section or {},
+    })
+    return {
+        **(thermal_meta or {}),
+        "run_validity": result.run_validity,
+        "validity_failure_reasons": result.failure_reasons,
+    }

@@ -5,6 +5,15 @@ import types
 import pytest
 
 from mrm_trace.labeller.labeller import TraceLabeller
+from mrm_trace.labeller.symbol_rules import DEFAULT_RULES, SymbolRule
+
+# These tests exercise the evidence ranking -- symbol vs coarse range, prescan
+# order-independence -- not any particular rule.  Binding them to a shipped rule
+# made them fail when `activation` was removed for being unreproducible, so they
+# use a rule of their own and leave DEFAULT_RULES free to change.
+_PROBE = "ggml_probe_kernel"
+_PROBE_RULES = [SymbolRule(region_type="activation", op_type="store",
+                           symbol_re=_PROBE)] + DEFAULT_RULES
 
 
 def _row(**overrides):
@@ -286,11 +295,22 @@ def test_geometry_kv_range_beats_generic_symbol():
 
 
 def test_generic_symbol_beats_coarse_range():
-    """A kernel's store destination is an activation buffer — that much holds."""
-    lab = TraceLabeller()
+    """A symbol outranks an arena range, which is only coarse evidence."""
+    lab = TraceLabeller(rules=_PROBE_RULES)
     lab.register_address_ranges(_ranges("runtime", "anon"))
-    row = _label_one(lab, symbol="ggml_vec_dot_q4_K", op_type="store")
+    row = _label_one(lab, symbol=_PROBE, op_type="store")
     assert row["region_type"] == "activation"
+
+
+def test_no_shipped_rule_claims_a_region_a_symbol_cannot_establish():
+    """
+    The rule this file's probe imitates was removed: `activation` from a compute
+    kernel's store varied 28-77x between repetitions of one configuration, so it
+    was mis-attributed rather than noisy.  `weight` and `kv_cache` went earlier,
+    for the same reason in stronger form.  All three come from address ranges.
+    """
+    claimed = {r.region_type for r in DEFAULT_RULES}
+    assert not claimed & {"weight", "kv_cache", "activation"}, claimed
 
 
 def test_coarse_range_used_when_no_symbol_matches():
@@ -302,10 +322,10 @@ def test_coarse_range_used_when_no_symbol_matches():
 
 def test_equal_evidence_keeps_first_classification():
     """Ties must not flip, or labelling becomes order-dependent."""
-    lab = TraceLabeller()
+    lab = TraceLabeller(rules=_PROBE_RULES)
     rows = [
-        _row(symbol="ggml_vec_dot_q4_K", op_type="store", sample_id=0),  # → activation
-        _row(symbol="malloc", op_type="store", sample_id=1),             # → runtime
+        _row(symbol=_PROBE, op_type="store", sample_id=0),    # → activation
+        _row(symbol="malloc", op_type="store", sample_id=1),  # → runtime
     ]
     out = list(lab.label(rows))
     assert [r["region_type"] for r in out] == ["activation", "activation"]
@@ -333,17 +353,17 @@ def test_prescan_makes_labelling_order_independent():
     symbol arriving later has no effect and the result depends on row order.
     """
     def _run(order, prescan):
-        lab = TraceLabeller()
+        lab = TraceLabeller(rules=_PROBE_RULES)
         lab.register_address_ranges(_ranges("runtime", "anon"))
         rows = [_row(**kw) for kw in order]
         if prescan:
             lab.prescan_symbols(rows)
         return [r["region_type"] for r in lab.label(rows)]
 
-    symbol_first = [{"symbol": "ggml_vec_dot_q4_K", "op_type": "store", "sample_id": 0},
+    symbol_first = [{"symbol": _PROBE, "op_type": "store", "sample_id": 0},
                     {"symbol": "", "op_type": "store", "sample_id": 1}]
     symbol_last = [{"symbol": "", "op_type": "store", "sample_id": 0},
-                   {"symbol": "ggml_vec_dot_q4_K", "op_type": "store", "sample_id": 1}]
+                   {"symbol": _PROBE, "op_type": "store", "sample_id": 1}]
 
     # Without prescan the two orderings disagree on the first row.
     assert _run(symbol_first, prescan=False)[0] != _run(symbol_last, prescan=False)[0]
@@ -354,9 +374,9 @@ def test_prescan_makes_labelling_order_independent():
 
 
 def test_prescan_returns_upgrade_count():
-    lab = TraceLabeller()
+    lab = TraceLabeller(rules=_PROBE_RULES)
     lab.register_address_ranges(_ranges("runtime", "anon"))
-    n = lab.prescan_symbols([_row(symbol="ggml_vec_dot_q4_K", op_type="store")])
+    n = lab.prescan_symbols([_row(symbol=_PROBE, op_type="store")])
     assert n == 1
 
 

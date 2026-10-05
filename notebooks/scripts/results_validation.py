@@ -64,10 +64,38 @@ _MAX_SHARE_RATIO = 5.0
 # results_exploratory_data_analysis.py does.
 _INFERRED_REGIONS = ("activation",)
 
+# One experimental cell.  The two sweeps vary different things -- the context
+# sweep varies ctx at fixed output tokens, the occupancy sweep varies output
+# tokens at fixed ctx -- so a cell key of (model, ctx) alone merges all three
+# occupancy levels into one cell and the sweep's independent variable vanishes
+# from every table.  Carrying both costs nothing when one of them is constant.
+_CELL = ["model_id", "ctx", "output_tokens"]
+
+# Printed labels stay as they were unless the dataset actually varies tokens,
+# so a context-sweep report is unchanged.
+_SHOW_TOKENS = False
+
+
+def _cell_label(model, ctx, tokens=None) -> str:
+    base = f"{model} ctx{ctx}"
+    if _SHOW_TOKENS and tokens is not None:
+        return f"{base} t{tokens}"
+    return base
+
+# A step this large between adjacent context settings of one model is a
+# discontinuity, not a trend.  Measured: 34 of 40 steps in the v1.5 sweep are
+# under 2.4x, and the two outliers are 36x and 44x.
+_MAX_CONTEXT_STEP = 5.0
+# Below this many regions, a ratio is small-number noise rather than a step.
+_MIN_REGIONS_FOR_STEP = 20
+
 # Retention is last-minus-first access *of a region*, so it needs the same
 # region sampled at least twice.  Below this the distribution is 0 by
 # construction at the granule used.
 _MIN_SAMPLES_PER_REGION = 2.0
+# A percentile resting on under half the regions it claims to describe is
+# a statement about a minority, and must be labelled as one.
+_MIN_SUPPORT_FRAC = 0.5
 
 
 class Report:
@@ -122,6 +150,7 @@ def load_runs(results_dir: pathlib.Path) -> pd.DataFrame:
             "model_id": model["id"],
             "params_b": model.get("params_billions"),
             "model_path": meta.get("engine", {}).get("model_path"),
+            "backend": model.get("backend"),
             "collector": coll["type"],
             "ctx": gen["context_length"],
             "rep": gen.get("rep_index"),
@@ -204,23 +233,45 @@ def check_completeness(runs: pd.DataFrame, report: Report) -> None:
         detail.append(f"incomplete directories (no exports): {len(incomplete)}")
         detail += [f"  - {name}" for name in incomplete[:5]]
 
-    expected_reps = sorted(r for r in runs["rep"].dropna().unique())
-    missing = []
-    for (model, ctx), group in runs.groupby(["model_id", "ctx"]):
-        have = sorted(group["rep"].dropna().unique())
-        gaps = [r for r in expected_reps if r not in have]
-        if gaps:
-            missing.append(f"{model} ctx{ctx}: missing rep(s) {gaps}")
+    # Rep 0 is a warmup that writes nothing by design, so its absence from disk
+    # is the intended state, not a gap; and the two paths need not share a rep
+    # set.  Taking the union over everything reported "missing rep 0" for every
+    # CPU cell and "missing rep 2" for every GPU cell -- 10 lines of noise that
+    # buried a cell genuinely sitting at one data rep.
+    runs = runs.copy()
+    runs["path"] = [
+        "gpu" if _is_gpu_model(runs, m) else "cpu" for m in runs["model_id"]
+    ]
+    data = runs[runs["rep"].fillna(0) > 0]
+
+    missing, thin = [], []
+    for path, path_runs in data.groupby("path"):
+        expected = sorted(r for r in path_runs["rep"].dropna().unique())
+        for cell, group in path_runs.groupby(_CELL):
+            have = sorted(group["rep"].dropna().unique())
+            gaps = [int(r) for r in expected if r not in have]
+            label = _cell_label(*cell)
+            if gaps:
+                missing.append(f"{label} ({path}): missing data rep(s) {gaps}")
+            if len(have) < 2:
+                thin.append(f"{label} ({path}): {len(have)} data rep — "
+                            f"reproducibility cannot be checked for this cell")
+
+    per_path = {
+        path: sorted(int(r) for r in g["rep"].dropna().unique())
+        for path, g in data.groupby("path")
+    }
 
     status = "PASS"
-    if missing:
+    if missing or thin:
         status = "WARN"
-        detail += missing[:10]
+        detail += missing[:10] + thin[:10]
     if incomplete:
         status = "WARN"
     report.add("matrix completeness", status,
                f"{len(runs)} runs over {runs['model_id'].nunique()} models, "
-               f"reps {expected_reps}", detail)
+               f"data reps " + ", ".join(f"{k}: {v}" for k, v in sorted(per_path.items()))
+               + " (rep 0 is a bare warmup and writes nothing)", detail)
 
 
 def check_region_coverage(runs: pd.DataFrame, metrics: pd.DataFrame,
@@ -234,12 +285,17 @@ def check_region_coverage(runs: pd.DataFrame, metrics: pd.DataFrame,
     diagnoses the cause, because there is a specific one — the GGUF mapping is
     skipped when it exceeds MAX_REGION_PAGES.
     """
+    # Split on backend, NOT collector: the GPU path also runs under perf mem,
+    # so `collector` stopped discriminating the two paths and the GPU branch
+    # below would never fire while GPU runs collected the CPU diagnosis.
+    gpu_models = {m for m in metrics["model_id"].unique()
+                  if _is_gpu_model(runs, m)}
     present = (metrics.groupby(["model_id", "collector"])["region_type"]
                .apply(set).to_dict())
-    detail, missing_any = [], False
+    detail, missing_any, explained_any = [], False, False
 
     for (model, collector), have in sorted(present.items()):
-        if collector != "perf_mem":
+        if model in gpu_models:
             continue
         gone = [r for r in _EXPECTED_CPU_REGIONS if r not in have]
         if not gone:
@@ -249,21 +305,57 @@ def check_region_coverage(runs: pd.DataFrame, metrics: pd.DataFrame,
         if "weight" in gone:
             detail.append(_diagnose_missing_weight(runs, model))
 
-    # The GPU path registers its ranges from PyTorch tensors; if those files are
-    # empty the run can only produce runtime/unknown.
+    # The GPU path registers its ranges from PyTorch tensors.  Weights that
+    # live in VRAM have no host address, so their absence is a platform limit,
+    # not a defect — but only when the recorded device census says so.
     for (model, collector), have in sorted(present.items()):
-        if collector == "perf_mem":
+        if model not in gpu_models:
             continue
         gone = [r for r in ("weight", "kv_cache") if r not in have]
-        if gone:
+        if not gone:
+            continue
+        reason = _gpu_absence_reason(runs, model)
+        if reason.startswith("UNEXPECTED"):
             missing_any = True
-            detail.append(f"{model} ({collector}): missing {', '.join(gone)}"
+            detail.append(f"{model} (gpu): missing {', '.join(gone)} — {reason}"
                           + _diagnose_empty_pytorch_regions(runs, model))
+        else:
+            explained_any = True
+            detail.append(f"{model} (gpu): {', '.join(gone)} absent — {reason}")
 
-    report.add("region coverage", "FAIL" if missing_any else "PASS",
-               "every model produced all expected regions" if not missing_any
-               else "some models are missing region types the analysis compares",
-               detail)
+    if missing_any:
+        status, summary = "FAIL", ("some models are missing region types the "
+                                   "analysis compares")
+    elif explained_any:
+        status, summary = "WARN", ("GPU-path models lack weight/kv_cache for a "
+                                   "recorded architectural reason")
+    else:
+        status, summary = "PASS", "every model produced all expected regions"
+    report.add("region coverage", status, summary, detail)
+
+
+def _is_gpu_model(runs: pd.DataFrame, model: str) -> bool:
+    """A model is on the GPU path when its runs used the transformers backend."""
+    rows = runs[runs["model_id"] == model]
+    if rows.empty:
+        return False
+    if (rows["backend"] == "transformers").any():
+        return True
+    # Structural fallback for runs written before `backend` was recorded.
+    return (pathlib.Path(rows.iloc[0]["run_dir"]) / "pytorch_regions.json").exists()
+
+
+def _gpu_absence_reason(runs: pd.DataFrame, model: str) -> str:
+    """
+    Justify absent GPU weight/kv_cache from parameter_devices.json.
+
+    Reuses the per-run auditor so the dataset report and the run audit cannot
+    give different answers about the same run.
+    """
+    rows = runs[runs["model_id"] == model]
+    if rows.empty:
+        return "UNEXPECTED: no runs found for this model"
+    return audit_run(rows.iloc[0]["run_dir"])._absence_reason("weight")
 
 
 def _diagnose_missing_weight(runs: pd.DataFrame, model: str) -> str:
@@ -348,15 +440,16 @@ def check_sampling_consistency(runs: pd.DataFrame, report: Report) -> None:
         detail.append(f"{len(clipped)} run(s) saw the cap fall, but all sampled "
                       "far below it — no clipping")
 
-    periods = runs.groupby(["model_id", "ctx"])["sample_period"].nunique()
+    periods = runs.groupby(_CELL)["sample_period"].nunique()
     varied = periods[periods > 1]
     if len(varied):
         if status == "PASS":
             status = "WARN"
-        detail.append(f"{len(varied)} (model, ctx) group(s) used more than one "
-                      "sampling period — the calibration adjusted mid-sweep, so "
-                      "compare sample counts with care")
-        detail += [f"  - {m} ctx{c}: {n} periods" for (m, c), n in varied.items()][:5]
+        detail.append(f"{len(varied)} cell(s) used more than one sampling "
+                      "period — the calibration adjusted mid-sweep, so compare "
+                      "sample counts with care")
+        detail += [f"  - {_cell_label(*cell)}: {n} periods"
+                   for cell, n in varied.items()][:5]
     report.add("sampling consistency", status,
                "no run was clipped by a falling cap", detail)
 
@@ -374,26 +467,28 @@ def check_reproducibility(metrics: pd.DataFrame, region_maps: pd.DataFrame,
         report.add("reproducibility", "WARN", "no region maps to compare")
         return
 
-    shares = (region_maps.groupby(["model_id", "ctx", "run_id", "region_type"])
+    shares = (region_maps.groupby(_CELL + ["run_id", "region_type"])
               ["access_count"].sum().reset_index())
     totals = shares.groupby("run_id")["access_count"].transform("sum")
     shares["share"] = shares["access_count"] / totals
 
     grounded_bad, inferred_bad, worst_grounded = [], [], 0.0
-    for (model, ctx, region), g in shares.groupby(["model_id", "ctx", "region_type"]):
+    for cell, g in shares.groupby(_CELL + ["region_type"]):
+        *cell_key, region = cell
+        label = _cell_label(*cell_key)
         if len(g) < 2:
             continue
         lo, hi = g["share"].min(), g["share"].max()
         bucket = inferred_bad if region in _INFERRED_REGIONS else grounded_bad
         if lo <= 0:
-            bucket.append(f"{model} ctx{ctx} {region}: share is 0 in "
+            bucket.append(f"{label} {region}: share is 0 in "
                           f"{(g['share'] == 0).sum()} of {len(g)} reps")
             continue
         ratio = hi / lo
         if region not in _INFERRED_REGIONS:
             worst_grounded = max(worst_grounded, ratio)
         if ratio > _MAX_SHARE_RATIO:
-            bucket.append(f"{model} ctx{ctx} {region}: share varies {ratio:.1f}x "
+            bucket.append(f"{label} {region}: share varies {ratio:.1f}x "
                           f"across {len(g)} reps ({lo:.2%} to {hi:.2%})")
 
     detail = list(grounded_bad[:8])
@@ -410,28 +505,121 @@ def check_reproducibility(metrics: pd.DataFrame, region_maps: pd.DataFrame,
 
 
 def check_retention_support(region_maps: pd.DataFrame, runs: pd.DataFrame,
-                            report: Report) -> None:
+                            report: Report,
+                            metrics: pd.DataFrame = None) -> None:
     """
     Retention needs a region sampled at least twice at the granule used.
 
-    The end-of-run granularity sweep reports this per run but is not persisted,
-    so it is recomputed here from region_map access counts — the same quantity
-    the sweep's `samples/region` column reports.
+    Each run now records the fraction of its regions whose retention was
+    observable (`retention_support_frac` in metrics.csv), which is the
+    authoritative number: it is what the published percentiles were actually
+    computed over.  Region-map access counts are the fallback for runs exported
+    before that column existed.
     """
+    granules = sorted(runs["granularity"].dropna().unique())
+    granule_text = ", ".join(f"{int(g) // 1024} KB" for g in granules)
+
+    if metrics is not None and "retention_support_frac" in metrics.columns:
+        per = (metrics.groupby(_CELL + ["region_type"])
+               ["retention_support_frac"].mean().reset_index())
+        thin = per[per["retention_support_frac"] < _MIN_SUPPORT_FRAC]
+        detail = [f"{_cell_label(r.model_id, r.ctx, r.output_tokens)} "
+                  f"{r.region_type}: retention rests on "
+                  f"{r.retention_support_frac:.0%} of its regions"
+                  for r in thin.sort_values("retention_support_frac").itertuples()]
+        report.add("retention support", "WARN" if detail else "PASS",
+                   f"granule(s) used: {granule_text}; {len(thin)} of {len(per)} "
+                   f"(cell, region) pair(s) rest on under "
+                   f"{_MIN_SUPPORT_FRAC:.0%} of their regions",
+                   detail[:12])
+        return
+
     if region_maps.empty:
         report.add("retention support", "WARN", "no region maps to check")
         return
-    per = (region_maps.groupby(["model_id", "ctx", "region_type"])["access_count"]
+    per = (region_maps.groupby(_CELL + ["region_type"])["access_count"]
            .median().reset_index(name="median_samples_per_region"))
     thin = per[per["median_samples_per_region"] < _MIN_SAMPLES_PER_REGION]
-    detail = [f"{r.model_id} ctx{r.ctx} {r.region_type}: median "
+    detail = [f"{_cell_label(r.model_id, r.ctx, r.output_tokens)} "
+              f"{r.region_type}: median "
               f"{r.median_samples_per_region:.1f} samples/region"
               for r in thin.itertuples()]
-    granules = sorted(runs["granularity"].dropna().unique())
     report.add("retention support", "WARN" if detail else "PASS",
-               f"granule(s) used: {', '.join(f'{int(g) // 1024} KB' for g in granules)}; "
-               f"{len(thin)} (model, ctx, region) cell(s) below "
-               f"{_MIN_SAMPLES_PER_REGION:.0f} samples/region",
+               f"granule(s) used: {granule_text}; "
+               f"{len(thin)} (cell, region) pair(s) below "
+               f"{_MIN_SAMPLES_PER_REGION:.0f} samples/region "
+               f"(metrics.csv predates retention_support_frac)",
+               detail[:12])
+
+
+def check_context_continuity(metrics: pd.DataFrame, region_maps: pd.DataFrame,
+                             report: Report) -> None:
+    """
+    A region's size must not jump discontinuously along the swept dimension.
+
+    Every other check in this file compares *repetitions within a cell*, so
+    nothing validated the swept dimension — the one the scaling claims are read
+    along.  The v1.5 sweep contained two 36-44x steps in `runtime` region count
+    between adjacent context settings of one model, reproducible across both
+    reps of each cell and therefore invisible to the reproducibility check,
+    while every other step in the matrix was under 2.4x.
+
+    The axis is whichever one the dataset varies: `ctx` for the context sweep,
+    `output_tokens` for the occupancy sweep.  Hard-coding `ctx` would have made
+    this check silently vacuous on the occupancy sweep, where ctx is constant —
+    a gate that passes because it examined nothing.
+    """
+    if region_maps.empty:
+        report.add("context continuity", "WARN", "no region maps to check")
+        return
+
+    axis = "ctx" if region_maps["ctx"].nunique() > 1 else "output_tokens"
+    if region_maps[axis].nunique() < 2:
+        report.add("context continuity", "PASS",
+                   "only one level on every swept dimension — nothing to compare")
+        return
+
+    # Count per *run* first, then average across reps: grouping straight to the
+    # cell sums the reps and reports a region count no run actually had.
+    key = "run_id" if "run_id" in region_maps.columns else "run_dir"
+    counts = (region_maps.groupby([key, "model_id", axis, "region_type"])
+              .size().reset_index(name="n_regions"))
+    per_cell = (counts.groupby(["model_id", "region_type", axis])["n_regions"]
+                .mean().reset_index())
+
+    label = "ctx" if axis == "ctx" else "t"
+    grounded, inferred, n_steps = [], [], 0
+    for (model, region), group in per_cell.groupby(["model_id", "region_type"]):
+        group = group.sort_values(axis)
+        vals = group["n_regions"].tolist()
+        levels = group[axis].tolist()
+        for i in range(len(vals) - 1):
+            lo, hi = min(vals[i], vals[i + 1]), max(vals[i], vals[i + 1])
+            n_steps += 1
+            if hi < _MIN_REGIONS_FOR_STEP:
+                continue                      # small-number noise, not a step
+            ratio = hi / max(lo, 1)
+            if ratio <= _MAX_CONTEXT_STEP:
+                continue
+            line = (f"{model} {region} {label}{levels[i]}->{levels[i + 1]}: "
+                    f"{vals[i]:,.0f} -> {vals[i + 1]:,.0f} regions "
+                    f"({ratio:.1f}x step)")
+            (inferred if region in _INFERRED_REGIONS else grounded).append(
+                (ratio, line))
+
+    detail = [line for _, line in sorted(grounded, reverse=True)]
+    if detail:
+        detail.append(f"a step this size is not a trend: do not compare this "
+                      f"region across {axis} until it is explained")
+    if inferred:
+        detail.append(f"inferred regions ({', '.join(_INFERRED_REGIONS)}) also "
+                      f"step, which is expected — they are already declared "
+                      f"unstable")
+        detail += [f"  {line}" for _, line in sorted(inferred, reverse=True)][:4]
+
+    report.add("context continuity", "WARN" if grounded else "PASS",
+               f"{len(grounded)} of {n_steps} adjacent-{axis} step(s) exceed "
+               f"{_MAX_CONTEXT_STEP:.0f}x in a non-inferred region",
                detail[:12])
 
 
@@ -498,12 +686,15 @@ def validate(results_dir: pathlib.Path) -> "tuple[Report, dict]":
 
     report = Report()
     check_per_run_audit(runs, report)
+    global _SHOW_TOKENS
+    _SHOW_TOKENS = runs["output_tokens"].nunique() > 1
     check_completeness(runs, report)
     check_region_coverage(runs, metrics, report)
     check_provenance(runs, report)
     check_sampling_consistency(runs, report)
     check_reproducibility(metrics, region_maps, report)
-    check_retention_support(region_maps, runs, report)
+    check_retention_support(region_maps, runs, report, metrics)
+    check_context_continuity(metrics, region_maps, report)
     check_validity(runs, report)
     check_metric_sanity(metrics, report)
     return report, {"runs": len(runs), "models": int(runs["model_id"].nunique())}

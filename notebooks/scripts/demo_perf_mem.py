@@ -102,7 +102,7 @@ from mrm_trace.telemetry.baseline import capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
 from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, GpuMonitor, read_cpu_freq_limits
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
-from mrm_trace.telemetry.validity import classify_from_metadata
+from mrm_trace.telemetry.validity import thermal_section
 from mrm_trace.utils.ids import generate_run_id
 from mrm_trace.utils.machine import machine_slug
 from mrm_trace.validate_machine import collect_machine_context
@@ -177,6 +177,23 @@ def parse_args():
         help=f"store period = --sample-period x this (default "
              f"{_STORE_PERIOD_MULTIPLIER}). Stores are the uninformative "
              "majority; loads carry the weight and KV reads.",
+    )
+    p.add_argument(
+        "--ignore-eos", dest="ignore_eos", action="store_true",
+        help="suppress the end-of-turn token so generation runs to --tokens. "
+             "Without it --tokens is a ceiling, not a count: asked for 1977, "
+             "Llama-3.2-1B produced 653 and the KV cache reached 33%% "
+             "occupancy instead of 98%%. Required for any experiment where the "
+             "token count is the independent variable.",
+    )
+    p.add_argument(
+        "--store-period", dest="store_period", type=int, default=None,
+        help="absolute store sampling period, overriding --store-multiplier. "
+             "Only this can make stores *denser* than loads, which is what "
+             "a write-centred metric needs: kv_cache received 18 store "
+             "samples in a measured run, too few for a write-once ratio. "
+             "Costly -- runtime stores outnumber kv_cache stores 63,361:1, "
+             "so the extra samples are mostly runtime.",
     )
     p.add_argument(
         "--warmup-only", dest="warmup_only", action="store_true",
@@ -393,28 +410,13 @@ def finalise_address_regions(regions: list, kv_regions: list) -> list:
 
 def _thermal_section(thermal_meta, baseline, observer_effect,
                      collector_section=None) -> dict:
-    # Classified through the same entry point --reclassify uses, so a fresh run
-    # and a later reclassification of its metadata can never disagree.  perf mem
-    # is out-of-process, so its memory is judged against system RAM rather than
-    # against the target's own footprint — see validity.py.
-    oe = dict(observer_effect or {})
-    oe.setdefault("baseline_cpu_pct", baseline.cpu_pct if baseline else 0.0)
-    # collector_section carries the sampling-cap readings.  Omitting it was a
-    # live bug: the run that triggered the cap reduction was reported `clean`
-    # because the classifier never saw the fields it checks.
-    validity = classify_from_metadata({
-        "thermal": thermal_meta,
-        "observer_effect": oe,
-        "collector": collector_section or {},
-    })
-    # Keep the reasons: a verdict of "contaminated" with no stated cause cannot
-    # be acted on, and it is the one field the data card needs to justify an
-    # exclusion.
-    return {
-        **thermal_meta,
-        "run_validity": validity.run_validity,
-        "validity_failure_reasons": validity.failure_reasons,
-    }
+    """Delegates to the shared builder so this path cannot drift again."""
+    return thermal_section(
+        thermal_meta,
+        baseline.cpu_pct if baseline else 0.0,
+        observer_effect,
+        collector_section,
+    )
 
 
 def build_metadata(
@@ -424,6 +426,7 @@ def build_metadata(
     region_granularity=_REGION_GRANULARITY_BYTES,
     machine_ctx=None, machine_id=None, samples_collected=None,
     context_length=None, batch_size=None, output_tokens=None, rep_index=None,
+    ignore_eos=False,
 ):
     total_tokens = sum(r["output_tokens"] for r in gen_results)
     total_time = sum(r["duration_s"] for r in gen_results)
@@ -445,6 +448,17 @@ def build_metadata(
             "output_tokens": output_tokens,
             "rep_index": rep_index,
             "total_output_tokens": total_tokens,
+            # output_tokens is what was asked for; total_output_tokens is what
+            # the model produced.  They diverge whenever the end-of-turn token
+            # fires, so recording only one of them hides a run that stopped a
+            # third of the way through its intended occupancy.
+            "ignore_eos": bool(ignore_eos),
+            "tokens_requested_per_prompt": output_tokens,
+            "reached_token_limit": (
+                bool(gen_results)
+                and all(r["output_tokens"] >= (output_tokens or 0)
+                        for r in gen_results)
+            ),
             "total_duration_s": round(total_time, 3),
             "avg_tokens_per_second": round(total_tokens / total_time, 1) if total_time > 0 else 0.0,
         },
@@ -498,8 +512,14 @@ def build_metadata(
             "vram_end_used_mb": gpu_stats.vram_end_used_mb,
             "gpu_util_pct_mean": round(gpu_stats.gpu_util_pct_mean, 1),
         }
-    if machine_ctx is not None and machine_ctx.get("gpu_power_draw_w") is not None:
-        gpu_section["power_draw_w"] = machine_ctx["gpu_power_draw_w"]
+    if machine_ctx is not None:
+        if machine_ctx.get("gpu_power_draw_w") is not None:
+            gpu_section["power_draw_w"] = machine_ctx["gpu_power_draw_w"]
+        if machine_ctx.get("gpu_power_limit_w") is not None:
+            gpu_section["power_limit_w"] = machine_ctx["gpu_power_limit_w"]
+        _status = machine_ctx.get("gpu_power_draw_status")
+        if _status is not None and _status != "ok":
+            gpu_section["power_draw_status"] = _status
     if gpu_section:
         metadata["gpu"] = gpu_section
 
@@ -753,6 +773,7 @@ def run_headless(args) -> None:
     run_cfg = RunConfig(
         run_id=run_id, model=model_cfg, context_length=args.ctx,
         batch_size=args.batch_size, output_tokens=args.tokens, rep_index=args.rep,
+        ignore_eos=args.ignore_eos,
     )
 
     pre_load_maps = snapshot_proc_maps()
@@ -870,6 +891,7 @@ def run_warmup_only(args) -> None:
         run_id=f"{model_id}-warmup", model=model_cfg,
         context_length=args.ctx, batch_size=args.batch_size,
         output_tokens=args.tokens, rep_index=args.rep,
+        ignore_eos=args.ignore_eos,
     )
 
     print(f"Warmup only — {model_id} ctx={args.ctx}, no tracing")
@@ -996,10 +1018,19 @@ def _collect_via_spawn(args, model_path, model_id, events, out_dir, raw_dir, run
         "--rep", str(args.rep),
         "--results-file", str(results_file),
     ]
+    # Anything that changes what the child *generates* has to be forwarded: the
+    # child re-parses argv from scratch, so a flag left out here is silently
+    # ignored while the parent still records it in metadata as though it had
+    # applied.  That is how --num-prompts once generated 7 prompts in a run
+    # recorded as 1, and how --ignore-eos produced 653 of 1977 tokens in a run
+    # whose metadata said ignore_eos=true.
     if args.num_prompts:
         inner_cmd += ["--num-prompts", str(args.num_prompts)]
+    if args.ignore_eos:
+        inner_cmd += ["--ignore-eos"]
     mem_events = build_perf_events(args.sample_period, args.ldlat,
-                                   args.store_multiplier)
+                                   args.store_multiplier,
+                                   store_period=args.store_period)
     probe_ok, probe_msg = probe_perf_events(mem_events)
     if probe_ok:
         # -d sets PERF_SAMPLE_ADDR; --weight carries the load latency.  The
@@ -1407,6 +1438,7 @@ def main():
         output_tokens=args.tokens, rep_index=args.rep,
         region_granularity=args.region_granularity,
         samples_collected=len(labelled),
+        ignore_eos=args.ignore_eos,
     )
     exporter = RunExporter(out_dir)
     export_result = exporter.export(

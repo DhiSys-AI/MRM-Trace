@@ -135,6 +135,13 @@ The Tier 3 validity tests are **the most important tests in the suite**. They ve
 known synthetic inputs produce known metric outputs — e.g. a trace with a 30s weight
 retention window must produce `retention_p99_s ≈ 30.0`.
 
+**Fixtures must match the sampling regime, not just the logic.** Every Tier-3 fixture
+builds 5 samples per region; the v1.5 sweep ran with *one* sample for 70-79% of regions at
+ctx 32768, and three defects passed 967 tests because no fixture exercised that regime —
+see [05 - Imputed Values in Sampled Measurements.md](context-files/05%20-%20Imputed%20Values%20in%20Sampled%20Measurements.md).
+A new derivation needs a test at production density (load/store period ratio 500:1,
+majority single-sample), and an absent observation must come out null rather than 0.
+
 ## Key Design Decisions (ADRs)
 
 ### ADR-1: `perf mem` as primary collector
@@ -198,6 +205,51 @@ every verdict in place. Both a fresh run and a reclassification go through
 `thermal.validity_failure_reasons` stating what failed.
 
 Contaminated runs are archived but excluded from aggregated metrics and paper figures.
+
+## Load/Store Sampling Asymmetry — which metrics it supports
+
+Loads and stores are sampled on **independent periods**: `--sample-period` for loads and
+`--sample-period x --store-multiplier` (default 500x) for stores. Any metric whose
+denominator is an observed write is therefore supported only where stores were actually
+captured, and that varies by region type. Measured on one run:
+
+| Region | loads | stores | write-once ratio | supported? |
+|---|---|---|---|---|
+| `runtime` | 4,752,845 | 1,140,498 | 45.1%, max 6,692 writes/addr | yes |
+| `activation` | 61,248 | 4,656 | 60.8%, max 28 | yes (but symbol-inferred) |
+| `kv_cache` | 2,918 | **18** | 1.000, **sd 0.000 across 30 runs** | **no** |
+| `weight` | 26,652 | **0** | n/a | read-only by construction |
+
+`kv_cache` write-once of exactly 1.000 with zero variance is the signature of at-most-one
+sampled store per address, not of demonstrated write-once behaviour. Report
+`write_once_ratio` and `reads_per_write` as **unsupported for kv_cache**, or re-collect
+with a lower `--store-multiplier`. `weight` having 0 stores is a genuine finding: the GGUF
+is mapped read-only and faulted in by the kernel, so the process never writes it.
+
+**A block lifetime requires its write.** `lifetime_ns` is null when no store for that
+block was sampled — 99.0% of blocks in the v1.5 sweep — and `write_observed` says which.
+Coercing the absent write to 0 returned `last_read_ns - 0`, the monotonic clock itself:
+162,196 s of "lifetime" inside a 73 s run, with every other gate green. The per-run audit
+now fails any lifetime exceeding 10x its own run, because a derived duration longer than
+the run that produced it is arithmetically a clock reading.
+
+**A retention value requires two observations.** A region sampled once has no interval:
+both ends are the same sample. `retention_s` is null below `MIN_SAMPLES_FOR_RETENTION`
+(2), percentiles are computed over observable regions only, and `metrics.csv` carries
+`n_regions_observable` / `retention_support_frac` so a reader can tell a p50 over 1 region
+from one over 10,000. Reporting those as 0.0 understated `kv_cache` p50 from 66.95 s to
+10.04 s at ctx 2048, and to 0.00 s at ctx 8192 and above — making a 1.5-2.2x decline over
+16x context look like a collapse to zero. Sampling density per region falls as context
+grows (fixed 10M budget, more regions), so the artifact was strongest exactly where the
+trend was read off.
+
+Derived quantities are **re-derivable in place**, like validity verdicts:
+`--rederive-kv` rebuilds every `kv_block_lifecycle.parquet` and `--rederive-metrics`
+every `metrics.csv`, each from its own `trace.parquet`. Each re-derivation runs the same
+code the pipeline does — `KVBlockTracker` and `compute_all()` respectively — and
+`test_rederivation_equals_live_tracking` and `test_rederived_metrics_equal_a_live_analysis`
+pin the two equal, so a re-derived dataset is not a patched one. Results written by a sudo sweep are root-owned, so re-derivation needs
+`sudo -E venv/bin/python`.
 
 ## Collector Hierarchy
 

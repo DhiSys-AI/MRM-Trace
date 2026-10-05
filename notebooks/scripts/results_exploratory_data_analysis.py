@@ -29,6 +29,8 @@ import pathlib
 import sys
 
 import numpy as np
+from typing import Optional
+
 import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
@@ -56,6 +58,11 @@ _PARAMS_BY_MODEL_ID = (
 
 # The GPU path writes pytorch_regions.json; the CPU path does not.  Both record
 # collector="perf_mem", so the collector field cannot distinguish them.
+# One experimental cell.  The occupancy sweep varies output tokens at a fixed
+# context, so a key of (model, ctx) alone collapses all three levels into one
+# row and the sweep's independent variable disappears from the tables.
+_CELL = ["model_id", "ctx", "output_tokens"]
+
 _GPU_MARKER = "pytorch_regions.json"
 
 pd.set_option("display.width", 200)
@@ -230,19 +237,32 @@ def section_model_scaling(data: pd.DataFrame, out_dir: pathlib.Path) -> pd.DataF
 
 def section_context_scaling(data: pd.DataFrame, out_dir: pathlib.Path) -> pd.DataFrame:
     """
-    Context length is the lever that moves the KV cache: its size is linear in
-    n_ctx, so this is where a KV-specific signal should appear.
+    The lever that moves the KV cache, whichever one this dataset pulled.
+
+    Context length sets how much KV cache is *allocated*; generated tokens set
+    how much is *written*.  The context sweep varies the first at a fixed
+    second, so occupancy falls as context grows and the cache is never filled.
+    The occupancy sweep varies the second at a fixed first.  Grouping on `ctx`
+    unconditionally made this table a single row on the occupancy sweep --
+    the independent variable averaged away.
     """
-    print_header("4. Context scaling (CPU path, per region type)")
     cpu = data[data["path"] == "cpu"]
-    piv = (cpu.groupby(["region_type", "ctx"])
+    axis = "ctx" if cpu["ctx"].nunique() > 1 else "output_tokens"
+    title = ("4. Context scaling (CPU path, per region type)" if axis == "ctx"
+             else "4. Occupancy scaling (CPU path, per region type)")
+    print_header(title)
+    if axis == "output_tokens":
+        print("  context fixed; generated tokens are the independent variable, "
+              "so the KV cache is progressively filled")
+        print()
+    piv = (cpu.groupby(["region_type", axis])
            .agg(retention_p50_s=("retention_p50_s", "mean"),
                 retention_p99_s=("retention_p99_s", "mean"),
                 write_once=("write_once_ratio_mean", "mean"),
                 working_set_mb=("working_set_mb_total", "mean"),
                 n_regions=("n_regions", "mean"),
                 runs=("run_id", "nunique"))
-           .reset_index().sort_values(["region_type", "ctx"]))
+           .reset_index().sort_values(["region_type", axis]))
     for region in _COMPARABLE_REGIONS:
         sub = piv[piv["region_type"] == region]
         if sub.empty:
@@ -250,13 +270,34 @@ def section_context_scaling(data: pd.DataFrame, out_dir: pathlib.Path) -> pd.Dat
         print(f"  {region}")
         print(sub.drop(columns="region_type").to_string(
             index=False, float_format=lambda v: f"{v:,.3f}"))
-        if region == "kv_cache" and len(sub) > 1:
+        if region == "kv_cache" and len(sub) > 1 and axis == "output_tokens":
+            lo, hi = sub.iloc[0], sub.iloc[-1]
+            if lo["working_set_mb"] > 0:
+                growth = hi["working_set_mb"] / lo["working_set_mb"]
+                span = hi[axis] / lo[axis]
+                print(f"    KV working set grows {growth:.1f}x as written "
+                      f"positions grow {span:.1f}x — here occupancy *is* the "
+                      f"variable, so this is a property of the cache filling "
+                      f"rather than of the allocation.")
+        elif region == "kv_cache" and len(sub) > 1:
             lo, hi = sub.iloc[0], sub.iloc[-1]
             if lo["working_set_mb"] > 0:
                 growth = hi["working_set_mb"] / lo["working_set_mb"]
                 span = hi["ctx"] / lo["ctx"]
-                print(f"    working set grows {growth:.1f}x over a {span:.0f}x "
-                      f"context increase (linear would be {span:.0f}x)")
+                # Stating the growth without the confound invites reading it as
+                # a property of KV caching.  It is not: output tokens are fixed
+                # across the context sweep, so the number of KV entries written
+                # is the same in every run and only the *allocated* buffer
+                # scales.  Occupancy therefore falls from ~26% to ~1.6%, and a
+                # flat touched footprint is the expected consequence of the
+                # design, not a finding about KV behaviour.
+                print(f"    KV working set changes {growth:.1f}x over a "
+                      f"{span:.0f}x context increase — but output tokens are "
+                      f"fixed, so the same ~535 KV positions are written in "
+                      f"every run and occupancy falls from ~26% to ~1.6%.")
+                print(f"    This sweep varies KV *allocation*, not KV "
+                      f"*occupancy*; it cannot support a claim about how KV "
+                      f"memory behaves as the cache fills.")
         print()
     _write_csv(piv, out_dir / "context_scaling.csv")
     return piv
@@ -277,6 +318,7 @@ def section_kv_lifecycle(runs: pd.DataFrame, out_dir: pathlib.Path) -> pd.DataFr
         if lc.empty:
             continue
         lc["model_id"], lc["ctx"], lc["rep"] = row.model_id, row.ctx, row.rep
+        lc["output_tokens"] = row.output_tokens
         frames.append(lc)
     if not frames:
         print("  no KV lifecycle rows in the dataset")
@@ -284,16 +326,48 @@ def section_kv_lifecycle(runs: pd.DataFrame, out_dir: pathlib.Path) -> pd.DataFr
     lc = pd.concat(frames, ignore_index=True)
     if "lifetime_ns" in lc:
         lc["lifetime_s"] = lc["lifetime_ns"] / 1e9
+
+    # A block's lifetime is defined only when its write was sampled.  Stores run
+    # on a much sparser period than loads, so for most blocks no store was ever
+    # captured and lifetime_ns is null -- an absence, not a zero.  Averaging
+    # over those would report the monotonic clock as a duration.
+    if "write_observed" in lc.columns:
+        timed = lc[lc["write_observed"].fillna(False).astype(bool)]
+    elif "lifetime_s" in lc.columns:
+        timed = lc[lc["lifetime_s"].notna()]
+    else:
+        timed = lc
+
     agg_cols = {c: ["count", "mean", "median"] for c in
-                ("lifetime_s", "total_reads") if c in lc.columns}
-    if agg_cols:
-        summary = lc.groupby(["model_id", "ctx"]).agg(agg_cols).reset_index()
+                ("lifetime_s", "total_reads") if c in timed.columns}
+    if agg_cols and not timed.empty:
+        summary = timed.groupby(_CELL).agg(agg_cols).reset_index()
         print(summary.to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
+        print()
+        print("  lifetime columns cover only blocks whose write was sampled; "
+              "total_reads below covers every block")
+    else:
+        print("  no KV block in the dataset had its write sampled, so no block "
+              "lifetime is measurable; read counts are reported below")
+
     print()
     print(f"  {len(lc):,} KV blocks across {lc['model_id'].nunique()} model(s)")
+    n_timed = len(timed)
+    print(f"  blocks with a sampled write (lifetime measurable): {n_timed:,} "
+          f"({n_timed / len(lc):.1%})")
+    if n_timed / max(len(lc), 1) < 0.5:
+        print("    -> block lifetime rests on this minority; it is not a "
+              "dataset-wide measurement. Lower the store sampling period to "
+              "raise it.")
     if "total_reads" in lc:
+        reads = (lc.groupby(_CELL)["total_reads"]
+                 .agg(["count", "mean", "median"]).reset_index())
+        print()
+        print("  read counts over all blocks:")
+        print(reads.to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
         never = (lc["total_reads"] == 0).sum()
-        print(f"  blocks written but never read in the trace: {never:,} "
+        print()
+        print(f"  blocks with no sampled read: {never:,} "
               f"({never / len(lc):.1%})")
     _write_csv(lc, out_dir / "kv_lifecycle_blocks.csv")
     return lc
@@ -330,7 +404,8 @@ def section_memory_hierarchy(runs: pd.DataFrame, out_dir: pathlib.Path,
 
 
 def section_caveats(runs: pd.DataFrame, metrics: pd.DataFrame,
-                    data: pd.DataFrame) -> None:
+                    data: pd.DataFrame,
+                    kv_blocks: Optional[pd.DataFrame] = None) -> None:
     """
     Caveats derived from the data, so the report cannot silently outrun what
     was measured.
@@ -361,6 +436,23 @@ def section_caveats(runs: pd.DataFrame, metrics: pd.DataFrame,
                          "those regions received no store samples, which for a "
                          "read-only mapping is the limiting case of write-once "
                          "rather than missing data.")
+
+    # Loads and stores are sampled on independent periods, the store period
+    # being far sparser.  Any metric that divides by an observed write count --
+    # write-once ratio, reads-per-write -- is therefore supported only where
+    # stores were actually captured.  The KV lifecycle file measures that
+    # support directly, so the caveat is derived rather than assumed.
+    if kv_blocks is not None and len(kv_blocks) and "write_observed" in kv_blocks:
+        frac = kv_blocks["write_observed"].fillna(False).astype(bool).mean()
+        if frac < 0.5:
+            notes.append(
+                f"only {frac:.1%} of {len(kv_blocks):,} KV blocks had a store "
+                "sampled, because stores are sampled on a much sparser period "
+                "than loads. `write_once_ratio` and `reads_per_write` for "
+                "kv_cache are computed over that minority, so a value of 1.000 "
+                "reflects at-most-one sampled store per address rather than "
+                "demonstrated write-once behaviour. Report them as unsupported "
+                "for kv_cache, or re-collect with a lower store period.")
 
     granules = sorted(runs["granularity"].dropna().unique())
     notes.append("retention is reported at a granule of "
@@ -471,10 +563,10 @@ def main() -> int:
     contrast = section_region_contrast(data, out_dir)
     section_model_scaling(data, out_dir)
     ctx_scaling = section_context_scaling(data, out_dir)
-    section_kv_lifecycle(runs, out_dir)
+    kv_blocks = section_kv_lifecycle(runs, out_dir)
     if args.with_traces:
         section_memory_hierarchy(runs, out_dir, args.trace_limit)
-    section_caveats(runs, metrics, data)
+    section_caveats(runs, metrics, data, kv_blocks)
     make_figures(contrast, ctx_scaling, out_dir)
     print()
     return 0

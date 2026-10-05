@@ -2,11 +2,21 @@
 KV cache block lifecycle tracker.
 
 For each unique KV cache address, records:
-  write_ns   — timestamp of the first STORE (block allocation)
+  write_ns   — timestamp of the first STORE, or None if no store was ever sampled
   last_read_ns — timestamp of the most recent LOAD
-  evict_ns   — timestamp of a second STORE (block eviction / reuse)
+  evict_ns   — timestamp of a second STORE (block reuse / eviction)
   total_reads — LOAD count
-  lifetime_ns — (evict_ns or last_read_ns) - write_ns
+  write_observed — whether a store for this block appeared in the sample
+  lifetime_ns — (evict_ns or last_read_ns) - write_ns, or None when the write
+                was never sampled
+
+A block's lifetime is only defined when its write was *observed*.  Stores are
+sampled on their own, much sparser period than loads, so the common case for a
+KV block is many sampled loads and no sampled store at all.  Coercing that
+absent write to 0 does not yield a short lifetime — it yields
+``last_read_ns - 0``, the raw monotonic clock reading, which is the machine's
+uptime (tens of hours) rather than a duration.  Such a block reports
+``lifetime_ns = None``; the absence is recorded, never imputed.
 
 This data is the primary input for KV cache retention analysis (Phase 6).
 """
@@ -75,16 +85,23 @@ class KVBlockTracker:
         """Return rows for kv_block_lifecycle.parquet."""
         rows = []
         for e in self._blocks.values():
-            write_ns = e.write_ns or 0
-            end_ns = e.evict_ns or e.last_read_ns or write_ns
+            # An unsampled store is an unknown, not a write at t=0.  Subtracting
+            # 0 from a monotonic timestamp yields the clock reading itself, so
+            # the lifetime of a block whose write was never sampled is null.
+            if e.write_ns is None:
+                lifetime_ns = None
+            else:
+                end_ns = e.evict_ns or e.last_read_ns or e.write_ns
+                lifetime_ns = max(0, end_ns - e.write_ns)
             rows.append({
                 "block_id": e.block_id,
                 "address": e.address,
                 "address_page": e.address_page,
-                "write_ns": write_ns,
+                "write_ns": e.write_ns,
                 "last_read_ns": e.last_read_ns,
                 "evict_ns": e.evict_ns,
                 "total_reads": e.total_reads,
-                "lifetime_ns": max(0, end_ns - write_ns),
+                "write_observed": e.write_ns is not None,
+                "lifetime_ns": lifetime_ns,
             })
         return rows

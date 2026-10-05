@@ -169,9 +169,18 @@ class TestSymbolEvidenceReachesLabeller:
         labelled = list(TraceLabeller().label(rows))
         assert labelled[0]["region_type"] != "kv_cache"
 
-    def test_a_compute_kernel_store_reaches_the_labeller_as_activation(self):
-        """A forward-pass kernel's store destination is an activation buffer."""
+    def test_a_compute_kernel_symbol_reaches_the_labeller(self):
+        """
+        What this check is for: the symbol parsed out of the IP field has to
+        arrive at the labeller intact, whatever the rules then do with it.
+
+        It used to observe that through the `activation` rule, which bound a
+        parser test to a labelling policy -- so it failed when that rule was
+        removed for varying 28-77x across identical repetitions.  A rule defined
+        here keeps the plumbing under test and leaves the policy free.
+        """
         from mrm_trace.labeller import TraceLabeller
+        from mrm_trace.labeller.symbol_rules import SymbolRule
 
         line = _RESOLVED.replace("__strlen_evex", "ggml_vec_dot_q6_K_q8_K").replace(
             "/usr/lib/x86_64-linux-gnu/libc.so.6", "/venv/lib/libggml-cpu.so"
@@ -179,5 +188,10 @@ class TestSymbolEvidenceReachesLabeller:
         rows = _parse(line)
         for r in rows:
             r["op_type"] = "store"
-        labelled = list(TraceLabeller().label(rows))
-        assert labelled[0]["region_type"] == "activation"
+        assert rows[0]["symbol"] == "ggml_vec_dot_q6_K_q8_K"
+        assert "libggml-cpu.so" in rows[0]["dso"]
+
+        probe = [SymbolRule(region_type="probe", op_type="store",
+                            symbol_re=r"ggml_vec_dot")]
+        labelled = list(TraceLabeller(rules=probe).label(rows))
+        assert labelled[0]["region_type"] == "probe"

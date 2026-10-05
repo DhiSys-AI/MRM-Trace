@@ -38,6 +38,7 @@ import pandas as pd
 from mrm_trace.analyser import compute_all
 from mrm_trace.collector.perf_events import (
     DEFAULT_LDLAT,
+    perf_event_paranoid,
     DEFAULT_STORE_MULTIPLIER,
     achieved_rate_per_cpu,
     build_perf_events,
@@ -55,7 +56,8 @@ from mrm_trace.telemetry.baseline import capture_baseline
 from mrm_trace.telemetry.observer_effect import compute_observer_effect
 from mrm_trace.telemetry.system_monitor import CpuFreqMonitor, CpuFreqLimits, GpuMonitor, read_cpu_freq_limits
 from mrm_trace.telemetry.thermal import ThermalMonitor, read_package_temp_c
-from mrm_trace.telemetry.validity import classify_run
+from mrm_trace.telemetry.validity import thermal_section
+from mrm_trace.telemetry.system_monitor import gpu_section
 from mrm_trace.utils.ids import generate_run_id
 from mrm_trace.utils.machine import machine_slug
 from mrm_trace.validate_machine import collect_machine_context
@@ -107,9 +109,12 @@ def _check_pmu() -> "tuple[bool, str]":
 
 
 def _auto_select_collector(is_root: bool) -> str:
+    """
+    Pick a collector.  PMU access, not root, decides — see _can_access_pmu().
+    """
     if _is_wsl2():
         return "memray"
-    if not is_root:
+    if not _can_access_pmu(is_root):
         return "memray"
     pmu_ok, _ = _check_pmu()
     return "perf-mem" if pmu_ok else "memray"
@@ -130,6 +135,12 @@ def parse_args():
                         "is linear in this, and each prompt is an independent KV "
                         "lifecycle because the model is re-primed per prompt.")
     p.add_argument("--rep", type=int, default=0, help="Repetition index (0 = warmup, 1+ = data runs)")
+    p.add_argument("--warmup-only", action="store_true", dest="warmup_only",
+                   help="load the model and generate, then exit without "
+                        "collecting, parsing or exporting. A warmup exists so "
+                        "the measured reps do not pay for faulting weights in "
+                        "from disk; collecting one costs a full run for a trace "
+                        "the analysis set (rep > 0) discards.")
     p.add_argument("--out", default="results")
     p.add_argument(
         "--machine", default=None,
@@ -146,6 +157,13 @@ def parse_args():
     p.add_argument("--store-multiplier", dest="store_multiplier", type=int,
                    default=DEFAULT_STORE_MULTIPLIER,
                    help="store period = --sample-period x this")
+    p.add_argument("--store-period", dest="store_period", type=int, default=None,
+                   help="absolute store sampling period, overriding --store-multiplier. "
+             "Only this can make stores *denser* than loads, which is what "
+             "a write-centred metric needs: kv_cache received 18 store "
+             "samples in a measured run, too few for a write-once ratio. "
+             "Costly -- runtime stores outnumber kv_cache stores 63,361:1, "
+             "so the extra samples are mostly runtime.")
     p.add_argument("--region-granularity", dest="region_granularity", type=int,
                    default=65536, help="bytes per region for retention analysis")
     # Internal flag used when perf spawns this script as the traced workload
@@ -245,7 +263,8 @@ def run_headless(args) -> None:
 
     check_transformers()
 
-    from mrm_trace.labeller.pytorch_regions import extract_pytorch_regions
+    from mrm_trace.labeller.pytorch_regions import (
+        extract_pytorch_regions, parameter_device_summary)
     from mrm_trace.labeller.kv_address_monitor import (
         install_transformers_kv_monitor,
         uninstall_transformers_kv_monitor,
@@ -263,8 +282,23 @@ def run_headless(args) -> None:
     regions = extract_pytorch_regions(model)
     regions_file = pathlib.Path(args.results_file).with_name("pytorch_regions.json")
     regions_file.write_text(json.dumps([r.to_dict() for r in regions]))
+
+    # Census of parameter placement.  An empty pytorch_regions.json is correct
+    # for a GPU-resident model (a CUDA data_ptr() is not a host address), so
+    # record where the weights actually were — otherwise the dataset cannot
+    # distinguish "correctly skipped" from "extractor failed".
+    device_summary = parameter_device_summary(model)
+    device_file = pathlib.Path(args.results_file).with_name("parameter_devices.json")
+    device_file.write_text(json.dumps(device_summary))
+
     print(f"  Weight regions recorded: {len(regions)} tensors across "
           f"{sum(r.size_bytes for r in regions) / 1e6:.0f} MB")
+    for dev, info in sorted(device_summary.items()):
+        note = ""
+        if not dev.startswith("cpu"):
+            note = "  → device memory, not addressable by a CPU PMU (skipped by design)"
+        print(f"    parameters on {dev}: {info['tensors']} tensors, "
+              f"{info['bytes'] / 1e6:.0f} MB{note}")
 
     # Install KV cache monitor BEFORE generation so every K/V tensor address
     # created by DynamicCache.update (including intermediate torch.cat results)
@@ -323,6 +357,11 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     perf_data = raw_dir / "perf.data"
 
     # Build the headless command: re-invoke this script under perf
+    # Every argument that changes the workload has to reach the headless child:
+    # it is the process perf traces, and it re-parses argv from scratch.
+    # --num-prompts was missing, so a run asking for one prompt generated all
+    # seven — seven times the work and seven concatenated KV lifecycles in one
+    # trace.
     inner_cmd = [
         sys.executable, str(pathlib.Path(__file__).resolve()),
         "--headless",
@@ -332,6 +371,8 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
         "--device", args.device,
         "--results-file", str(results_file),
     ]
+    if args.num_prompts:
+        inner_cmd += ["--num-prompts", str(args.num_prompts)]
     # -k CLOCK_MONOTONIC puts sample timestamps in the same domain as _mono_ns().
     from mrm_trace.collector.perf_runner import clock_args
 
@@ -339,7 +380,8 @@ def collect_with_perf_mem(args, raw_dir: pathlib.Path, run_id: str):
     # module.  This script previously ran `perf mem record` with no period and
     # no events, so its runs recorded no acquisition parameters at all.
     perf_events = build_perf_events(args.sample_period, args.ldlat,
-                                    args.store_multiplier)
+                                    args.store_multiplier,
+                                    store_period=args.store_period)
     probe_ok, probe_msg = probe_perf_events(perf_events)
     if probe_ok:
         perf_cmd = (record_command(perf, perf_events, str(perf_data))
@@ -671,32 +713,18 @@ def _hw_section(baseline, cpu_freq_limits, cpu_freq_stats, machine_ctx) -> dict:
 
 
 def _gpu_section(gpu_stats, machine_ctx) -> dict:
-    section: dict = {}
-    if gpu_stats is not None:
-        section = {
-            "name": gpu_stats.name,
-            "vram_total_mb": gpu_stats.vram_total_mb,
-            "vram_start_used_mb": gpu_stats.vram_start_used_mb,
-            "vram_peak_used_mb": gpu_stats.vram_peak_used_mb,
-            "vram_end_used_mb": gpu_stats.vram_end_used_mb,
-            "gpu_util_pct_mean": round(gpu_stats.gpu_util_pct_mean, 1),
-        }
-    if machine_ctx is not None and machine_ctx.get("gpu_power_draw_w") is not None:
-        section["power_draw_w"] = machine_ctx["gpu_power_draw_w"]
-    return section
+    return gpu_section(gpu_stats, machine_ctx)
 
 
-def _thermal_section(thermal_meta, baseline, observer_effect) -> dict:
-    oe = observer_effect or {}
-    validity = classify_run(
-        observer_cpu_overhead_pct_max=oe.get("observer_cpu_overhead_pct_mean", 0.0),
-        observer_memory_frac=oe.get("observer_memory_overhead_frac", 0.0),
-        thermal_throttle_events=thermal_meta["throttle_events"],
-        baseline_cpu_pct=baseline.cpu_pct if baseline else 0.0,
-        io_contention_detected=oe.get("io_contention_detected", False),
-        peak_temp_c=thermal_meta.get("peak_temp_c", 0.0),
+def _thermal_section(thermal_meta, baseline, observer_effect,
+                     collector_section=None) -> dict:
+    """Delegates to the shared builder so this path cannot drift again."""
+    return thermal_section(
+        thermal_meta,
+        baseline.cpu_pct if baseline else 0.0,
+        observer_effect,
+        collector_section,
     )
-    return {**thermal_meta, "run_validity": validity.run_validity}
 
 
 def build_metadata(
@@ -734,7 +762,10 @@ def build_metadata(
     if observer_effect is not None:
         metadata["observer_effect"] = observer_effect
     if thermal_meta is not None:
-        metadata["thermal"] = _thermal_section(thermal_meta, baseline, observer_effect)
+        metadata["thermal"] = _thermal_section(
+            thermal_meta, baseline, observer_effect,
+            collector_section=metadata.get("collector"),
+        )
     return metadata
 
 
@@ -745,10 +776,30 @@ def _df_val(df, col, agg="mean"):
     return round(float(vals.agg(agg)), 4) if len(vals) > 0 else "n/a"
 
 
+def _can_access_pmu(is_root: bool) -> bool:
+    """
+    Root is not the requirement — PMU access is.
+
+    With kernel.perf_event_paranoid <= 0 an unprivileged user can record
+    hardware events, so refusing to start then costs a pointless sudo.  Matches
+    the check in demo_perf_mem.py.
+    """
+    if is_root:
+        return True
+    paranoid = perf_event_paranoid()
+    return paranoid is not None and paranoid <= 0
+
+
 def _resolve_collector(args, is_root: bool) -> str:
     if args.collector != "auto":
-        if args.collector == "perf-mem" and not is_root:
-            print("ERROR: perf mem requires root. Re-run with sudo -E venv/bin/python.", file=sys.stderr)
+        if args.collector == "perf-mem" and not _can_access_pmu(is_root):
+            paranoid = perf_event_paranoid()
+            print("ERROR: perf mem needs PMU access: either run as root or set "
+                  f"kernel.perf_event_paranoid <= 0 (currently {paranoid}).",
+                  file=sys.stderr)
+            print("  sudo -E venv/bin/python notebooks/scripts/demo_qwen_hf.py ...",
+                  file=sys.stderr)
+            print("  or: sudo sysctl -w kernel.perf_event_paranoid=0", file=sys.stderr)
             sys.exit(1)
         return args.collector
     collector = _auto_select_collector(is_root)
@@ -798,12 +849,36 @@ def _print_analysis_summary(analysis: dict) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def run_warmup_only(args) -> None:
+    """
+    Warm the page cache and exit.
+
+    Without this the GPU branch collected a full run for every rep 0 the matrix
+    called a warmup, so each GPU cell held one cold-cache run and one warm run
+    and the analysis set (rep > 0) kept only the warm one -- leaving every GPU
+    cell at n=1, with no cross-rep check possible on that path.  Wall-clock
+    differed by up to 35% between the two (46.7 s vs 34.5 s on mistral-7b),
+    which retention, being last-minus-first access, inherits directly.
+    """
+    check_transformers()
+    print("Warmup run — loading model and generating, no collection")
+    load_start_ns = _mono_ns()
+    model, tokenizer = load_model_and_tokenizer(args.model, args.device)
+    print(f"Model loaded in {(_mono_ns() - load_start_ns) / 1e9:.1f}s")
+    run_generation(model, tokenizer, args.tokens, num_prompts=args.num_prompts)
+    print("Warmup complete — page cache warmed, no artifacts written")
+
+
 def main():
     args = parse_args()
 
     # Headless mode: run by perf mem record as the traced workload
     if args.headless:
         run_headless(args)
+        return
+
+    if args.warmup_only:
+        run_warmup_only(args)
         return
 
     check_transformers()

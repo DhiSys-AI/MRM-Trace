@@ -37,10 +37,18 @@ def _rows(region_id, region_type, n_stores, n_loads, base_address=0x1000):
 )
 @settings(max_examples=200, deadline=None)
 def test_retention_ns_always_nonnegative(n_stores, n_loads):
-    """retention_ns must never be negative regardless of access pattern."""
+    """
+    retention_ns must never be negative regardless of access pattern.
+
+    It may be null: a region sampled once has no interval to measure, so the
+    value is absent rather than zero.
+    """
     trace = pd.DataFrame(_rows(1, "weight", n_stores, n_loads))
     per_region, _ = compute_retention(trace)
-    assert (per_region["retention_ns"] >= 0).all()
+    observed = per_region["retention_ns"].dropna()
+    assert (observed >= 0).all()
+    unobservable = per_region[~per_region["retention_observable"]]
+    assert unobservable["retention_ns"].isna().all()
 
 
 @given(
@@ -49,10 +57,16 @@ def test_retention_ns_always_nonnegative(n_stores, n_loads):
 )
 @settings(max_examples=200, deadline=None)
 def test_retention_s_consistent_with_ns(n_stores, n_loads):
-    """retention_s must equal retention_ns / 1e9 (within floating-point tolerance)."""
+    """
+    retention_s must equal retention_ns / 1e9 (within floating-point tolerance),
+    and the two must be absent together.
+    """
     trace = pd.DataFrame(_rows(1, "weight", n_stores, n_loads))
     per_region, _ = compute_retention(trace)
     for _, row in per_region.iterrows():
+        if pd.isna(row["retention_ns"]):
+            assert pd.isna(row["retention_s"])
+            continue
         assert abs(row["retention_s"] - row["retention_ns"] / 1e9) < 1e-6
 
 
