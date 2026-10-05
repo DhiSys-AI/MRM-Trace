@@ -42,7 +42,12 @@ _WARMUP_REP = 0
 
 # Region types the MRM comparison needs from a CPU run.  activation and
 # runtime are inferred, weight and kv_cache are address-grounded.
-_EXPECTED_CPU_REGIONS = ("weight", "kv_cache", "activation", "runtime")
+# The region types a CPU-path run must produce.  `activation` was removed from
+# this set when its symbol rule was removed: its share varied 28-77x between
+# repetitions of one configuration, so it was mis-attributed rather than noisy,
+# and no rule claims it any more.  Leaving it here made every run in the next
+# sweep FAIL for not producing a region type the code cannot produce.
+_EXPECTED_CPU_REGIONS = ("weight", "kv_cache", "runtime")
 
 # Across repetitions of one configuration, a region's share of the trace should
 # be stable.  A large spread is the signature of propagated mis-attribution
@@ -62,6 +67,8 @@ _MAX_SHARE_RATIO = 5.0
 # not a quantity to compare across runs.  That is a caveat to declare, not a
 # release blocker — provided the analysis declares it, which
 # results_exploratory_data_analysis.py does.
+# Nothing is symbol-inferred any more; kept so a dataset collected under the
+# old rules still has its `activation` rows treated as the caveat they are.
 _INFERRED_REGIONS = ("activation",)
 
 # One experimental cell.  The two sweeps vary different things -- the context
@@ -70,6 +77,11 @@ _INFERRED_REGIONS = ("activation",)
 # occupancy levels into one cell and the sweep's independent variable vanishes
 # from every table.  Carrying both costs nothing when one of them is constant.
 _CELL = ["model_id", "ctx", "output_tokens"]
+
+# Every loader must attach all of _CELL.  A column added here but not to
+# load_metrics() and load_region_maps() raises KeyError on the first real
+# dataset, which synthetic fixtures carrying the column by hand will not catch.
+_CELL_SOURCES = ("load_runs", "load_metrics", "load_region_maps")
 
 # Printed labels stay as they were unless the dataset actually varies tokens,
 # so a context-sweep report is unchanged.
@@ -176,7 +188,8 @@ def load_metrics(runs: pd.DataFrame) -> pd.DataFrame:
     frames = []
     for _, run in runs.iterrows():
         m = pd.read_csv(pathlib.Path(run["run_dir"]) / "metrics.csv")
-        for col in ("run_id", "model_id", "collector", "ctx", "rep", "params_b"):
+        for col in ("run_id", "model_id", "collector", "ctx", "rep",
+                    "params_b", "output_tokens"):
             m[col] = run[col]
         frames.append(m)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -197,6 +210,8 @@ def load_region_maps(runs: pd.DataFrame) -> pd.DataFrame:
         rm["model_id"] = run["model_id"]
         rm["collector"] = run["collector"]
         rm["ctx"] = run["ctx"]
+        rm["rep"] = run["rep"]
+        rm["output_tokens"] = run["output_tokens"]
         frames.append(rm)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 

@@ -11,7 +11,7 @@ _KNOWN_SCHEMA_VERSIONS: Dict[str, str] = {
     "trace.parquet": "1.0",
     "region_map.parquet": "1.0",
     "kv_block_lifecycle.parquet": "1.1",
-    "metrics.csv": "1.1",
+    "metrics.csv": "1.2",
     "metadata.json": "1.0",
 }
 

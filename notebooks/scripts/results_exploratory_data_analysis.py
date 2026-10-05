@@ -41,6 +41,8 @@ _WARMUP_REP = 0
 # `unknown` is addresses in no known mapping.  Workplan Section 12.2 excludes it
 # from region-level comparisons, so it is reported separately rather than mixed
 # into the contrast table.
+# `activation` stays listed so a legacy dataset still reports it, but it is
+# no longer produced: no symbol rule claims a region a symbol cannot establish.
 _COMPARABLE_REGIONS = ("weight", "kv_cache", "activation", "runtime")
 
 # Regions whose addresses come from a recorded range rather than from a symbol.
@@ -62,6 +64,7 @@ _PARAMS_BY_MODEL_ID = (
 # context, so a key of (model, ctx) alone collapses all three levels into one
 # row and the sweep's independent variable disappears from the tables.
 _CELL = ["model_id", "ctx", "output_tokens"]
+_CELL_SOURCES = ("load_dataset",)
 
 _GPU_MARKER = "pytorch_regions.json"
 
@@ -126,8 +129,11 @@ def load_dataset(results_dir: pathlib.Path) -> "tuple[pd.DataFrame, pd.DataFrame
         }
         run_rows.append(run)
         m = pd.read_csv(metrics_path)
+        # Every column in _CELL must come across, or a section that groups on
+        # the cell key raises KeyError on the first real dataset -- which a
+        # fixture that supplies the column by hand will not catch.
         for key in ("run_id", "model_id", "params_b", "collector", "path", "ctx",
-                    "rep", "validity", "granularity"):
+                    "rep", "validity", "granularity", "output_tokens"):
             m[key] = run[key]
         metric_frames.append(m)
 

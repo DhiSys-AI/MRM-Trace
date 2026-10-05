@@ -130,6 +130,22 @@ at `native_traces=True` (root) or when traced at the C level with `perf mem`.
 
 ---
 
+
+### Packaging for Kaggle
+
+`prepare_kaggle_dataset.py` turns a finished sweep in `results/` into a Kaggle-ready folder
+under `datasets/` (git-ignored): stacked tables, per-run metadata and prompts, stratified
+trace subsamples, a generated data card (`README.md`), `dataset-metadata.json` and
+`SHA256SUMS`. `raw/perf.data` is not included. The username and home paths are rewritten,
+and the run fails if either survives anywhere. What is included and why:
+`context-files/06 - Kaggle Dataset Selection.md`.
+
+```bash
+venv/bin/python notebooks/scripts/prepare_kaggle_dataset.py \
+  --kaggle-id <kaggle-user>/mrm-trace-llm-inference --force
+kaggle datasets create -p datasets/mrm-trace-kaggle --dir-mode zip
+```
+
 ## Tips
 
 - Run as root (`sudo`) or in Colab to enable `native_traces=True`, which captures C-level

@@ -43,7 +43,9 @@ def compute_all(trace) -> dict:
     ws_per_region, ws_summary = compute_working_set(trace)
     loc_per_region, loc_summary = compute_locality(trace)
     iai = compute_iai(trace)
-    suit = classify_suitability(ret_summary, wo, rf)
+    # IAI reaches the classifier, or `runtime` is high_mrm while being
+    # re-touched every 31 ms.
+    suit = classify_suitability(ret_summary, wo, rf, iai_summary=iai)
 
     return {
         "retention_per_region": ret_per_region,

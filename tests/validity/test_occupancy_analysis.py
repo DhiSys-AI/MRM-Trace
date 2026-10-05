@@ -177,3 +177,39 @@ def test_the_eda_reports_occupancy_not_context(capsys):
     # all three levels must survive into the table
     for t in _TOKENS:
         assert str(t) in out, t
+
+
+# ── the expected region set must match what the code can produce ─────────────
+
+def test_the_expected_region_set_excludes_what_no_rule_produces(val):
+    """
+    `activation` was removed from the labeller for varying 28-77x across
+    identical reps, but stayed in the validator's expected set -- so every run
+    of the next sweep FAILED for not producing a region type the code cannot
+    produce.  The two lists have to agree.
+    """
+    from mrm_trace.labeller.symbol_rules import DEFAULT_RULES
+
+    producible = {r.region_type for r in DEFAULT_RULES}
+    # weight and kv_cache come from recorded address ranges, not symbol rules
+    producible |= {"weight", "kv_cache", "unknown"}
+    assert set(val._EXPECTED_CPU_REGIONS) <= producible, (
+        f"expected but unproducible: "
+        f"{set(val._EXPECTED_CPU_REGIONS) - producible}")
+
+
+@pytest.mark.parametrize("module", ["results_validation",
+                                    "results_exploratory_data_analysis"])
+def test_every_loader_attaches_the_whole_cell_key(module):
+    """
+    _CELL is used as a groupby key, so a column missing from any loader raises
+    KeyError on the first real dataset.  Synthetic fixtures that supply the
+    column by hand do not catch it -- these did not, and the sweep caught both
+    scripts in turn.
+    """
+    import inspect
+    mod = _module(module)
+    for name in mod._CELL_SOURCES:
+        source = inspect.getsource(getattr(mod, name))
+        for col in mod._CELL:
+            assert f'"{col}"' in source, f"{module}.{name} does not attach {col}"

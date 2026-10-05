@@ -72,6 +72,42 @@ def build_metrics_table(analysis: dict) -> pd.DataFrame:
     }).copy()
     ws["working_set_mb_total"] = ws["working_set_bytes_total"] / 1_048_576
 
+    # Inter-access interval.  This was computed by compute_all() and then
+    # dropped on the floor, which mattered more than it sounds: retention
+    # (last access - first access of a granule) is bounded above by the run and
+    # for a region touched throughout simply reports it.  Measured across the
+    # occupancy sweep, retention p99 was 89-95% of the collection duration for
+    # *every* region type, so it separated them by 10-40%.  IAI -- the gap
+    # between consecutive accesses to one address, i.e. how long the line could
+    # sit in slow memory -- separates them by three orders of magnitude:
+    #
+    #   llama-3.2-1b, 98% occupancy, 258 s run, median gap:
+    #     runtime   0.03 s   (re-touched constantly; poor MRM candidate)
+    #     kv_cache  58.7 s
+    #     weight    73.4 s   (untouched for a quarter of the run)
+    #
+    # n_intervals travels with it because the support is wildly uneven -- 146
+    # intervals for weight against 10.2M for runtime -- and because the bias has
+    # a direction: an address must be sampled twice to yield a gap, so the
+    # addresses that qualify are the most frequently touched ones and the
+    # measured gaps are biased *short*.  The weight and KV figures are therefore
+    # conservative, which is the safe direction for an MRM claim.
+    # .get rather than [] so a caller that assembles the analysis dict itself
+    # -- fixtures, and any consumer predating IAI -- still gets a table.
+    iai = analysis.get("iai")
+    iai = iai.copy() if iai is not None else pd.DataFrame()
+    if not iai.empty:
+        for pct in ("p50", "p90", "p99"):
+            col = f"iai_{pct}_ns"
+            if col in iai.columns:
+                iai[f"iai_{pct}_s"] = iai[col] / 1e9
+        iai = iai[["region_type", "n_intervals"]
+                  + [f"iai_{p}_s" for p in ("p50", "p90", "p99")
+                     if f"iai_{p}_s" in iai.columns]]
+    else:
+        iai = pd.DataFrame(columns=["region_type", "n_intervals",
+                                    "iai_p50_s", "iai_p90_s", "iai_p99_s"])
+
     # suitability
     suit = analysis["suitability"][["region_type", "suitability"]]
 
@@ -81,6 +117,7 @@ def build_metrics_table(analysis: dict) -> pd.DataFrame:
         .merge(rf,   on="region_type", how="left")
         .merge(ws[["region_type", "unique_pages_total", "working_set_mb_total"]],
                on="region_type", how="left")
+        .merge(iai, on="region_type", how="left")
         .merge(suit, on="region_type", how="left")
     )
 
@@ -90,6 +127,7 @@ def build_metrics_table(analysis: dict) -> pd.DataFrame:
         "retention_p50_s", "retention_p90_s", "retention_p99_s", "retention_mean_s",
         "write_once_ratio_mean", "reads_per_write_mean",
         "working_set_mb_total", "unique_pages_total",
+        "n_intervals", "iai_p50_s", "iai_p90_s", "iai_p99_s",
         "suitability",
     ]
     present = [c for c in col_order if c in merged.columns]

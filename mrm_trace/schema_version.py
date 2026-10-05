@@ -20,7 +20,7 @@ CURRENT_VERSIONS: Dict[str, str] = {
     "trace":              "1.0",
     "region_map":         "1.0",
     "kv_block_lifecycle": "1.1",
-    "metrics":            "1.1",
+    "metrics":            "1.2",
     "metadata":           "1.0",
     "manifest":           "1.0",
 }

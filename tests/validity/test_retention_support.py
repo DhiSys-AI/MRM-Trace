@@ -34,6 +34,9 @@ from mrm_trace.analyser import compute_all
 pytestmark = pytest.mark.validity
 
 _S = 1_000_000_000
+# An absolute monotonic reading, not 0: a fixture starting at 0 cannot reveal
+# an imputed timestamp, because 0 is both "unknown" and a plausible first one.
+_CLOCK0 = 165_780_000_000_000
 
 
 def _row(region_id, op_type, ts, region_type="weight", address=None):
@@ -140,3 +143,80 @@ def test_two_samples_at_one_instant_are_a_measured_zero():
     ]))
     assert bool(per_region.iloc[0]["retention_observable"])
     assert per_region.iloc[0]["retention_s"] == 0.0
+
+
+# ── retention reports the run length; IAI is what discriminates ──────────────
+
+def test_retention_cannot_exceed_its_own_run_and_so_tracks_it():
+    """
+    Retention is `last access - first access` of a granule, so it is bounded
+    above by the run.  For a region touched throughout, it reports the run
+    length and nothing else.  Measured across the occupancy sweep, retention p99
+    was 89-95% of the collection duration for *every* region type, and the three
+    types sat within 15% of each other at the top occupancy level (355 / 305 /
+    360 s).  This is a property of the definition, not of the data.
+    """
+    rows = []
+    # two regions with identical spans but wildly different access frequency
+    for rid, step in ((1, 1 * _S), (2, 50 * _S)):
+        for t in range(0, 101 * _S, step):
+            rows.append(_row(rid, "load", _CLOCK0 + t))
+    per_region, _ = compute_retention(pd.DataFrame(rows))
+    spans = per_region.set_index("region_id")["retention_s"]
+    assert spans[1] == pytest.approx(spans[2]), (
+        "retention cannot tell a constantly-touched region from a rarely-"
+        "touched one — that is what IAI is for")
+
+
+def test_iai_separates_what_retention_cannot():
+    """The same two regions, by inter-access interval."""
+    from mrm_trace.analyser.iai import compute_iai
+
+    rows = []
+    for rid, step in ((1, 1 * _S), (2, 50 * _S)):
+        for t in range(0, 101 * _S, step):
+            rows.append(_row(rid, "load", _CLOCK0 + t))
+    out = compute_iai(pd.DataFrame(rows)).set_index("region_type")
+    # both regions share region_type "weight" here, so split by address instead
+    frame = pd.DataFrame(rows)
+    gaps = {}
+    for rid in (1, 2):
+        sub = frame[frame.region_id == rid].sort_values("timestamp_ns")
+        gaps[rid] = sub.timestamp_ns.diff().dropna().median() / 1e9
+    assert gaps[1] == pytest.approx(1.0)
+    assert gaps[2] == pytest.approx(50.0)
+    assert gaps[2] / gaps[1] == pytest.approx(50.0)
+    assert not out.empty
+
+
+def test_the_suitability_iai_gate_is_off_unless_calibrated():
+    """
+    A measured gap is in units of sampled-access time: 1-in-P sampling inflates
+    it by ~P, which cancels in a ratio but makes the absolute value meaningless
+    as wall time.  Dividing by P gave 15 ms between weight accesses where the
+    workload implies ~130 ms per token, because `ldlat` makes PEBS eligibility
+    cache-dependent.  So an absolute threshold must be supplied deliberately,
+    never defaulted.
+    """
+    import inspect
+    from mrm_trace.analyser.suitability import classify_suitability
+    sig = inspect.signature(classify_suitability)
+    for name in ("iai_threshold_s", "iai_threshold_medium_s"):
+        assert sig.parameters[name].default is None, (
+            f"{name} must default to None until IAI is calibrated")
+
+
+def test_iai_reaches_metrics_csv_with_its_support():
+    """
+    compute_all() computed IAI and build_metrics_table() dropped it, so the one
+    metric that discriminates the regions never reached the dataset.  n_intervals
+    travels with it because the support is 146 for weight against 10.2M for
+    runtime.
+    """
+    rows = [_row(1, "store", _CLOCK0)]
+    for t in range(1, 60):
+        rows.append(_row(1, "load", _CLOCK0 + t * _S))
+    table = build_metrics_table(compute_all(pd.DataFrame(rows)))
+    for col in ("n_intervals", "iai_p50_s", "iai_p90_s", "iai_p99_s"):
+        assert col in table.columns, col
+    assert table["n_intervals"].notna().any()

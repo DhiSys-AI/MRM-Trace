@@ -374,6 +374,63 @@ generating — see lesson 12. The audit caught that too, which is what it is for
 
 ---
 
+## 4c. Retention reports the run length; the discriminating metric was discarded
+
+The occupancy sweep ran clean (9 pass, 1 warn, 0 fail; 30/30 runs at 26.1% /
+51.1% / 97.7% occupancy, all reaching their token limit exactly). What it
+revealed is about the primary metric itself.
+
+Retention is `last access - first access` of a granule, so it is bounded above
+by the run, and for a region touched throughout it reports the run length.
+Across all 30 runs, retention p99 was **89-95% of each run's own collection
+duration for every region type**, and p50 was 40-57%:
+
+| region | p50 / duration | p99 / duration |
+|---|---|---|
+| `kv_cache` | 0.40 - 0.48 | 0.89 - 0.93 |
+| `weight` | 0.49 - 0.56 | 0.90 - 0.94 |
+| `runtime` | 0.49 - 0.57 | 0.91 - 0.95 |
+
+At the top occupancy level the three types sat at 355 / 305 / 360 s — within
+15% of each other. Retention separates regions by 10-40%; paired within a run,
+`weight`/`kv_cache` is 1.06-1.39x and consistent in direction but modest.
+
+**Inter-access interval separates them by three orders of magnitude.** IAI is
+the gap between consecutive accesses to one address — how long the line is left
+alone, which is the quantity MRM actually turns on. On llama-3.2-1B at 98%
+occupancy, median gap:
+
+| region | median gap | intervals |
+|---|---|---|
+| `runtime` | **0.03 s** | 10,217,953 |
+| `kv_cache` | **58.7 s** | 75 |
+| `weight` | **73.4 s** | 146 |
+
+`compute_all()` had been computing this all along and `build_metrics_table()`
+dropped it, so the one metric that discriminates the regions never reached the
+dataset. It is now exported with `n_intervals` beside it, because the support is
+146 against 10.2M and the bias has a direction: an address must be sampled twice
+to yield a gap, so the addresses that qualify are the most frequently touched
+ones and the measured gaps are biased *short* — conservative for `weight` and
+`kv_cache`, which is the safe direction.
+
+**The absolute values are not calibrated.** A measured gap is between
+consecutive *samples*, not accesses, so 1-in-P sampling inflates it by roughly
+P. That cancels in a ratio between regions but not in an absolute figure:
+dividing by P gives an estimated 15 ms between weight accesses where the
+workload implies ~130 ms per token, a 9x discrepancy, because `ldlat` makes PEBS
+eligibility depend on whether the access missed cache and so the sampled
+fraction is not uniform. The suitability gate on IAI is therefore **off by
+default** and takes a threshold only from a caller who has calibrated one.
+
+Gating on it does fix a real vacuity: with retention as the only time condition,
+`runtime` — re-touched every 31 ms — was classified `high_mrm` alongside the
+weight region, and a verdict every region passes is not a classification. With a
+gate applied, `weight` and `kv_cache` stay `high_mrm` and `runtime` falls to
+`low_mrm`. The *ordering* is the result; the cut points are a parameter to state.
+
+---
+
 ## 5. Future work
 
 ### 5.1 A sparse-regime fixture for the validity tier — *highest value, ~1 hour*
@@ -477,7 +534,17 @@ two stable ones and makes `runtime` comparable for the first time. It is a
 labelling change, so it needs a re-label of the existing runs and should land
 before the next sweep.
 
-### 5.8 Coverage gate on both execution paths
+### 5.8 Calibrate the inter-access interval
+
+See §4c. IAI is the metric that discriminates the regions and the only one whose
+separation is large enough to carry a conclusion, but its absolute scale is
+inflated by sampling in a way that `ldlat` makes non-uniform. Two steps: collect
+one short run at `ldlat=0` and a dense period to measure the PEBS eligibility
+fraction per region, then validate the corrected weight gap against the known
+ms-per-token. That converts a ratio into a number, and a number is what a
+suitability threshold needs.
+
+### 5.9 Coverage gate on both execution paths
 
 Add a check that every branch of `_build_command` is exercised, and more generally
 that the CPU and GPU paths are both constructed in tests. §3.5 was a one-line
